@@ -16,19 +16,14 @@
 # Wall-clock time is reported for each. Speedup = A / B.
 # =============================================================================
 
-# --- Self-elevate to admin if not already ---------------------------------
-# The bench needs CUDA toolkit + cuDNN on PATH. NVIDIA's installer adds those
-# to the SYSTEM PATH which is only fully inherited by elevated (admin) shells.
-# If we're not admin, re-launch ourselves via UAC so the inherited PATH
-# contains the NVIDIA entries.
-$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    $scriptPath = $MyInvocation.MyCommand.Path
-    $argList = $args -join ' '
-    Write-Host '[bench] not running as admin - re-launching elevated so the system PATH (CUDA, cuDNN) is inherited'
-    $q = [char]34
-    Start-Process -FilePath powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File $q$scriptPath$q $argList" -Verb RunAs
-    exit $LASTEXITCODE
+# --- Pull in the system PATH from registry (no admin needed) -------------
+# The NVIDIA installer writes CUDA toolkit + cuDNN into the SYSTEM PATH
+# (HKLM\...Session Manager\Environment\Path). Non-elevated shells only
+# see the user PATH, so we explicitly merge in the system PATH here
+# without needing UAC elevation.
+$sysPath = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -Name Path -ErrorAction SilentlyContinue).Path
+if ($sysPath) {
+    $env:PATH = "$sysPath;$env:PATH"
 }
 
 $ErrorActionPreference = "Stop"
