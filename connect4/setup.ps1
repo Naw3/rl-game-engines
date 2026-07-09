@@ -16,14 +16,21 @@
 # --- Self-elevate to admin if not already ----------------------------------
 # The CUDA installer requires admin rights. If we're not elevated, re-launch
 # ourselves via UAC so the install can write to Program Files and update the
-# system PATH. The user just sees a single UAC prompt.
+# system PATH. The new admin window stays visible so the user can follow
+# progress; we wait for it to finish before closing the original shell.
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $scriptPath = $MyInvocation.MyCommand.Path
     Write-Host '[setup] not running as admin - re-launching elevated so the CUDA installer can write to Program Files'
     $q = [char]34
-    Start-Process -FilePath powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File $q$scriptPath$q" -Verb RunAs
-    exit $LASTEXITCODE
+    $argList = "-NoProfile -ExecutionPolicy Bypass -File $q$scriptPath$q -Elevated"
+    # -Wait makes the parent block until the admin child finishes. The
+    # admin window stays visible (Normal) so the user can see CUDA install
+    # progress. The child re-checks IsInRole and skips the elevation block
+    # because it's now running as admin.
+    $proc = Start-Process -FilePath powershell -ArgumentList $argList -Verb RunAs -WindowStyle Normal -PassThru
+    $proc.WaitForExit()
+    exit $proc.ExitCode
 }
 
 $ErrorActionPreference = "Stop"
@@ -91,3 +98,10 @@ Write-Host "[setup] Done. Next steps:"
 Write-Host "  1. (If you just installed Rust) close and reopen PowerShell"
 Write-Host "  2. cd $PSScriptRoot\src_rust ; cargo build --release --features cuda"
 Write-Host "  3. cd $PSScriptRoot ; .\bench_cycle.ps1"
+Write-Host ""
+if ($args -contains '-Elevated') {
+    # When the admin re-launch finishes, pause so the user can read the
+    # output before the elevated window auto-closes.
+    Write-Host "Press Enter to close this admin window..."
+    [void](Read-Host)
+}
