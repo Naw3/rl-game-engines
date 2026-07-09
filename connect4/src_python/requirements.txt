@@ -23,6 +23,7 @@ torch                # CUDA 12.4 build (Connect 4 doesn't need torchvision — n
 numpy>=1.24
 pygame>=2.5
 onnx>=1.15           # Model export to ONNX, consumed by tract-onnx in Rust.
+onnxscript           # Required by torch.onnx.export in PyTorch 2.13+ (newer ONNX exporter).
 
 # --- GPU runtime ---
 onnxruntime-gpu      # Optional Python-side inference check / debugging.
