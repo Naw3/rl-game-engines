@@ -1,0 +1,48 @@
+[package]
+name = "connect4_mcts"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rayon = "1.10"       # Lock-free asynchronous parallelism
+serde = { version = "1.0", features = ["derive"] } # Elegant serialization
+bincode = "1.3"      # Raw binary format for write speed
+rand = { version = "0.8", features = ["small_rng"] } # Ultra-light RNG for CPU
+rand_distr = "0.4"   # Statistical distributions (Dirichlet for exploration noise)
+# Inference backends — both are kept so `--device cpu` can use the
+# pure-Rust tract (faster on small models, no FFI overhead) and
+# `--device gpu` can use ort with CUDA. See network.rs for the dispatch.
+tract-onnx = "0.21"          # CPU backend (fast, pure Rust)
+tract-core = "0.21"          # Re-exports needed for tract's types
+ort = { version = "2.0.0-rc.12", features = ["std"] } # GPU backend (CUDA via onnxruntime). ort-sys's default features (download-binaries) auto-fetch the matching onnxruntime DLL.
+ndarray = "0.17"             # Input tensor construction (used by both backends). Bumped to 0.17 to match ort's transitive dep and avoid two-version conflicts.
+
+[features]
+# Default: CPU only (tract). Build with `--features cuda` to enable
+# the GPU execution provider via ort. CUDA requires the CUDA toolkit
+# and `onnxruntime-gpu` installed at runtime.
+default = []
+cuda = ["ort/cuda"]
+
+[profile.release]
+# Tuning notes for low-RAM machines (target: 8 GB total, 1 GB free at link time):
+# - `lto = false` — fat LTO and even thin LTO both push peak RAM past 1.5 GB
+#   at link time on this crate (ort + tract + connect4_mcts combined). With
+#   only 1 GB free on an 8 GB machine, the linker swap-thrashes the SSD
+#   and turns a 30 s link into 5-9 min. No LTO = no cross-crate bitcode
+#   phase; runtime cost on the 227K-param model: ~5-10 % vs fat LTO.
+# - `codegen-units = 1` (NOT 16) — higher values spawn parallel LLVM
+#   instances, each carrying its own data structures. On a low-RAM
+#   machine, 1 instance at a time keeps the peak lower than 16 parallel
+#   ones even if codegen is slower per-crate. The big win on RAM comes
+#   from LTO off, not from parallelism.
+# - `opt-level = 3` — per-crate LLVM optimization still runs at full
+#   strength. Most of the runtime perf lives here, not in LTO.
+# - Net: link from 5-9 min down to 1-2 min, runtime perf ~90-95 % of
+#   fat-LTO setup. Best trade for 8 GB total.
+# - For even faster iteration use the dev profile:
+#     cargo build --features cuda        # ~30 s, opt-level 0, debug symbols
+opt-level = 3
+lto = false
+codegen-units = 1
+panic = "abort"      # Removes exception overhead for more performance

@@ -1,0 +1,32 @@
+# =============================================================================
+# Python dependencies for the Connect4 AlphaZero pipeline.
+#
+# One-shot install:
+#   pip install -r requirements.txt
+#
+# Why the index magic:
+#   * `--index-url` replaces pip's default PyPI with the PyTorch CUDA wheel
+#     server, so we get the CUDA build of `torch` (PyPI's torch is CPU-only).
+#   * `--extra-index-url https://pypi.org/simple` re-adds PyPI as a fallback
+#     so non-PyTorch packages (numpy, pygame, onnx, nvidia-cudnn-cu12, ...)
+#     can still be found. Without this line, pip would only search the cu124
+#     index and pygame etc. would fail with "No matching distribution found".
+#
+# To switch to CPU-only torch (no CUDA), comment out the two index lines and
+# re-install. Everything else works either way.
+# =============================================================================
+--index-url https://download.pytorch.org/whl/cu124
+--extra-index-url https://pypi.org/simple
+
+# --- Core ---
+torch                # CUDA 12.4 build (Connect 4 doesn't need torchvision — no images)
+numpy>=1.24
+pygame>=2.5
+onnx>=1.15           # Model export to ONNX, consumed by tract-onnx in Rust.
+
+# --- GPU runtime ---
+onnxruntime-gpu      # Optional Python-side inference check / debugging.
+nvidia-cudnn-cu12    # cuDNN 9.x for CUDA 12 — required by onnxruntime-gpu's CUDA
+                     # execution provider and by the Rust `ort` crate's CUDA EP.
+                     # The PyPI placeholder `nvidia-cudnn` is dead (it expects a
+                     # NVIDIA private index that no longer works). Use this one.
