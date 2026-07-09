@@ -20,18 +20,31 @@ Write-Host "[setup] project root: $PSScriptRoot"
 Write-Host ""
 
 # --- 1. CUDA Toolkit 12.6 -----------------------------------------------------
+# We use NVIDIA's official network installer (NOT winget) because winget
+# refuses to side-by-side install: if a newer CUDA (e.g. v13.2) is already
+# present, winget silently no-ops. The NVIDIA installer happily coexists
+# v12.x with v13.x. We use `-s` (silent) + skip the driver install (the
+# existing one already supports both versions).
 $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
 if (Test-Path (Join-Path $cudaRoot "bin\cudart64_12.dll")) {
     Write-Host "[setup] CUDA 12.6 already installed at $cudaRoot - skipping"
 } else {
-    Write-Host "[setup] Installing CUDA Toolkit 12.6 (winget) - this takes 3-5 min..."
-    winget install Nvidia.CUDA --version 12.6 --accept-source-agreements --accept-package-agreements
+    $installer = "$env:USERPROFILE\Downloads\cuda_12.6.3_windows_network.exe"
+    if (-not (Test-Path $installer)) {
+        Write-Host "[setup] Downloading CUDA 12.6 network installer (~3 GB, network)..."
+        Invoke-WebRequest -Uri "https://developer.download.nvidia.com/compute/cuda/12.6.3/network_installers/cuda_12.6.3_windows_network.exe" -OutFile $installer
+    }
+    Write-Host "[setup] Running CUDA 12.6 installer (silent, no driver override)..."
+    # -s: silent, -n: no reboot. Custom install (default in silent) only
+    # installs the toolkit + runtime. Driver is preserved (we already have
+    # a working NVIDIA driver from CUDA 13.2).
+    Start-Process -FilePath $installer -ArgumentList "-s -n" -Wait -NoNewWindow
     if (-not (Test-Path (Join-Path $cudaRoot "bin\cudart64_12.dll"))) {
         Write-Host "[setup] FAILED: CUDA 12.6 install did not produce expected DLL at $cudaRoot\bin"
-        Write-Host "[setup]   (winget sometimes installs to a different path. Check 'Get-ChildItem C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA')"
+        Write-Host "[setup]   The installer may have shown a UI prompt. Run it interactively to see what failed."
         exit 1
     }
-    Write-Host "[setup] CUDA 12.6 installed OK"
+    Write-Host "[setup] CUDA 12.6 installed OK (side-by-side with 13.x if present)"
 }
 
 # --- 2. cuDNN 9.x for CUDA 12 (pip wheel) ------------------------------------
