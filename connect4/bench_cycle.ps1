@@ -43,10 +43,9 @@ if ($cudaBin) { $env:PATH = "$cudaBin;$env:PATH" }
 
 $cudnnBin = $null
 try {
-    $cudnnLoc = & $PYTHON -c "import importlib.metadata; m = importlib.metadata.metadata('nvidia-cudnn-cu12'); print(m['Name']); print(m.get_payload('Location') or '')" 2>$null
-    # importlib.metadata prints "Name\nLocation" — grab the second non-empty line.
-    $cudnnLoc = ($cudnnLoc | Where-Object { $_ -match '^[A-Za-z]:\\' } | Select-Object -First 1)
-    if ($cudnnLoc) {
+    $cudnnLoc = & $PYTHON -c "import importlib.metadata, os; p = importlib.metadata.distribution('nvidia-cudnn-cu12')._path; print(os.path.dirname(os.path.dirname(p)))" 2>$null
+    $cudnnLoc = ($cudnnLoc | Select-Object -Last 1).Trim()
+    if ($cudnnLoc -and (Test-Path $cudnnLoc)) {
         $candidate = Join-Path $cudnnLoc 'nvidia\cudnn\bin'
         if (Test-Path $candidate) { $cudnnBin = $candidate }
     }

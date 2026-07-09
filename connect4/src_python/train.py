@@ -160,7 +160,6 @@ def main() -> None:
     p.add_argument("--batch", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--num-workers", type=int, default=2)
     p.add_argument(
         "--device",
         choices=["cpu", "cuda", "auto"],
