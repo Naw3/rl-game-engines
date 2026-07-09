@@ -30,15 +30,41 @@ $PYTHON_DEVICE = "cuda"
 # Make sure cuDNN (from the pip-installed nvidia-cudnn-cu12) and the CUDA toolkit
 # runtime DLLs (cublasLt64_12.dll, cublas64_12.dll, etc.) are on PATH. The Rust
 # `ort` crate's CUDA execution provider loads these via dlopen at runtime.
-$cudnnBin   = "$env:LocalAppData\Programs\Python\Python312\Lib\site-packages\nvidia\cudnn\bin"
-$cudaBin    = "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin"
-if (Test-Path $cudaBin)   { $env:PATH = "$cudaBin;$env:PATH" }
-if (Test-Path $cudnnBin) { $env:PATH = "$cudnnBin;$env:PATH" }
+#
+# Both paths are discovered dynamically:
+#   - CUDA toolkit: search the standard NVIDIA install path for v12.x.
+#   - cuDNN: ask Python (whatever interpreter `python` resolves to) where
+#     the `nvidia-cudnn-cu12` package was installed, then derive `<site-packages>/nvidia/cudnn/bin`.
+$cudaBin    = $null
+Get-ChildItem "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA" -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^v12\.' } |
+    ForEach-Object { $candidate = Join-Path $_.FullName 'bin'; if (Test-Path $candidate) { $cudaBin = $candidate } }
+if ($cudaBin) { $env:PATH = "$cudaBin;$env:PATH" }
+
+$cudnnBin = $null
+try {
+    $cudnnLoc = & $PYTHON -c "import importlib.metadata; m = importlib.metadata.metadata('nvidia-cudnn-cu12'); print(m['Name']); print(m.get_payload('Location') or '')" 2>$null
+    # importlib.metadata prints "Name\nLocation" — grab the second non-empty line.
+    $cudnnLoc = ($cudnnLoc | Where-Object { $_ -match '^[A-Za-z]:\\' } | Select-Object -First 1)
+    if ($cudnnLoc) {
+        $candidate = Join-Path $cudnnLoc 'nvidia\cudnn\bin'
+        if (Test-Path $candidate) { $cudnnBin = $candidate }
+    }
+} catch {}
+if ($cudnnBin) { $env:PATH = "$cudnnBin;$env:PATH" }
 
 Write-Host "[bench] params: GAMES=$GAMES SIMS=$SIMS EPOCHS=$EPOCHS BATCH=$BATCH"
 Write-Host "[bench] python device: $PYTHON_DEVICE (hard-coded)"
-Write-Host "[bench] CUDA bin on PATH:   $(if (Test-Path $cudaBin)   { 'yes' } else { 'NO - CUDA toolkit 12.6 missing' })"
-Write-Host "[bench] cuDNN bin on PATH:  $(if (Test-Path $cudnnBin) { 'yes' } else { 'NO - nvidia-cudnn-cu12 not installed' })"
+if ($cudaBin) {
+    Write-Host "[bench] CUDA bin on PATH:   yes ($cudaBin)"
+} else {
+    Write-Host "[bench] CUDA bin on PATH:   NO - no CUDA toolkit v12.x found in '$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA'"
+}
+if ($cudnnBin) {
+    Write-Host "[bench] cuDNN bin on PATH:  yes ($cudnnBin)"
+} else {
+    Write-Host "[bench] cuDNN bin on PATH:  NO - nvidia-cudnn-cu12 not installed (run: pip install nvidia-cudnn-cu12)"
+}
 Write-Host ""
 
 # --- Helper: run one cycle, return total seconds ----------------------------

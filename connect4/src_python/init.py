@@ -30,6 +30,14 @@ import os
 import sys
 from pathlib import Path
 
+# Force UTF-8 on stdout/stderr. Windows defaults to cp1252 which crashes on
+# Unicode arrows in print() output. Safe on all platforms.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 import torch
 
 from model import Connect4Net
@@ -103,10 +111,10 @@ def main() -> int:
     net = Connect4Net(channels=args.channels, num_blocks=args.num_blocks)
     print(f"[init] model: {net.num_parameters():,} parameters")
 
-    print(f"[init] saving state_dict → {args.out_pt}")
+    print(f"[init] saving state_dict -> {args.out_pt}")
     net.save(args.out_pt)
 
-    print(f"[init] exporting ONNX → {args.out_onnx} (opset {args.opset})")
+    print(f"[init] exporting ONNX -> {args.out_onnx} (opset {args.opset})")
     export_onnx(net, args.out_onnx, opset=args.opset)
 
     print(f"[init] done. {args.out_pt} + {args.out_onnx} ready for self-play.")
