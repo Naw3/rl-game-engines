@@ -1,0 +1,138 @@
+﻿**********************
+Windows PowerShell transcript start
+Start time: 20260709191738
+Username: DESKTOP-ACG0VGU\Admin
+RunAs User: DESKTOP-ACG0VGU\Admin
+Configuration Name: 
+Machine: DESKTOP-ACG0VGU (Microsoft Windows NT 10.0.26200.0)
+Host Application: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -Command Set-Location -Path 'C:\Users\Admin\Documents\Dev\rl-game-engines\connect4'; & 'C:\Users\Admin\Documents\Dev\rl-game-engines\connect4\setup.ps1' -Elevated
+Process ID: 14772
+PSVersion: 5.1.26100.8655
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.8655
+BuildVersion: 10.0.26100.8655
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Transcript started, output file is C:\Users\Admin\Documents\Dev\rl-game-engines\connect4\setup.log
+[setup] Connect4 pipeline setup starting...
+[setup] Project root: C:\Users\Admin\Documents\Dev\rl-game-engines\connect4
+[setup] Derived original user home directory: C:\Users\Admin
+
+[setup] Python is already available: C:\Program Files\Python311\python.exe
+[setup] Rust is already available: C:\Users\Admin\.cargo\bin\cargo.exe
+[setup] Ensuring stable Rust toolchain...
+info: using existing install for stable-x86_64-pc-windows-msvc
+info: default toolchain set to stable-x86_64-pc-windows-msvc
+
+  stable-x86_64-pc-windows-msvc unchanged - rustc 1.97.0 (2d8144b78 2026-07-07)
+[setup] CUDA 12.6 already installed at C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6 - registering in PATH.
+[setup] Adding 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin' to User PATH permanently...
+[setup] Refreshing environment variables from registry...
+[setup] Upgrading pip, setuptools, and wheel...
+[setup] Installing Python dependencies from requirements.txt...
+PS>TerminatingError(): "The pipeline has been stopped."
+**********************
+Windows PowerShell transcript end
+End time: 20260709191845
+**********************
+**********************
+Windows PowerShell transcript start
+Start time: 20260709191921
+Username: DESKTOP-ACG0VGU\Admin
+RunAs User: DESKTOP-ACG0VGU\Admin
+Configuration Name: 
+Machine: DESKTOP-ACG0VGU (Microsoft Windows NT 10.0.26200.0)
+Host Application: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -Command Set-Location -Path 'C:\Users\Admin\Documents\Dev\rl-game-engines\connect4'; & 'C:\Users\Admin\Documents\Dev\rl-game-engines\connect4\setup.ps1' -Elevated
+Process ID: 17348
+PSVersion: 5.1.26100.8655
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.8655
+BuildVersion: 10.0.26100.8655
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Transcript started, output file is C:\Users\Admin\Documents\Dev\rl-game-engines\connect4\setup.log
+[setup] Connect4 pipeline setup starting...
+[setup] Project root: C:\Users\Admin\Documents\Dev\rl-game-engines\connect4
+[setup] Derived original user home directory: C:\Users\Admin
+
+[setup] Python is already available: C:\Program Files\Python311\python.exe
+[setup] Rust is already available: C:\Users\Admin\.cargo\bin\cargo.exe
+[setup] Ensuring stable Rust toolchain...
+info: using existing install for stable-x86_64-pc-windows-msvc
+info: default toolchain set to stable-x86_64-pc-windows-msvc
+
+  stable-x86_64-pc-windows-msvc unchanged - rustc 1.97.0 (2d8144b78 2026-07-07)
+[setup] CUDA 12.6 already installed at C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6 - registering in PATH.
+[setup] uv is already available: C:\Users\Admin\.local\bin\uv.exe
+[setup] Running outside of virtual environment. Using --system flag for uv.
+[setup] Installing Python dependencies from requirements.txt via uv...
+Using Python 3.11.9 environment at: C:\Program Files\Python311
+Resolved 23 packages in 652ms
+Prepared 8 packages in 26.89s
+Installed 8 packages in 1m 25s
+ + jinja2==3.1.6
+ + ml-dtypes==0.5.4
+ + nvidia-cublas-cu12==12.9.2.10
+ + nvidia-cudnn-cu12==9.24.0.43
+ + onnx==1.22.0
+ + onnx-ir==0.2.1
+ + onnxscript==0.7.1
+ + torch==2.13.0
+[setup] Python dependencies installed.
+[setup] Locating nvidia-cudnn-cu12 package path...
+PS>TerminatingError(python.exe): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: Traceback (most recent call last):"
+>> TerminatingError(setup.ps1): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: [setup] An error occurred during setup: Traceback (most recent call last):"
+**********************
+Windows PowerShell transcript end
+End time: 20260709192115
+**********************
+**********************
+Windows PowerShell transcript start
+Start time: 20260709192121
+Username: DESKTOP-ACG0VGU\Admin
+RunAs User: DESKTOP-ACG0VGU\Admin
+Configuration Name: 
+Machine: DESKTOP-ACG0VGU (Microsoft Windows NT 10.0.26200.0)
+Host Application: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -Command Set-Location -Path 'C:\Users\Admin\Documents\Dev\rl-game-engines\connect4'; & 'C:\Users\Admin\Documents\Dev\rl-game-engines\connect4\setup.ps1' -Elevated
+Process ID: 10748
+PSVersion: 5.1.26100.8655
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.8655
+BuildVersion: 10.0.26100.8655
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Transcript started, output file is C:\Users\Admin\Documents\Dev\rl-game-engines\connect4\setup.log
+[setup] Connect4 pipeline setup starting...
+[setup] Project root: C:\Users\Admin\Documents\Dev\rl-game-engines\connect4
+[setup] Derived original user home directory: C:\Users\Admin
+
+[setup] Python is already available: C:\Program Files\Python311\python.exe
+[setup] Rust is already available: C:\Users\Admin\.cargo\bin\cargo.exe
+[setup] Ensuring stable Rust toolchain...
+info: using existing install for stable-x86_64-pc-windows-msvc
+info: default toolchain set to stable-x86_64-pc-windows-msvc
+
+  stable-x86_64-pc-windows-msvc unchanged - rustc 1.97.0 (2d8144b78 2026-07-07)
+[setup] CUDA 12.6 already installed at C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6 - registering in PATH.
+[setup] uv is already available: C:\Users\Admin\.local\bin\uv.exe
+[setup] Running outside of virtual environment. Using --system flag for uv.
+[setup] Installing Python dependencies from requirements.txt via uv...
+Using Python 3.11.9 environment at: C:\Program Files\Python311
+Checked 7 packages in 6ms
+[setup] Python dependencies installed.
+[setup] Locating nvidia-cudnn-cu12 package path...
+PS>TerminatingError(python.exe): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: Traceback (most recent call last):"
+>> TerminatingError(setup.ps1): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: [setup] An error occurred during setup: Traceback (most recent call last):"
+**********************
+Windows PowerShell transcript end
+End time: 20260709192121
+**********************

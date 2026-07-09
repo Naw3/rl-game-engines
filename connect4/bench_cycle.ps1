@@ -49,6 +49,7 @@ $PYTHON_DEVICE = "cuda"
 #     cublasLt64_12.dll (the cuDNN-cu12 compatibility marker — this DLL only
 #     exists in CUDA 12.x toolkits). If found, prepend its bin to PATH. This
 #     handles stale registry PATH entries and multiple CUDA installs.
+$PYTHON   = if ($env:PYTHON) { $env:PYTHON } else { "python" }
 $cudnnBin = $null
 $cudaBin  = $null
 try {

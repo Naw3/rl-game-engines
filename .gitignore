@@ -33,6 +33,7 @@
 **/*.pt
 **/*.onnx
 **/*.bin
+**/*.data
 
 # --- IDE / editor ---
 **/.idea/
