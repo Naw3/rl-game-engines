@@ -43,12 +43,12 @@ if ($cudaBin) { $env:PATH = "$cudaBin;$env:PATH" }
 
 $cudnnBin = $null
 try {
-    $cudnnLoc = & $PYTHON -c "import importlib.metadata, os; p = importlib.metadata.distribution('nvidia-cudnn-cu12')._path; print(os.path.dirname(os.path.dirname(p)))" 2>$null
+    # Ask Python directly for the nvidia.cudnn module's on-disk location.
+    # More robust than parsing pip metadata, and works regardless of whether
+    # the package was installed system-wide or user-mode (Roaming/ vs LocalAppData/).
+    $cudnnLoc = & $PYTHON -c "import nvidia.cudnn, os; print(os.path.join(os.path.dirname(nvidia.cudnn.__file__), 'bin'))" 2>$null
     $cudnnLoc = ($cudnnLoc | Select-Object -Last 1).Trim()
-    if ($cudnnLoc -and (Test-Path $cudnnLoc)) {
-        $candidate = Join-Path $cudnnLoc 'nvidia\cudnn\bin'
-        if (Test-Path $candidate) { $cudnnBin = $candidate }
-    }
+    if ($cudnnLoc -and (Test-Path $cudnnLoc)) { $cudnnBin = $cudnnLoc }
 } catch {}
 if ($cudnnBin) { $env:PATH = "$cudnnBin;$env:PATH" }
 
