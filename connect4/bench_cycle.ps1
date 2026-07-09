@@ -31,21 +31,27 @@ $PYTHON_DEVICE = "cuda"
 # runtime DLLs (cublasLt64_12.dll, cublas64_12.dll, etc.) are on PATH. The Rust
 # `ort` crate's CUDA execution provider loads these via dlopen at runtime.
 #
-# Both paths are discovered dynamically:
-#   - CUDA toolkit: search the standard NVIDIA install path for v12.x.
+# Discovery:
 #   - cuDNN: ask Python (whatever interpreter `python` resolves to) where
-#     the `nvidia-cudnn-cu12` package was installed, then derive `<site-packages>/nvidia/cudnn/bin`.
-$cudaBin    = $null
-Get-ChildItem "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA" -Directory -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -match '^v12\.' } |
-    ForEach-Object { $candidate = Join-Path $_.FullName 'bin'; if (Test-Path $candidate) { $cudaBin = $candidate } }
+#     the `nvidia.cudnn` module is on disk, then derive `.../bin`.
+#   - CUDA toolkit: search the standard NVIDIA install path for v12.x. If
+#     multiple v12.x are present, take the highest version. The user's
+#     CUDA_PATH env var (if set) wins.
+$cudaBin = $null
+if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH 'bin'))) {
+    $cudaBin = Join-Path $env:CUDA_PATH 'bin'
+} else {
+    Get-ChildItem "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^v12\.' } |
+        Sort-Object Name -Descending |
+        ForEach-Object { $candidate = Join-Path $_.FullName 'bin'; if (-not $cudaBin -and (Test-Path $candidate)) { $cudaBin = $candidate } }
+}
 if ($cudaBin) { $env:PATH = "$cudaBin;$env:PATH" }
 
 $cudnnBin = $null
 try {
     # Ask Python directly for the nvidia.cudnn module's on-disk location.
-    # More robust than parsing pip metadata, and works regardless of whether
-    # the package was installed system-wide or user-mode (Roaming/ vs LocalAppData/).
+    # Works regardless of system-wide vs user-mode (Roaming/ vs LocalAppData/).
     $cudnnLoc = & $PYTHON -c "import nvidia.cudnn, os; print(os.path.join(os.path.dirname(nvidia.cudnn.__file__), 'bin'))" 2>$null
     $cudnnLoc = ($cudnnLoc | Select-Object -Last 1).Trim()
     if ($cudnnLoc -and (Test-Path $cudnnLoc)) { $cudnnBin = $cudnnLoc }
