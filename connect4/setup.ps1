@@ -13,6 +13,19 @@
 # After setup, just `.\bench_cycle.ps1` works.
 # =============================================================================
 
+# --- Self-elevate to admin if not already ----------------------------------
+# The CUDA installer requires admin rights. If we're not elevated, re-launch
+# ourselves via UAC so the install can write to Program Files and update the
+# system PATH. The user just sees a single UAC prompt.
+$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $scriptPath = $MyInvocation.MyCommand.Path
+    Write-Host '[setup] not running as admin - re-launching elevated so the CUDA installer can write to Program Files'
+    $q = [char]34
+    Start-Process -FilePath powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File $q$scriptPath$q" -Verb RunAs
+    exit $LASTEXITCODE
+}
+
 $ErrorActionPreference = "Stop"
 
 Write-Host "[setup] Connect4 pipeline setup"
