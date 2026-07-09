@@ -43,6 +43,6 @@ cuda = ["ort/cuda"]
 # - For even faster iteration use the dev profile:
 #     cargo build --features cuda        # ~30 s, opt-level 0, debug symbols
 opt-level = 3
-lto = "thin"
-codegen-units = 4
+lto = "thin" # "false"
+codegen-units = 4 # 1
 panic = "abort"      # Removes exception overhead for more performance
