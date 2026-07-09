@@ -16,6 +16,21 @@
 # Wall-clock time is reported for each. Speedup = A / B.
 # =============================================================================
 
+# --- Self-elevate to admin if not already ---------------------------------
+# The bench needs CUDA toolkit + cuDNN on PATH. NVIDIA's installer adds those
+# to the SYSTEM PATH which is only fully inherited by elevated (admin) shells.
+# If we're not admin, re-launch ourselves via UAC so the inherited PATH
+# contains the NVIDIA entries.
+$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $scriptPath = $MyInvocation.MyCommand.Path
+    $argList = $args -join ' '
+    Write-Host '[bench] not running as admin - re-launching elevated so the system PATH (CUDA, cuDNN) is inherited'
+    $q = [char]34
+    Start-Process -FilePath powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File $q$scriptPath$q $argList" -Verb RunAs
+    exit $LASTEXITCODE
+}
+
 $ErrorActionPreference = "Stop"
 
 # --- Shared knobs (override via env before running) --------------------------
@@ -28,32 +43,17 @@ $BATCH  = if ($env:BATCH)  { [int]$env:BATCH }  else { 256 }
 $PYTHON_DEVICE = "cuda"
 
 # Make sure cuDNN (from the pip-installed nvidia-cudnn-cu12) and the CUDA toolkit
-# runtime DLLs (cublasLt64_12.dll, cublas64_12.dll, etc.) are on PATH. The Rust
-# `ort` crate's CUDA execution provider loads these via dlopen at runtime.
+# runtime DLLs (cublasLt64_12.dll, etc.) are on PATH. The Rust `ort` crate's CUDA
+# execution provider loads these via dlopen at runtime.
 #
-# Discovery:
-#   - cuDNN: ask Python (whatever interpreter `python` resolves to) where
-#     the `nvidia.cudnn` module is on disk, then derive `.../bin`.
-#   - CUDA toolkit: search the standard NVIDIA install path for v12.x. If
-#     multiple v12.x are present, take the highest version. The user's
-#     CUDA_PATH env var (if set) wins.
-$cudaBin = $null
-if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH 'bin'))) {
-    $cudaBin = Join-Path $env:CUDA_PATH 'bin'
-} else {
-    Get-ChildItem "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA" -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^v12\.' } |
-        Sort-Object Name -Descending |
-        ForEach-Object { $candidate = Join-Path $_.FullName 'bin'; if (-not $cudaBin -and (Test-Path $candidate)) { $cudaBin = $candidate } }
-}
-if ($cudaBin) { $env:PATH = "$cudaBin;$env:PATH" }
-
+# Best-effort discovery — relies on the user having either a CUDA toolkit
+# installed system-wide (auto-discovered under ProgramFiles) or the
+# nvidia-cudnn-cu12 wheel installed via pip. If the user runs this
+# script in an admin shell, the system PATH (which includes the NVIDIA
+# installer entries) is fully inherited, and the discovery below is
+# usually a no-op confirmation.
 $cudnnBin = $null
 try {
-    # nvidia-cudnn-cu12 is a data-only wheel: it ships DLLs under
-    # `<site-packages>/nvidia/cudnn/bin/` but NO Python module. So we
-    # ask pip directly for the install location of the wheel, then
-    # derive the bin dir. Works for system-wide AND user-mode installs.
     $cudnnLoc = & $PYTHON -c "import importlib.metadata, os; dist = importlib.metadata.distribution('nvidia-cudnn-cu12'); print(os.path.join(os.path.dirname(dist._path), 'nvidia', 'cudnn', 'bin'))" 2>$null
     $cudnnLoc = ($cudnnLoc | Select-Object -Last 1).Trim()
     if ($cudnnLoc -and (Test-Path $cudnnLoc)) { $cudnnBin = $cudnnLoc }
@@ -65,7 +65,7 @@ Write-Host "[bench] python device: $PYTHON_DEVICE (hard-coded)"
 if ($cudaBin) {
     Write-Host "[bench] CUDA bin on PATH:   yes ($cudaBin)"
 } else {
-    Write-Host "[bench] CUDA bin on PATH:   NO - no CUDA toolkit v12.x found in '$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA'"
+    Write-Host "[bench] CUDA bin on PATH:   NO - CUDA toolkit not on PATH. Run this script in an admin shell, or install CUDA 12.x."
 }
 if ($cudnnBin) {
     Write-Host "[bench] cuDNN bin on PATH:  yes ($cudnnBin)"
