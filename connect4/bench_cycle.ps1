@@ -50,9 +50,11 @@ if ($cudaBin) { $env:PATH = "$cudaBin;$env:PATH" }
 
 $cudnnBin = $null
 try {
-    # Ask Python directly for the nvidia.cudnn module's on-disk location.
-    # Works regardless of system-wide vs user-mode (Roaming/ vs LocalAppData/).
-    $cudnnLoc = & $PYTHON -c "import nvidia.cudnn, os; print(os.path.join(os.path.dirname(nvidia.cudnn.__file__), 'bin'))" 2>$null
+    # nvidia-cudnn-cu12 is a data-only wheel: it ships DLLs under
+    # `<site-packages>/nvidia/cudnn/bin/` but NO Python module. So we
+    # ask pip directly for the install location of the wheel, then
+    # derive the bin dir. Works for system-wide AND user-mode installs.
+    $cudnnLoc = & $PYTHON -c "import importlib.metadata, os; dist = importlib.metadata.distribution('nvidia-cudnn-cu12'); print(os.path.join(os.path.dirname(dist._path), 'nvidia', 'cudnn', 'bin'))" 2>$null
     $cudnnLoc = ($cudnnLoc | Select-Object -Last 1).Trim()
     if ($cudnnLoc -and (Test-Path $cudnnLoc)) { $cudnnBin = $cudnnLoc }
 } catch {}
