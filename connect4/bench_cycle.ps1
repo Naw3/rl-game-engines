@@ -27,24 +27,37 @@ $BATCH  = if ($env:BATCH)  { [int]$env:BATCH }  else { 256 }
 # Python is ALWAYS GPU per the design contract. Don't make this configurable.
 $PYTHON_DEVICE = "cuda"
 
-# Make sure cuDNN (from the pip-installed nvidia-cudnn-cu12) and the CUDA toolkit
-# runtime DLLs (cublasLt64_12.dll, cublas64_12.dll, etc.) are on PATH. The Rust
+# Make sure cuDNN (from the pip-installed nvidia-cudnn-cu12) and the matching
+# CUDA toolkit runtime DLLs (cublasLt64_12.dll, etc.) are on PATH. The Rust
 # `ort` crate's CUDA execution provider loads these via dlopen at runtime.
 #
-# Discovery:
-#   - cuDNN: ask Python (whatever interpreter `python` resolves to) where
-#     the `nvidia.cudnn` module is on disk, then derive `.../bin`.
-#   - CUDA toolkit: search the standard NVIDIA install path for v12.x. If
-#     multiple v12.x are present, take the highest version. The user's
-#     CUDA_PATH env var (if set) wins.
+# Critical: nvidia-cudnn-cu12 wheel needs CUDA 12.x — the cuBLAS DLL
+# it depends on is cublasLt64_12.dll, which only exists in v12.x toolkits.
+# If the user has BOTH v12.x and v13.x installed, picking v13 silently
+# breaks Config B. So:
+#   1. Find the v12 toolkit that has cublasLt64_12.dll.
+#   2. Make sure cuDNN's bin dir is on PATH (it lives under
+#      <site-packages>/nvidia/cudnn/bin/, see the cuDNN discovery below).
+#   3. Honor $env:CUDA_PATH if it's set AND points to a v12 dir.
+
 $cudaBin = $null
-if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH 'bin'))) {
-    $cudaBin = Join-Path $env:CUDA_PATH 'bin'
-} else {
-    Get-ChildItem "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA" -Directory -ErrorAction SilentlyContinue |
+
+# 1. Honor CUDA_PATH if it points to a usable v12.x toolkit.
+if ($env:CUDA_PATH) {
+    $candidate = Join-Path $env:CUDA_PATH 'bin'
+    if ((Test-Path (Join-Path $candidate 'cublasLt64_12.dll'))) {
+        $cudaBin = $candidate
+    }
+}
+
+# 2. Otherwise, find the v12.x toolkit that has cublasLt64_12.dll.
+if (-not $cudaBin) {
+    $candidates = Get-ChildItem "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA" -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match '^v12\.' } |
-        Sort-Object Name -Descending |
-        ForEach-Object { $candidate = Join-Path $_.FullName 'bin'; if (-not $cudaBin -and (Test-Path $candidate)) { $cudaBin = $candidate } }
+        ForEach-Object { Join-Path $_.FullName 'bin' } |
+        Where-Object { Test-Path (Join-Path $_ 'cublasLt64_12.dll') } |
+        Sort-Object { ($_ -split '\\')[-2] } -Descending   # highest v12.x first
+    if ($candidates.Count -gt 0) { $cudaBin = $candidates[0] }
 }
 if ($cudaBin) { $env:PATH = "$cudaBin;$env:PATH" }
 
@@ -65,7 +78,8 @@ Write-Host "[bench] python device: $PYTHON_DEVICE (hard-coded)"
 if ($cudaBin) {
     Write-Host "[bench] CUDA bin on PATH:   yes ($cudaBin)"
 } else {
-    Write-Host "[bench] CUDA bin on PATH:   NO - no CUDA toolkit v12.x found in '$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA'"
+    Write-Host "[bench] CUDA bin on PATH:   NO - no v12.x CUDA toolkit with cublasLt64_12.dll found."
+    Write-Host "           (nvidia-cudnn-cu12 needs CUDA 12.x, not 13.x. Install CUDA 12.6 via winget.)"
 }
 if ($cudnnBin) {
     Write-Host "[bench] cuDNN bin on PATH:  yes ($cudnnBin)"
