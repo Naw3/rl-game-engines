@@ -1,7 +1,13 @@
 # =============================================================================
 # Python dependencies for the Connect4 AlphaZero pipeline.
 #
-# One-shot install:
+# This file only covers Python-level deps. For the FULL setup (CUDA toolkit
+# install + cuDNN wheel + Rust toolchain), run from the project root:
+#
+#   powershell -ExecutionPolicy Bypass -File .\setup.ps1
+#
+# After setup.ps1 has run once, this file alone can refresh the Python env:
+#
 #   pip install -r requirements.txt
 #
 # Why the index magic:
@@ -27,7 +33,9 @@ onnxscript           # Required by torch.onnx.export in PyTorch 2.13+ (newer ONN
 
 # --- GPU runtime ---
 onnxruntime-gpu      # Optional Python-side inference check / debugging.
-nvidia-cudnn-cu12    # cuDNN 9.x for CUDA 12 — required by onnxruntime-gpu's CUDA
-                     # execution provider and by the Rust `ort` crate's CUDA EP.
-                     # The PyPI placeholder `nvidia-cudnn` is dead (it expects a
-                     # NVIDIA private index that no longer works). Use this one.
+nvidia-cudnn-cu12    # cuDNN 9.x for CUDA 12 — data-only wheel, ships DLLs in
+                     # <site-packages>/nvidia/cudnn/bin/ but no Python module.
+                     # Note: the cuDNN DLLs need a CUDA 12 toolkit on PATH
+                     # (cublasLt64_12.dll etc.) — handled by setup.ps1 + the
+                     # bench script. nvidia-cublas-cu12 and nvidia-cuda-nvrtc-cu12
+                     # come in as transitive deps.
