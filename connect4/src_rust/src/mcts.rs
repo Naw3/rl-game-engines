@@ -83,17 +83,23 @@
 // ---------
 // The MCTS itself is single-threaded (each game owns one MCTS). The
 // network is shared across games via `Arc<Network>` (see `main.rs`)
-// so the 64 games spawned by rayon all use the same ONNX session.
-// `tract`'s `RunnableModel` is `Send + Sync` and serialises concurrent
-// `run` calls internally — safe by construction, no extra locking
-// needed on the Rust side. `ort`'s `Session` is wrapped in `Mutex` for
-// the same reason.
+// so the 64 games spawned by rayon all share the same inference backend.
+//
+// On CPU (tract), `RunnableModel` is `Send + Sync` and serialises
+// concurrent `run` calls internally — safe by construction.
+//
+// On GPU (ort), a single dispatcher thread owns the one ort `Session`
+// and receives board states from all 64 MCTS threads via a
+// `crossbeam_channel` queue. It batches incoming requests (up to 64
+// boards at once) into a single GPU forward pass, then routes results
+// back to their requesting threads. This eliminates per-call FFI
+// overhead and fully saturates the GPU.
 //
 // Reference: Silver et al., 2017, §3.3.2 (PUCT), §3.4.1 (value
 // backup, dirichlet noise), Algorithm 1 (the full self-play loop).
 // =============================================================================
 
-use crate::bitboard::{col_mask, Board};
+use crate::bitboard::Board;
 use crate::network::{Eval, Network};
 use rand::Rng;
 use rand::distributions::Distribution;
@@ -142,9 +148,9 @@ impl Default for MCTSConfig {
 struct Node {
     own: u64,
     opp: u64,
-    /// Index of the child node corresponding to action `a`. None = not yet
+    /// Index of the child node corresponding to action `a`. u32::MAX = not yet
     /// created (we expand on first visit).
-    children: [Option<usize>; 7],
+    children: [u32; 7],
     /// Visit count N(s, a) for each action.
     n: [u32; 7],
     /// Sum of leaf values W(s, a) for each action, from the perspective of
@@ -165,7 +171,7 @@ impl Node {
         Node {
             own,
             opp,
-            children: [None; 7],
+            children: [u32::MAX; 7],
             n: [0; 7],
             w: [0.0; 7],
             p: [0.0; 7],
@@ -195,6 +201,8 @@ pub struct MCTS {
     tree: Vec<Node>,
     /// Shared, thread-safe reference to the inference network.
     network: Arc<Network>,
+    /// Pre-allocated buffers for paths to avoid allocation in `select`
+    scratch_paths: Vec<Vec<PathEntry>>,
 }
 
 impl MCTS {
@@ -207,6 +215,7 @@ impl MCTS {
             config: cfg,
             tree: Vec::with_capacity(8192),
             network,
+            scratch_paths: (0..cfg.batch_size).map(|_| Vec::with_capacity(64)).collect(),
         }
     }
 
@@ -269,10 +278,14 @@ impl MCTS {
             let mut terminal_values: Vec<Option<f32>> = Vec::with_capacity(this_batch);
 
             for _ in 0..this_batch {
-                let (path, terminal_value) = self.select(root_idx);
+                let mut path = self.scratch_paths.pop().unwrap_or_else(|| Vec::with_capacity(64));
+                path.clear();
+                let terminal_value = self.select(root_idx, &mut path);
+                
                 if let Some(v) = terminal_value {
                     // Terminal: back up immediately, don't queue.
                     self.backup(&path, v);
+                    self.scratch_paths.push(path);
                     continue;
                 }
                 // Apply virtual loss along the path (skip the leaf's
@@ -295,7 +308,7 @@ impl MCTS {
 
                 // Phase 3: undo virtual loss, expand leaf with real priors,
                 // back up real value.
-                for ((path, _), eval) in paths.iter().zip(terminal_values.iter()).zip(evals.iter()) {
+                for ((path, _), eval) in paths.into_iter().zip(terminal_values.iter()).zip(evals.iter()) {
                     // Undo virtual loss.
                     for entry in path.iter() {
                         if entry.action != usize::MAX {
@@ -306,7 +319,8 @@ impl MCTS {
                     let leaf_idx = path.last().unwrap().node_idx;
                     self.expand_with_eval(leaf_idx, eval);
                     // Backup real value.
-                    self.backup(path, eval.value);
+                    self.backup(&path, eval.value);
+                    self.scratch_paths.push(path);
                 }
             }
 
@@ -318,11 +332,10 @@ impl MCTS {
     }
 
     /// Walk from `node_idx` down to a leaf (unexpanded node or terminal).
-    /// Returns the path (each step's node index + action taken) and:
+    /// Mutates the given path (each step's node index + action taken) and returns:
     ///   - `Some(value)` if the leaf is terminal (no NN eval needed), or
     ///   - `None` if the leaf is a normal unexpanded node to evaluate.
-    fn select(&mut self, node_idx: usize) -> (Vec<PathEntry>, Option<f32>) {
-        let mut path: Vec<PathEntry> = Vec::with_capacity(16);
+    fn select(&mut self, node_idx: usize, path: &mut Vec<PathEntry>) -> Option<f32> {
         let mut current = node_idx;
 
         loop {
@@ -331,13 +344,13 @@ impl MCTS {
             // terminal that we expand into".
             if let Some(v) = self.tree[current].is_terminal {
                 path.push(PathEntry { node_idx: current, action: usize::MAX });
-                return (path, Some(v));
+                return Some(v);
             }
 
             // Leaf (unexpanded): return for batched eval.
             if !self.tree[current].is_expanded {
                 path.push(PathEntry { node_idx: current, action: usize::MAX });
-                return (path, None);
+                return None;
             }
 
             // Internal: pick best PUCT child.
@@ -352,12 +365,13 @@ impl MCTS {
             let result = child_board.make_move(action);
 
             // Get or create the child node.
-            let child_idx = if let Some(idx) = self.tree[current].children[action] {
-                idx
+            let child = self.tree[current].children[action];
+            let child_idx = if child != u32::MAX {
+                child as usize
             } else {
                 let new_idx = self.tree.len();
                 self.tree.push(Node::new(child_board.own, child_board.opp));
-                self.tree[current].children[action] = Some(new_idx);
+                self.tree[current].children[action] = new_idx as u32;
                 new_idx
             };
 
@@ -370,20 +384,20 @@ impl MCTS {
                     self.tree[child_idx].is_terminal = Some(-1.0);
                     self.tree[child_idx].is_expanded = true;
                     path.push(PathEntry { node_idx: child_idx, action: usize::MAX });
-                    return (path, Some(-1.0));
+                    return Some(-1.0);
                 }
                 crate::bitboard::MoveResult::Draw => {
                     self.tree[child_idx].is_terminal = Some(0.0);
                     self.tree[child_idx].is_expanded = true;
                     path.push(PathEntry { node_idx: child_idx, action: usize::MAX });
-                    return (path, Some(0.0));
+                    return Some(0.0);
                 }
                 crate::bitboard::MoveResult::Continue => {
                     current = child_idx;
                 }
                 crate::bitboard::MoveResult::Illegal => {
                     // Should never happen if priors are correct.
-                    return (path, Some(0.0));
+                    return Some(0.0);
                 }
             }
         }
@@ -398,7 +412,7 @@ impl MCTS {
         }
         let occupied = node.own | node.opp;
         for c in 0..7 {
-            let legal = (occupied & col_mask(c)) != col_mask(c);
+            let legal = (occupied & (1u64 << (c * 7 + 5))) == 0;
             node.p[c] = if legal { eval.policy[c] } else { 0.0 };
         }
         node.is_expanded = true;

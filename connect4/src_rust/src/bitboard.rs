@@ -81,12 +81,13 @@ pub const fn col_top_guard(c: usize) -> u64 {
 pub fn next_empty_bit(occupied: u64, c: usize) -> Option<u64> {
     let mask = col_mask(c);
     let occ = occupied & mask;
-    if occ == mask {
-        return None; // column is full
-    }
     let next = ((occ | col_top_guard(c)) + col_bottom(c)) & mask;
-    debug_assert_eq!(next.count_ones(), 1, "next_empty_bit must be a single bit");
-    Some(next)
+    if next == 0 {
+        None
+    } else {
+        debug_assert_eq!(next.count_ones(), 1, "next_empty_bit must be a single bit");
+        Some(next)
+    }
 }
 
 /// 4-in-a-row check for a single player's u64. O(1), no loops.
@@ -133,7 +134,7 @@ impl Board {
         let mut mask = 0u8;
         let occ = self.own | self.opp;
         for c in 0..7usize {
-            if (occ & col_mask(c)) != col_mask(c) {
+            if (occ & (1u64 << (c * 7 + 5))) == 0 {
                 mask |= 1 << c;
             }
         }

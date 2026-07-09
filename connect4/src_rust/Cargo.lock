@@ -128,6 +128,7 @@ name = "connect4_mcts"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "crossbeam-channel",
  "ndarray 0.17.2",
  "ort",
  "rand",
@@ -161,6 +162,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "crossbeam-channel"
+version = "0.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]

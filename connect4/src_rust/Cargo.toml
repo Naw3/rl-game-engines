@@ -16,6 +16,7 @@ tract-onnx = "0.21"          # CPU backend (fast, pure Rust)
 tract-core = "0.21"          # Re-exports needed for tract's types
 ort = { version = "2.0.0-rc.12", features = ["std"] } # GPU backend (CUDA via onnxruntime). ort-sys's default features (download-binaries) auto-fetch the matching onnxruntime DLL.
 ndarray = "0.17"             # Input tensor construction (used by both backends). Bumped to 0.17 to match ort's transitive dep and avoid two-version conflicts.
+crossbeam-channel = "0.5"   # Lock-free MPSC for the GPU dispatcher request queue.
 
 [features]
 # Default: CPU only (tract). Build with `--features cuda` to enable

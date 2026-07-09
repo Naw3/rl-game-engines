@@ -57,6 +57,7 @@ CLI
 from __future__ import annotations
 
 import argparse
+import random
 import sys
 import time
 
@@ -100,7 +101,7 @@ def compute_loss(
     return policy_loss + value_loss, policy_loss, value_loss
 
 
-def export_onnx(model: Connect4Net, onnx_path: str, opset: int = 17) -> None:
+def export_onnx(model: Connect4Net, onnx_path: str, opset: int = 18) -> None:
     """Export the (already-trained) model to ONNX.
 
     Output contract — the Rust side (network.rs) reads by name:
@@ -123,17 +124,19 @@ def export_onnx(model: Connect4Net, onnx_path: str, opset: int = 17) -> None:
     model_cpu.eval()
 
     dummy = torch.randn(1, 3, 6, 7)
+
+    # Use dynamic_shapes (preferred over deprecated dynamic_axes with dynamo=True).
+    # Batch dimension is symbolic so the Rust backend can feed any batch size.
+    batch = torch.export.Dim("batch", min=1, max=256)
+    dynamic_shapes = {"input": {0: batch}}
+
     torch.onnx.export(
         model_cpu,
-        dummy,
+        (dummy,),
         onnx_path,
         input_names=["input"],
         output_names=["policy", "value"],
-        dynamic_axes={
-            "input": {0: "batch"},
-            "policy": {0: "batch"},
-            "value": {0: "batch"},
-        },
+        dynamic_shapes=dynamic_shapes,
         opset_version=opset,
         do_constant_folding=True,
     )
@@ -141,6 +144,25 @@ def export_onnx(model: Connect4Net, onnx_path: str, opset: int = 17) -> None:
     import onnx
     onnx_model = onnx.load(onnx_path)
     onnx.checker.check_model(onnx_model)
+
+
+class _ReplayDataset(torch.utils.data.Dataset):
+    def __init__(self, planes, policy, value):
+        self._planes, self._policy, self._value = planes, policy, value
+        self.count = len(planes)
+        self.symmetry = False
+    def __len__(self): return self.count
+    def __getitem__(self, idx):
+        planes = self._planes[idx]
+        policy = self._policy[idx]
+        value = self._value[idx]
+        if self.symmetry:
+            if random.random() < 0.5:
+                planes = planes[:, :, ::-1].copy()
+                policy = policy[::-1].copy()
+        return (torch.from_numpy(planes),
+                torch.from_numpy(policy),
+                torch.tensor(value, dtype=torch.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +197,7 @@ def main() -> None:
     p.add_argument("--no-compile", action="store_true", help="disable torch.compile")
     p.add_argument("--no-onnx", action="store_true",
                    help="skip ONNX export (debug only)")
-    p.add_argument("--onnx-opset", type=int, default=17)
+    p.add_argument("--onnx-opset", type=int, default=18)
     p.add_argument("--max-samples", type=int, default=None,
                    help="cap dataset size (for quick smoke tests)")
     p.add_argument("--log-every", type=int, default=20)
@@ -201,6 +223,10 @@ def main() -> None:
           f"onnx={'off' if args.no_onnx else 'on'}")
     print(f"[train] data={args.data}  out={args.out}")
     print(f"[train] epochs={args.epochs}  batch={args.batch}  lr={args.lr}")
+
+    if args.device == "cuda":
+        torch.backends.cudnn.benchmark = True
+        print("[train] enabled cudnn.benchmark for faster convolutions")
 
     # ---- Data -------------------------------------------------------------
     # If --data-dir is set, load all C4D1 files in it (replay buffer).
@@ -231,33 +257,15 @@ def main() -> None:
             own_arr, opp_arr = own_arr[:args.max_samples], opp_arr[:args.max_samples]
             policy_arr, value_arr = policy_arr[:args.max_samples], value_arr[:args.max_samples]
         planes_arr = decode_bitboard_batched(own_arr, opp_arr)
-        # Build a one-off dataset-like wrapper so the rest of the code is unchanged.
-        class _ReplayDataset:
-            def __init__(self, planes, policy, value):
-                self._planes, self._policy, self._value = planes, policy, value
-                self.count = len(planes)
-                self.symmetry = False
-            def __len__(self): return self.count
-            def __getitem__(self, idx):
-                planes = self._planes[idx]
-                policy = self._policy[idx]
-                value = self._value[idx]
-                if self.symmetry:
-                    import random as _r
-                    if _r.random() < 0.5:
-                        planes = planes[:, :, ::-1].copy()
-                        policy = policy[::-1].copy()
-                return (torch.from_numpy(planes),
-                        torch.from_numpy(policy),
-                        torch.tensor(value, dtype=torch.float32))
+        
         ds = _ReplayDataset(planes_arr, policy_arr, value_arr)
         ds.symmetry = args.symmetry
         if args.symmetry:
             print("[train] symmetry augmentation ON (horizontal flip, 50/50)")
-        # Force num_workers=0 for the replay path because _ReplayDataset is
-        # defined inside main() and can't be pickled by DataLoader workers.
+        
         if args.num_workers is None:
-            args.num_workers = 0
+            args.num_workers = 2
+
         # Quick stats for replay
         n = len(ds)
         n_pos = int((value_arr > 0).sum()); n_neg = int((value_arr < 0).sum())

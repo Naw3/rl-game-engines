@@ -492,10 +492,11 @@ fn play_game<R: Rng + ?Sized>(mcts: &mut MCTS, rng: &mut R) -> Vec<Sample> {
         }
     }
 
-    // Assign values. The winner is always the LAST mover (the move that
-    // created 4-in-a-row filled the column that made the line). So at
-    // the last sample, the player to move is the winner; everywhere else,
-    // the player to move is the loser. On a draw, all values are 0.
+    // Assign values. The winner is always the LAST mover (the player who made
+    // the move at index n-1). So the player to move at index n-1 gets +1.0.
+    // The opponent (player to move at index n-2) lost, so they get -1.0.
+    // The player to move at index n-3 gets +1.0, and so on, alternating backwards.
+    // On a draw, all values are 0.
     let n = samples.len();
     if let Some(MoveResult::Draw) = last_was_terminal {
         for s in samples.iter_mut() {
@@ -503,7 +504,7 @@ fn play_game<R: Rng + ?Sized>(mcts: &mut MCTS, rng: &mut R) -> Vec<Sample> {
         }
     } else {
         for (i, s) in samples.iter_mut().enumerate() {
-            s.value = if i + 1 == n { 1.0 } else { -1.0 };
+            s.value = if (n - 1 - i) % 2 == 0 { 1.0 } else { -1.0 };
         }
     }
 

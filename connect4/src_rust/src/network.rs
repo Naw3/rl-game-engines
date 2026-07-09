@@ -10,29 +10,42 @@
 //     for our 50K-param model. Always available (no external dep).
 //
 //   * `--device gpu`  → ort with CUDA execution provider. Requires
-//     `--features cuda` at build time, plus `onnnxruntime-gpu` and the
-//     CUDA toolkit at runtime. ~5x speedup over CPU on large workloads.
+//     `--features cuda` at build time, plus `onnxruntime-gpu` and the
+//     CUDA toolkit at runtime.
 //
 //   * `--device auto` → tries GPU first, falls back to CPU if CUDA is
-//     unavailable or fails to initialise. (Auto-resolves to Gpu iff the
-//     `cuda` feature was compiled in.)
+//     unavailable or fails to initialise.
 //
-// Performance note: `tract-onnx` is typically 1.5–3x faster than `ort`
-// on CPU for small models, because there's no FFI marshalling per call.
-// For our 227K-param model, CPU is the bottleneck either way, so the
-// tract path is the default for `--device auto` when CUDA isn't set up.
+// GPU Inference Architecture: Centralised Dispatcher
+// ---------------------------------------------------
+// When `--device gpu`, a single dedicated OS thread owns the one-and-only
+// ort `Session`. All 64 rayon MCTS worker threads send their board states
+// via a `crossbeam_channel` bounded MPSC queue. The dispatcher:
+//   1. Blocks on the first request (recv()).
+//   2. Drains additional pending requests without blocking (try_recv()),
+//      up to `MAX_DISPATCHER_BATCH` boards.
+//   3. Builds one (N, 3, 6, 7) tensor and runs a single ort forward pass.
+//   4. Sends each result back to its requester via a oneshot sync channel.
+// This achieves maximum GPU utilisation (large batches) while using only
+// one ort Session (minimum VRAM).
+//
+// CPU Inference Architecture: Tract (no pooling needed)
+// ------------------------------------------------------
+// On CPU, we use tract-onnx. `RunnableModel` is `Send + Sync` and
+// serialises concurrent `run` calls internally — safe by construction,
+// no extra locking needed on the Rust side.
 //
 // What "null" means
-// ----------------
+// -----------------
 // `Network::null()` returns a Network with no backend. It produces
 // uniform priors + value=0. The orchestrator's `init.py` ensures a real
-// model exists before the very first self-play, so the null path is
-// only hit if the `.onnx` was deleted manually.
+// model exists before the very first self-play.
 // =============================================================================
 
 use crate::bitboard::{col_mask, Board};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use crossbeam_channel::{bounded, Receiver, Sender};
 
 // --- tract imports (CPU backend) ------------------------------------------
 use tract_onnx::prelude::{
@@ -47,6 +60,12 @@ use ort::execution_providers::CUDAExecutionProvider;
 use ort::session::builder::SessionBuilder;
 use ort::session::Session;
 use ort::value::Value;
+
+/// Maximum number of boards batched together in a single GPU forward pass.
+/// With 64 concurrent MCTS threads, each submitting 1 board per select step,
+/// 64 is the natural ceiling. Larger = more GPU utilisation; smaller = lower
+/// latency per individual request.
+const MAX_DISPATCHER_BATCH: usize = 64;
 
 /// Inference device. `Auto` resolves at session load time based on
 /// whether the `cuda` feature was compiled in.
@@ -86,22 +105,33 @@ impl Device {
     }
 }
 
-/// The inference network. Holds an optional `Backend` (Tract or Ort)
+/// The inference network. Holds an optional `Backend` (Tract or OrtDispatcher)
 /// shared via `Arc` across all rayon worker threads.
 pub struct Network {
     backend: Option<Arc<Backend>>,
     device: Device,
 }
 
-/// Inference backend enum — dispatched at `evaluate` time. Both variants
-/// hold a thread-safe session handle.
+/// Inference backend enum — dispatched at `evaluate` time.
 enum Backend {
-    /// Pure-Rust CPU inference via tract-onnx. Fastest on small models.
+    /// Pure-Rust CPU inference via tract-onnx. `RunnableModel` is Send+Sync.
     Tract(Arc<TractSession>),
-    /// FFI to onnxruntime, supports CUDA via the `cuda` feature.
-    /// Wrapped in Mutex because ort 2.0 `Session::run` requires `&mut self`,
-    /// and we share the session across rayon worker threads via Arc.
-    Ort(Arc<Mutex<Session>>),
+    /// GPU inference via a centralised dispatcher thread. All worker threads
+    /// push `InferRequest` structs into the shared sender; the dispatcher owns
+    /// the single ort `Session` and batches incoming requests.
+    OrtDispatcher(InferQueue),
+}
+
+/// The sender half of the dispatcher's request queue. Cloned cheaply per thread.
+type InferQueue = Sender<InferRequest>;
+
+/// One inference request sent from an MCTS worker to the GPU dispatcher.
+struct InferRequest {
+    /// The board state to evaluate.
+    board: Board,
+    /// Channel to send the result back on. The dispatcher calls `send` after
+    /// completing the batch that contains this request.
+    reply: Sender<Eval>,
 }
 
 type TractSession = RunnableModel<TypedFact, Box<dyn TypedOp>, TypedModel>;
@@ -125,8 +155,10 @@ impl Network {
                 Backend::Tract(Arc::new(sess))
             }
             Device::Gpu => {
-                let sess = load_ort(path.as_ref(), Device::Gpu)?;
-                Backend::Ort(Arc::new(Mutex::new(sess)))
+                // Spawn the dedicated GPU dispatcher thread. It owns the
+                // single ort Session and processes batched requests.
+                let sender = start_dispatcher(path.as_ref())?;
+                Backend::OrtDispatcher(sender)
             }
             Device::Auto => unreachable!("Device::Auto must be resolved before load"),
         };
@@ -160,20 +192,22 @@ impl Network {
     pub fn evaluate(&self, board: Board) -> Eval {
         match self.backend.as_deref() {
             Some(Backend::Tract(sess)) => tract_eval(sess, board),
-            Some(Backend::Ort(sess)) => ort_eval(sess, board),
+            Some(Backend::OrtDispatcher(queue)) => dispatcher_eval(queue, board),
             None => null_eval(board),
         }
     }
 
-    /// Evaluate a batch of positions in a single forward pass.
-    #[allow(dead_code)] // planned for v1.1 batching pipeline
+    /// Evaluate a batch of positions. On GPU, each board is submitted
+    /// individually to the dispatcher — the dispatcher will merge them with
+    /// concurrent requests from other threads into a single large GPU batch.
+    /// On CPU (tract), they are forwarded as a single batch directly.
     pub fn evaluate_batch(&self, boards: &[Board]) -> Vec<Eval> {
         if boards.is_empty() {
             return Vec::new();
         }
         match self.backend.as_deref() {
             Some(Backend::Tract(sess)) => tract_batch_eval(sess, boards),
-            Some(Backend::Ort(sess)) => ort_batch_eval(sess, boards),
+            Some(Backend::OrtDispatcher(queue)) => dispatcher_batch_eval(queue, boards),
             None => boards.iter().map(|&b| null_eval(b)).collect(),
         }
     }
@@ -185,12 +219,9 @@ impl Network {
 
 /// Load the model with tract-onnx. CPU inference, fastest on this size.
 ///
-/// Note: the Python exporter sets `dynamic_axes={"input": {0: "batch"}}`, so
-/// the ONNX graph accepts any batch size. We therefore do NOT call
-/// `with_input_fact` here — that would lock the batch dim to 1 and break
-/// the batched inference path in `MCTS::run_with_batch`. Tract's shape
-/// inference reads the dynamic dim from the ONNX graph and lets us feed
-/// arbitrary batch sizes at runtime.
+/// Note: the Python exporter uses `dynamic_shapes` with the batch dimension
+/// symbolic, so the ONNX graph accepts any batch size. We therefore do NOT
+/// call `with_input_fact` here — that would lock the batch dim to 1.
 fn load_tract(path: &Path) -> Result<TractSession, Box<dyn std::error::Error>> {
     let session = tract_onnx::onnx()
         .model_for_path(path)?
@@ -200,8 +231,7 @@ fn load_tract(path: &Path) -> Result<TractSession, Box<dyn std::error::Error>> {
 }
 
 /// Load the model with ort. CUDA if `device == Gpu` and `cuda` feature
-/// compiled in; CPU otherwise. The CUDA execution provider is added
-/// FIRST so it has priority; CPU is the fallback.
+/// compiled in; CPU otherwise.
 fn load_ort(path: &Path, device: Device) -> Result<Session, Box<dyn std::error::Error>> {
     let mut builder = SessionBuilder::new()?;
 
@@ -229,6 +259,152 @@ fn load_ort(path: &Path, device: Device) -> Result<Session, Box<dyn std::error::
 }
 
 // ---------------------------------------------------------------------------
+// GPU Dispatcher
+// ---------------------------------------------------------------------------
+
+/// Spawn the GPU dispatcher thread. Returns the `Sender` half of the request
+/// queue; the `Receiver` is owned by the dispatcher thread.
+///
+/// The dispatcher thread exits automatically when all senders are dropped
+/// (i.e., when the `Network` is dropped at end of self-play).
+fn start_dispatcher(path: &Path) -> Result<InferQueue, Box<dyn std::error::Error>> {
+    // Bounded queue so backpressure prevents unbounded queuing.
+    // 256 slots: with 64 threads each queuing ~32 requests per sim batch,
+    // this gives enough headroom without unbounded memory growth.
+    let (tx, rx): (Sender<InferRequest>, Receiver<InferRequest>) = bounded(256);
+
+    let session = load_ort(path, Device::Gpu)?;
+
+    std::thread::Builder::new()
+        .name("ort-gpu-dispatcher".to_string())
+        .spawn(move || run_dispatcher(session, rx))?;
+
+    Ok(tx)
+}
+
+/// The main loop of the GPU dispatcher thread.
+fn run_dispatcher(mut session: Session, rx: Receiver<InferRequest>) {
+    loop {
+        // Block until at least one request arrives.
+        let first = match rx.recv() {
+            Ok(req) => req,
+            Err(_) => return, // all senders dropped → clean shutdown
+        };
+
+        // Drain as many additional requests as are immediately available,
+        // then wait up to 500 µs for stragglers before flushing.
+        // This "batching window" prevents degenerate batch-size-1 flushes
+        // when only a few MCTS games remain active at end-of-cycle.
+        let mut batch: Vec<InferRequest> = Vec::with_capacity(MAX_DISPATCHER_BATCH);
+        batch.push(first);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_micros(500);
+        loop {
+            if batch.len() >= MAX_DISPATCHER_BATCH {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(req) => batch.push(req),
+                Err(_) => break, // timeout or disconnected
+            }
+        }
+
+        let n = batch.len();
+
+        // Build the (N, 3, 6, 7) input tensor.
+        let boards: Vec<Board> = batch.iter().map(|r| r.board).collect();
+        let (shape, data) = boards_to_input(&boards);
+        let input_val = match Value::from_array((shape, data)) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[ort-dispatcher] failed to build input tensor: {e}");
+                for req in batch {
+                    let _ = req.reply.send(null_eval(req.board));
+                }
+                continue;
+            }
+        };
+
+        // Single GPU forward pass — the key to saturating the 4060.
+        let outputs = match session.run(ort::inputs!["input" => input_val]) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("[ort-dispatcher] inference error: {e}");
+                for req in batch {
+                    let _ = req.reply.send(null_eval(req.board));
+                }
+                continue;
+            }
+        };
+
+        let policy_view = outputs[0]
+            .try_extract_array::<f32>()
+            .expect("ort policy extraction failed");
+        let value_view = outputs[1]
+            .try_extract_array::<f32>()
+            .expect("ort value extraction failed");
+        let policy_data: Vec<f32> = policy_view.iter().copied().collect();
+        let value_data: Vec<f32> = value_view.iter().copied().collect();
+
+        // Dispatch results back to each requester.
+        for (i, req) in batch.into_iter().enumerate() {
+            let row = &policy_data[i * 7..(i + 1) * 7];
+            let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exp_row: Vec<f32> = row.iter().map(|x| (x - max).exp()).collect();
+            let sum: f32 = exp_row.iter().sum();
+            let mut policy = [0.0f32; 7];
+            for c in 0..7 {
+                policy[c] = exp_row[c] / sum;
+            }
+            let eval = Eval {
+                policy,
+                value: value_data[i],
+            };
+            let _ = req.reply.send(eval); // ignore if receiver already dropped
+        }
+
+        let _ = n; // suppress unused warning in non-debug builds
+    }
+}
+
+/// Submit one board to the GPU dispatcher and wait for its result.
+fn dispatcher_eval(queue: &InferQueue, board: Board) -> Eval {
+    let (reply_tx, reply_rx) = bounded(1);
+    queue
+        .send(InferRequest { board, reply: reply_tx })
+        .expect("GPU dispatcher thread has exited unexpectedly");
+    reply_rx
+        .recv()
+        .expect("GPU dispatcher closed reply channel")
+}
+
+/// Submit N boards to the GPU dispatcher, collecting results in order.
+/// The dispatcher merges these with concurrent requests from other
+/// threads into the largest possible batch before executing.
+fn dispatcher_batch_eval(queue: &InferQueue, boards: &[Board]) -> Vec<Eval> {
+    // Allocate one reply channel per board upfront.
+    let channels: Vec<(Sender<Eval>, Receiver<Eval>)> =
+        (0..boards.len()).map(|_| bounded(1)).collect();
+
+    // Send all requests before waiting on any reply — maximises batching.
+    for (board, (tx, _)) in boards.iter().zip(channels.iter()) {
+        queue
+            .send(InferRequest { board: *board, reply: tx.clone() })
+            .expect("GPU dispatcher thread has exited unexpectedly");
+    }
+
+    // Collect results in submission order.
+    channels
+        .into_iter()
+        .map(|(_, rx)| rx.recv().expect("GPU dispatcher closed reply channel"))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Tensor construction (shared by both backends)
 // ---------------------------------------------------------------------------
 
@@ -236,78 +412,53 @@ fn load_ort(path: &Path, device: Device) -> Result<Session, Box<dyn std::error::
 ///
 /// Plane 0 = "own" (current player's pieces, 1.0 at each cell).
 /// Plane 1 = "opponent" (1.0 at each cell where the opponent has a piece).
-/// Plane 2 = "turn" (all 1.0 — the third plane is a constant bias, as
-/// the model's contract requires 3 input planes per the C4D1 format).
+/// Plane 2 = "turn" (all 1.0 — constant bias plane, as per C4D1 format).
 ///
 /// The bit layout is the same column-major 7-bits-per-column encoding
 /// used in `bitboard.rs`: cell (row r, col c) → bit (c * 7 + r).
-///
-/// Returns `(shape, data)` so both backends can build their own tensor type
-/// from a plain `Vec<f32>` — this avoids ndarray version conflicts between
-/// tract (0.16) and ort (0.17) that show up at the type-identity level.
 fn board_to_input(board: Board) -> (Vec<usize>, Vec<f32>) {
     let shape = vec![1, 3, 6, 7];
     let mut data = Vec::with_capacity(1 * 3 * 6 * 7);
-    for c in 0..3 {
-        for r in 0..6 {
-            for col in 0..7 {
-                let bit = 1u64 << (col * 7 + r);
-                let v = match c {
-                    0 => {
-                        if board.own & bit != 0 {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                    1 => {
-                        if board.opp & bit != 0 {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                    _ => 1.0, // c == 2: turn plane, constant 1
-                };
-                data.push(v);
-            }
+
+    for r in 0..6 {
+        for col in 0..7 {
+            let bit = 1u64 << (col * 7 + r);
+            data.push(if board.own & bit != 0 { 1.0 } else { 0.0 });
         }
     }
+    for r in 0..6 {
+        for col in 0..7 {
+            let bit = 1u64 << (col * 7 + r);
+            data.push(if board.opp & bit != 0 { 1.0 } else { 0.0 });
+        }
+    }
+    for _ in 0..42 {
+        data.push(1.0);
+    }
+
     (shape, data)
 }
 
 /// Build a (N, 3, 6, 7) f32 tensor from a batch of Boards.
-#[allow(dead_code)] // planned for v1.1 batching pipeline
 fn boards_to_input(boards: &[Board]) -> (Vec<usize>, Vec<f32>) {
     let n = boards.len();
     let shape = vec![n, 3, 6, 7];
     let mut data = Vec::with_capacity(n * 3 * 6 * 7);
-    for b in 0..n {
-        let board = boards[b];
-        for c in 0..3 {
-            for r in 0..6 {
-                for col in 0..7 {
-                    let bit = 1u64 << (col * 7 + r);
-                    let v = match c {
-                        0 => {
-                            if board.own & bit != 0 {
-                                1.0
-                            } else {
-                                0.0
-                            }
-                        }
-                        1 => {
-                            if board.opp & bit != 0 {
-                                1.0
-                            } else {
-                                0.0
-                            }
-                        }
-                        _ => 1.0,
-                    };
-                    data.push(v);
-                }
+    for board in boards {
+        for r in 0..6 {
+            for col in 0..7 {
+                let bit = 1u64 << (col * 7 + r);
+                data.push(if board.own & bit != 0 { 1.0 } else { 0.0 });
             }
+        }
+        for r in 0..6 {
+            for col in 0..7 {
+                let bit = 1u64 << (col * 7 + r);
+                data.push(if board.opp & bit != 0 { 1.0 } else { 0.0 });
+            }
+        }
+        for _ in 0..42 {
+            data.push(1.0);
         }
     }
     (shape, data)
@@ -346,7 +497,6 @@ fn tract_eval(sess: &TractSession, board: Board) -> Eval {
     Eval { policy, value }
 }
 
-#[allow(dead_code)] // planned for v1.1 batching pipeline
 fn tract_batch_eval(sess: &TractSession, boards: &[Board]) -> Vec<Eval> {
     let n = boards.len();
     let (shape, data) = boards_to_input(boards);
@@ -380,83 +530,8 @@ fn tract_batch_eval(sess: &TractSession, boards: &[Board]) -> Vec<Eval> {
 }
 
 // ---------------------------------------------------------------------------
-// Backend-specific eval (ort)
+// Fallback: null network
 // ---------------------------------------------------------------------------
-
-fn ort_eval(sess: &Mutex<Session>, board: Board) -> Eval {
-    let (shape, data) = board_to_input(board);
-    let value = Value::from_array((shape, data)).expect("failed to build ort input Value");
-    // Extract everything we need from the session inside the lock guard.
-    // `outputs` holds references into the session, so we materialise the
-    // policy + value as owned data before releasing the lock.
-    let (policy, value_scalar): (Vec<f32>, f32) = {
-        let mut guard = sess.lock().expect("ort Mutex poisoned");
-        let outputs = guard
-            .run(ort::inputs!["input" => value])
-            .expect("ort inference failed for single position");
-        let policy_view = outputs[0]
-            .try_extract_array::<f32>()
-            .expect("ort policy output extraction failed");
-        let value_view = outputs[1]
-            .try_extract_array::<f32>()
-            .expect("ort value output extraction failed");
-        let policy: Vec<f32> = policy_view.iter().copied().collect();
-        let v = *value_view
-            .as_slice()
-            .and_then(|s| s.first())
-            .expect("ort value output has no elements");
-        (policy, v)
-    };
-    let max = policy.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exp_row: Vec<f32> = policy.iter().map(|x| (x - max).exp()).collect();
-    let sum: f32 = exp_row.iter().sum();
-    let mut policy_arr = [0.0f32; 7];
-    for c in 0..7 {
-        policy_arr[c] = exp_row[c] / sum;
-    }
-    Eval {
-        policy: policy_arr,
-        value: value_scalar,
-    }
-}
-
-#[allow(dead_code)] // planned for v1.1 batching pipeline
-fn ort_batch_eval(sess: &Mutex<Session>, boards: &[Board]) -> Vec<Eval> {
-    let n = boards.len();
-    let (shape, data) = boards_to_input(boards);
-    let value = Value::from_array((shape, data)).expect("failed to build batched ort input Value");
-    let (policy_data, value_data) = {
-        let mut guard = sess.lock().expect("ort Mutex poisoned");
-        let outputs = guard
-            .run(ort::inputs!["input" => value])
-            .expect("ort inference failed for batch");
-        let policy_view = outputs[0]
-            .try_extract_array::<f32>()
-            .expect("ort policy output extraction failed");
-        let value_view = outputs[1]
-            .try_extract_array::<f32>()
-            .expect("ort value output extraction failed");
-        let p = policy_view.iter().copied().collect::<Vec<f32>>();
-        let v = value_view.iter().copied().collect::<Vec<f32>>();
-        (p, v)
-    };
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let row = &policy_data[i * 7..(i + 1) * 7];
-        let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exp_row: Vec<f32> = row.iter().map(|x| (x - max).exp()).collect();
-        let sum: f32 = exp_row.iter().sum();
-        let mut policy = [0.0f32; 7];
-        for c in 0..7 {
-            policy[c] = exp_row[c] / sum;
-        }
-        out.push(Eval {
-            policy,
-            value: value_data[i],
-        });
-    }
-    out
-}
 
 /// Fallback evaluation: uniform over legal moves, value = 0.
 fn null_eval(board: Board) -> Eval {

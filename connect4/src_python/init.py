@@ -55,7 +55,7 @@ _DEFAULT_ONNX = str(_PROJECT_ROOT / "connect4_model.onnx")
 def export_onnx(
     model: Connect4Net,
     onnx_path: str,
-    opset: int = 17,
+    opset: int = 18,
 ) -> None:
     """Export `model` to ONNX with dynamic batch dim and named I/O.
 
@@ -69,17 +69,18 @@ def export_onnx(
     """
     model.eval()
     dummy = torch.randn(1, 3, 6, 7)
+
+    # Use dynamic_shapes (preferred over deprecated dynamic_axes with dynamo=True).
+    batch = torch.export.Dim("batch", min=1, max=256)
+    dynamic_shapes = {"input": {0: batch}}
+
     torch.onnx.export(
         model,
-        dummy,
+        (dummy,),
         onnx_path,
         input_names=["input"],
         output_names=["policy", "value"],
-        dynamic_axes={
-            "input": {0: "batch"},
-            "policy": {0: "batch"},
-            "value": {0: "batch"},
-        },
+        dynamic_shapes=dynamic_shapes,
         opset_version=opset,
         do_constant_folding=True,
     )
@@ -95,7 +96,7 @@ def main() -> int:
                    help=f"PyTorch state_dict output path (default {_DEFAULT_PT})")
     p.add_argument("--out-onnx", default=_DEFAULT_ONNX,
                    help=f"ONNX output path, consumed by Rust MCTS (default {_DEFAULT_ONNX})")
-    p.add_argument("--opset", type=int, default=17, help="ONNX opset version")
+    p.add_argument("--opset", type=int, default=18, help="ONNX opset version")
     p.add_argument("--force", action="store_true",
                    help="Overwrite existing files")
     p.add_argument("--channels", type=int, default=64)

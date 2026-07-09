@@ -32,6 +32,7 @@ architectures that want a turn/empty plane.
 
 from __future__ import annotations
 
+import random
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -188,8 +189,7 @@ class C4Dataset(Dataset):
             # 50/50: with prob 0.5 apply horizontal flip.
             # No RNG of our own — torch/numpy ops use the default global RNG,
             # which is fine for data aug (the model doesn't need reproducible batches).
-            import random as _r
-            if _r.random() < 0.5:
+            if random.random() < 0.5:
                 planes = planes[:, :, ::-1].copy()  # flip cols (axis=2)
                 policy = policy[::-1].copy()        # flip policy columns
 

@@ -93,11 +93,9 @@ function Invoke-Cycle([string]$RustDevice) {
     $env:SIMS          = "$SIMS"
     $env:EPOCHS        = "$EPOCHS"
     $env:BATCH         = "$BATCH"
-    # Batching strategy: BATCH_SIZE=1 for CPU (tract already optimal at batch=1,
-    # batching ADDS overhead via virtual loss bookkeeping). BATCH_SIZE=32 for GPU
-    # (ort+CUDA is FFI-bound per-call, batching hides that latency).
-    $env:BATCH_SIZE    = if ($RustDevice -eq "gpu") { "32" } else { "1" }
-
+    # Batching strategy: BATCH_SIZE=32. With recent optimizations, batching
+    # works nicely on CPU as well by reducing tree-traversal overhead.
+    $env:BATCH_SIZE    = "32"
     Write-Host ""
     Write-Host "[bench] ============== Config: rust=$RustDevice + python=$PYTHON_DEVICE =============="
     $t = Measure-Command { & ".\run_pipeline.ps1" }
