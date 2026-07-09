@@ -1,0 +1,48 @@
+# --- Rust ---
+# Build artifacts. `target/` is recreated by `cargo build` from Cargo.toml.
+**/target/
+
+# Cargo.lock IS committed for binary crates (this is a binary, not a library).
+# See https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html
+
+# --- Python ---
+# Bytecode caches and pyc files. Recreated on import.
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+
+# Test / coverage caches.
+**/.pytest_cache/
+**/.coverage
+**/htmlcov/
+
+# Virtual environments (never commit).
+**/.venv/
+**/venv/
+**/env/
+
+# Setuptools / build artifacts.
+**/*.egg-info/
+**/dist/
+**/build/
+
+# --- ML artifacts ---
+# Trained model weights and training data are large and regenerable.
+# Run `python init.py` to recreate the random-init bootstrap, then
+# `python train.py` to retrain from a self-play cycle.
+**/*.pt
+**/*.onnx
+**/*.bin
+
+# --- IDE / editor ---
+**/.idea/
+**/.vscode/
+**/*.swp
+**/*.swo
+**/*~
+**/.vs/
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
