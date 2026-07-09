@@ -41,13 +41,16 @@ $PYTHON_DEVICE = "cuda"
 # runtime DLLs (cublasLt64_12.dll, etc.) are on PATH. The Rust `ort` crate's CUDA
 # execution provider loads these via dlopen at runtime.
 #
-# Best-effort discovery — relies on the user having either a CUDA toolkit
-# installed system-wide (auto-discovered under ProgramFiles) or the
-# nvidia-cudnn-cu12 wheel installed via pip. If the user runs this
-# script in an admin shell, the system PATH (which includes the NVIDIA
-# installer entries) is fully inherited, and the discovery below is
-# usually a no-op confirmation.
+# Discovery (no hardcodes):
+#   - cuDNN: ask pip directly for the install location of the nvidia-cudnn-cu12
+#     wheel, then derive <site-packages>/nvidia/cudnn/bin/. Works for
+#     system-wide AND user-mode installs.
+#   - CUDA toolkit: scan ProgramFiles for any v1x.x toolkit whose bin/ contains
+#     cublasLt64_12.dll (the cuDNN-cu12 compatibility marker — this DLL only
+#     exists in CUDA 12.x toolkits). If found, prepend its bin to PATH. This
+#     handles stale registry PATH entries and multiple CUDA installs.
 $cudnnBin = $null
+$cudaBin  = $null
 try {
     $cudnnLoc = & $PYTHON -c "import importlib.metadata, os; dist = importlib.metadata.distribution('nvidia-cudnn-cu12'); print(os.path.join(os.path.dirname(dist._path), 'nvidia', 'cudnn', 'bin'))" 2>$null
     $cudnnLoc = ($cudnnLoc | Select-Object -Last 1).Trim()
@@ -55,12 +58,23 @@ try {
 } catch {}
 if ($cudnnBin) { $env:PATH = "$cudnnBin;$env:PATH" }
 
+if (Test-Path "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA") {
+    $cudaRoot = Get-ChildItem "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^v1[02]\.' } |  # v10.x or v12.x (skip v13+: no cublasLt64_12.dll)
+        Where-Object { Test-Path (Join-Path $_.FullName 'bin\cublasLt64_12.dll') } |
+        Sort-Object { $_.Name } -Descending |
+        Select-Object -First 1 -ExpandProperty FullName
+    if ($cudaRoot) { $cudaBin = Join-Path $cudaRoot 'bin' }
+}
+if ($cudaBin) { $env:PATH = "$cudaBin;$env:PATH" }
+
 Write-Host "[bench] params: GAMES=$GAMES SIMS=$SIMS EPOCHS=$EPOCHS BATCH=$BATCH"
 Write-Host "[bench] python device: $PYTHON_DEVICE (hard-coded)"
 if ($cudaBin) {
     Write-Host "[bench] CUDA bin on PATH:   yes ($cudaBin)"
 } else {
-    Write-Host "[bench] CUDA bin on PATH:   NO - CUDA toolkit not on PATH. Run this script in an admin shell, or install CUDA 12.x."
+    Write-Host "[bench] CUDA bin on PATH:   NO - no CUDA v12.x toolkit with cublasLt64_12.dll found."
+    Write-Host "           (nvidia-cudnn-cu12 wheel needs CUDA 12.x. Run setup.ps1 or: winget install Nvidia.CUDA --version 12.6)"
 }
 if ($cudnnBin) {
     Write-Host "[bench] cuDNN bin on PATH:  yes ($cudnnBin)"
