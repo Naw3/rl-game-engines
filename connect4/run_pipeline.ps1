@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # run_pipeline.ps1 â€- Endless self-play â†- train loop for Connect4Net (Windows).
 #
 # Same logic as the previous bash version, but native PowerShell.
@@ -22,6 +22,15 @@ Push-Location $ScriptDir
 function Format-Seconds([datetime]$t0, [datetime]$t1) {
     $elapsed = [math]::Round(($t1 - $t0).TotalSeconds, 1)
     return "$elapsed s"
+}
+
+# --- Config file (optional) -------------------------------------------------
+# pipeline.conf.ps1 sets env vars before the defaults below are read.
+# Edit that file to change devices, games, sims, epochs, etc.
+$_conf = Join-Path $ScriptDir "pipeline.conf.ps1"
+if (Test-Path $_conf) {
+    . $_conf
+    Write-Host "[pipeline] loaded config: $_conf"
 }
 
 # --- Defaults / env --------------------------------------------------------

@@ -16,6 +16,10 @@
 # Wall-clock time is reported for each. Speedup = A / B.
 # =============================================================================
 
+param (
+    [string]$Mode = "both" # Peut être "cpu", "gpu" ou "both"
+)
+
 # --- Pull in the system PATH from registry (no admin needed) -------------
 # The NVIDIA installer writes CUDA toolkit + cuDNN into the SYSTEM PATH
 # (HKLM\...Session Manager\Environment\Path). Non-elevated shells only
@@ -29,10 +33,10 @@ if ($sysPath) {
 $ErrorActionPreference = "Stop"
 
 # --- Shared knobs (override via env before running) --------------------------
-$GAMES  = if ($env:GAMES)  { [int]$env:GAMES }  else { 64 }
-$SIMS   = if ($env:SIMS)   { [int]$env:SIMS }   else { 800 }
-$EPOCHS = if ($env:EPOCHS) { [int]$env:EPOCHS } else { 5 }
-$BATCH  = if ($env:BATCH)  { [int]$env:BATCH }  else { 256 }
+$GAMES       = 256
+$SIMS        = 800
+$EPOCHS      = 5
+$BATCH_SIZE  = 32
 
 # Python is ALWAYS GPU per the design contract. Don't make this configurable.
 $PYTHON_DEVICE = "cuda"
@@ -69,7 +73,7 @@ if (Test-Path "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA") {
 }
 if ($cudaBin) { $env:PATH = "$cudaBin;$env:PATH" }
 
-Write-Host "[bench] params: GAMES=$GAMES SIMS=$SIMS EPOCHS=$EPOCHS BATCH=$BATCH"
+Write-Host "[bench] params: GAMES=$GAMES SIMS=$SIMS EPOCHS=$EPOCHS BATCH=$BATCH_SIZE"
 Write-Host "[bench] python device: $PYTHON_DEVICE (hard-coded)"
 if ($cudaBin) {
     Write-Host "[bench] CUDA bin on PATH:   yes ($cudaBin)"
@@ -92,21 +96,41 @@ function Invoke-Cycle([string]$RustDevice) {
     $env:GAMES         = "$GAMES"
     $env:SIMS          = "$SIMS"
     $env:EPOCHS        = "$EPOCHS"
-    $env:BATCH         = "$BATCH"
+    $env:BATCH_SIZE    = "$BATCH_SIZE"
     # Batching strategy: BATCH_SIZE=32. With recent optimizations, batching
     # works nicely on CPU as well by reducing tree-traversal overhead.
-    $env:BATCH_SIZE    = "32"
+    # Détermination de la taille de batch MCTS
+    if ($RustDevice -eq "cpu") {
+        $env:BATCH_SIZE = [string]$env:NUMBER_OF_PROCESSORS  # Auto-détection (12 sur ton fixe, 8 sur laptop)
+    } else {
+        $env:BATCH_SIZE = [string]$BATCH_SIZE  # Utilise la variable globale du script (ex: 256 ou 128)
+    }
+
     Write-Host ""
     Write-Host "[bench] ============== Config: rust=$RustDevice + python=$PYTHON_DEVICE =============="
-    $t = Measure-Command { & ".\run_pipeline.ps1" }
+    $t = Measure-Command {
+        & ".\run_pipeline.ps1" -Games $GAMES -Sims $SIMS -Epochs $EPOCHS -Batch $env:BATCH_SIZE -BatchSize $env:BATCH_SIZE -RustDevice $RustDevice -PythonDevice $PYTHON_DEVICE
+    }
     Write-Host ""
     Write-Host ("[bench] >> total wall-clock for this config: {0:F1} s" -f $t.TotalSeconds)
     return $t.TotalSeconds
 }
 
+# Déplacer temporairement la conf locale pour que le banc d'essai ait la priorité
+$hasConf = Test-Path "pipeline.conf.ps1"
+if ($hasConf) { Rename-Item "pipeline.conf.ps1" "pipeline.conf.ps1.bak" -Force }
+
 # --- Run both configs ------------------------------------------------------
-$timeA = Invoke-Cycle -RustDevice "cpu"
-$timeB = Invoke-Cycle -RustDevice "gpu"
+# --- Run selected configs --------------------------------------------------
+$timeA = 0
+$timeB = 0
+
+if ($Mode -eq "cpu" -or $Mode -eq "both") {
+    $timeA = Invoke-Cycle -RustDevice "cpu"
+}
+if ($Mode -eq "gpu" -or $Mode -eq "both") {
+    $timeB = Invoke-Cycle -RustDevice "gpu"
+}
 
 # --- Report -----------------------------------------------------------------
 Write-Host ""
