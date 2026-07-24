@@ -350,9 +350,7 @@ def main() -> None:
             print("[train] symmetry augmentation ON (horizontal flip, 50/50)")
         
         if args.num_workers is None:
-            args.num_workers = 2
-
-        # Quick stats for replay
+            args.num_workers = 0  # 0 is vastly faster on Windows for small memory-loaded datasets (no process spawn overhead)
         n = len(ds)
         n_pos = int((value_arr > 0).sum()); n_neg = int((value_arr < 0).sum())
         print(f"[train] replay dataset: {n:,} samples | wins={n_pos} losses={n_neg} draws={n - n_pos - n_neg}")
