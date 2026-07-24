@@ -42,9 +42,25 @@ bounded and the patterns are local (3×3 convs cover any potential).
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+try:
+    from config import CONFIG
+    _DEFAULT_CHANNELS = CONFIG.network.channels
+    _DEFAULT_NUM_BLOCKS = CONFIG.network.num_blocks
+except Exception as err:
+    print(f"[model] WARNING: Failed to load config.py ({err}); using fallbacks (channels=64, num_blocks=3)")
+    _DEFAULT_CHANNELS = 64
+    _DEFAULT_NUM_BLOCKS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -75,11 +91,15 @@ class Connect4Net(nn.Module):
     """AlphaZero-style policy + value network for Connect 4.
 
     Args:
-        channels:  width of the conv trunk (default 64).
-        num_blocks: number of residual blocks in the trunk (default 3).
+        channels:  width of the conv trunk.
+        num_blocks: number of residual blocks in the trunk.
     """
 
-    def __init__(self, channels: int = 64, num_blocks: int = 3) -> None:
+    def __init__(
+        self,
+        channels: int = _DEFAULT_CHANNELS,
+        num_blocks: int = _DEFAULT_NUM_BLOCKS,
+    ) -> None:
         super().__init__()
         self.channels = channels
         self.num_blocks = num_blocks

@@ -81,13 +81,90 @@ struct Sample {
     value: f32,
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+struct ConfigJson {
+    mcts: Option<MctsJson>,
+    gui: Option<GuiJson>,
+    paths: Option<PathsJson>,
+    device: Option<DeviceJson>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MctsJson {
+    games: Option<usize>,
+    sims: Option<usize>,
+    cpu_batch_size: Option<usize>,
+    gpu_batch_size: Option<usize>,
+    c_puct: Option<f32>,
+    dirichlet_alpha: Option<f32>,
+    dirichlet_epsilon: Option<f32>,
+    temperature: Option<f32>,
+    seed: Option<u64>,
+    warmup: Option<usize>,
+    bench_iterations: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GuiJson {
+    progress_bar_width: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PathsJson {
+    model_onnx: Option<String>,
+    selfplay_bin: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+struct DeviceJson {
+    rust_device: Option<String>,
+}
+
+fn load_config_from_python() -> Option<ConfigJson> {
+    let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent()?;
+    let config_py = parent.join("config.py");
+    if !config_py.exists() {
+        eprintln!("[selfplay] WARNING: config.py not found at {}; using fallback defaults", config_py.display());
+        return None;
+    }
+
+    let venv_py = parent.join(".venv").join("Scripts").join("python.exe");
+    let py_cmd = if venv_py.exists() {
+        venv_py.to_string_lossy().to_string()
+    } else {
+        "python".to_string()
+    };
+
+    let output = match std::process::Command::new(&py_cmd)
+        .arg(&config_py)
+        .current_dir(parent)
+        .output() {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("[selfplay] WARNING: Failed to execute python config.py ({}); using fallback defaults", e);
+                return None;
+            }
+        };
+
+    if output.status.success() {
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        match serde_json::from_str::<ConfigJson>(&stdout_str) {
+            Ok(cfg) => return Some(cfg),
+            Err(e) => eprintln!("[selfplay] WARNING: Failed to parse JSON output from config.py ({}); using fallback defaults", e),
+        }
+    } else {
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        eprintln!("[selfplay] WARNING: config.py exited with failure ({}); using fallback defaults", stderr_str.trim());
+    }
+    None
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
 
     // --- Subcommand dispatch ---------------------------------------------
-    // If the first non-flag positional argument is `benchmark`, run the
-    // NN inference benchmark and exit. Otherwise (or if the first arg
-    // is a flag like `--games`), run the default self-play pipeline.
     if args.len() > 1 && !args[1].starts_with('-') {
         match args[1].as_str() {
             "benchmark" => return run_benchmark(&args[2..]),
@@ -104,21 +181,19 @@ fn main() -> ExitCode {
     }
 
     // --- Default: self-play mode -----------------------------------------
-    // Defaults.
-    let mut num_games: usize = 64;
-    let mut simulations: usize = mcts::DEFAULT_SIMS;
-    let mut batch_size: usize = mcts::DEFAULT_BATCH_SIZE;
-    let mut seed: u64 = 0xC0FFEE_u64;
-    let mut output: String = "selfplay.bin".to_string();
-    // Default model path: `<project_root>/connect4_model.onnx`. We resolve
-    // the project root at compile time via `CARGO_MANIFEST_DIR` (the
-    // directory holding this crate's Cargo.toml, i.e. `src_rust/`), then
-    // go one level up. This means the binary works from any cwd — no
-    // need to `cd` to the project root before running. The user can
-    // still override with `-m <path>`.
-    let mut model_path: String = default_model_path().to_string_lossy().to_string();
-    let mut temperature: f32 = 1.0;
-    let mut dirichlet_eps: f32 = mcts::DEFAULT_DIRICHLET_EPSILON;
+    let json_cfg = load_config_from_python();
+
+    // Defaults initialized from config.json if present, fallback to built-in defaults.
+    let mut num_games: usize = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.games).unwrap_or(64);
+    let mut simulations: usize = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.sims).unwrap_or(mcts::DEFAULT_SIMS);
+    let mut batch_size_opt: Option<usize> = None;
+    let mut seed: u64 = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.seed).unwrap_or(0xC0FFEE_u64);
+    let mut output: String = json_cfg.as_ref().and_then(|c| c.paths.as_ref()?.selfplay_bin.clone()).unwrap_or_else(|| "selfplay.bin".to_string());
+    let mut model_path: String = json_cfg.as_ref().and_then(|c| c.paths.as_ref()?.model_onnx.clone()).unwrap_or_else(|| default_model_path().to_string_lossy().to_string());
+    let mut temperature: f32 = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.temperature).unwrap_or(1.0);
+    let mut c_puct: f32 = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.c_puct).unwrap_or(mcts::DEFAULT_C_PUCT);
+    let dirichlet_alpha: f32 = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.dirichlet_alpha).unwrap_or(mcts::DEFAULT_DIRICHLET_ALPHA);
+    let mut dirichlet_eps: f32 = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.dirichlet_epsilon).unwrap_or(mcts::DEFAULT_DIRICHLET_EPSILON);
     let mut device: network::Device = network::Device::Auto;
     let mut verbose: bool = false;
 
@@ -132,26 +207,21 @@ fn main() -> ExitCode {
         };
         match a.as_str() {
             "--games" | "-g" => {
-                num_games = next(&mut i).parse().unwrap_or_else(|_| {
-                    eprintln!("invalid --games value");
-                    64
-                });
+                num_games = next(&mut i).parse().unwrap_or(64);
             }
             "--sims" | "-s" => {
-                simulations = next(&mut i).parse().unwrap_or_else(|_| {
-                    eprintln!("invalid --sims value");
-                    mcts::DEFAULT_SIMS
-                });
+                simulations = next(&mut i).parse().unwrap_or(mcts::DEFAULT_SIMS);
             }
             "--batch-size" | "-b" => {
-                batch_size = next(&mut i).parse().unwrap_or_else(|_| {
-                    eprintln!("invalid --batch-size value");
-                    mcts::DEFAULT_BATCH_SIZE
-                });
-                if batch_size < 1 {
-                    eprintln!("--batch-size must be >= 1, got {}", batch_size);
+                let b: usize = next(&mut i).parse().unwrap_or(32);
+                if b < 1 {
+                    eprintln!("--batch-size must be >= 1, got {}", b);
                     return ExitCode::from(2);
                 }
+                batch_size_opt = Some(b);
+            }
+            "--c-puct" => {
+                c_puct = next(&mut i).parse().unwrap_or(mcts::DEFAULT_C_PUCT);
             }
             "--seed" => {
                 seed = next(&mut i).parse().unwrap_or(0xC0FFEE_u64);
@@ -227,11 +297,23 @@ fn main() -> ExitCode {
         }
     };
 
+    let batch_size = match batch_size_opt {
+        Some(b) => b,
+        None => {
+            let cpu_b = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.cpu_batch_size).unwrap_or_else(|| rayon::current_num_threads());
+            let gpu_b = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.gpu_batch_size).unwrap_or(32);
+            match network.device() {
+                network::Device::Cpu => cpu_b,
+                network::Device::Gpu | network::Device::Auto => gpu_b,
+            }
+        }
+    };
+
     let config = MCTSConfig {
         simulations,
         batch_size,
-        c_puct: mcts::DEFAULT_C_PUCT,
-        dirichlet_alpha: mcts::DEFAULT_DIRICHLET_ALPHA,
+        c_puct,
+        dirichlet_alpha,
         dirichlet_epsilon: dirichlet_eps,
         temperature,
     };
@@ -264,6 +346,20 @@ fn main() -> ExitCode {
     // tree) and its own RNG, but ALL workers share the same
     // Arc<Network>. The network is the only synchronisation point
     // across threads; tract serialises concurrent run() calls internally.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let completed_games = Arc::new(AtomicUsize::new(0));
+    let total_plies = Arc::new(AtomicUsize::new(0));
+
+    if verbose {
+        let bar_width = json_cfg.as_ref().and_then(|c| c.gui.as_ref()?.progress_bar_width).unwrap_or(20);
+        let bar = format!("[{}]", " ".repeat(bar_width));
+        eprint!(
+            "\r\x1B[K[selfplay]   0% {}    0/{} | avg 0.0 moves | 0.0s | 0.0s/game | ETA: --",
+            bar, num_games
+        );
+        let _ = std::io::stderr().flush();
+    }
+
     let samples: Vec<Sample> = (0..num_games)
         .into_par_iter()
         .enumerate()
@@ -274,14 +370,53 @@ fn main() -> ExitCode {
             let mut rng = StdRng::seed_from_u64(game_seed);
             let mut mcts = MCTS::new(config, Arc::clone(&network));
             let game_samples = play_game(&mut mcts, &mut rng);
-            if verbose && (game_idx < 4 || game_idx % 16 == 0) {
-                eprintln!(
-                    "[selfplay] game {:4}/{}: {} samples, {} plies",
-                    game_idx + 1,
-                    num_games,
-                    game_samples.len(),
-                    game_samples.len()
+
+            let completed = completed_games.fetch_add(1, Ordering::SeqCst) + 1;
+            let current_plies = total_plies.fetch_add(game_samples.len(), Ordering::SeqCst) + game_samples.len();
+
+            if verbose {
+                let elapsed = start.elapsed().as_secs_f64();
+                let avg_plies = current_plies as f64 / completed as f64;
+                let sec_per_game = elapsed / completed as f64;
+                let remaining_games = num_games.saturating_sub(completed);
+                let eta_sec = sec_per_game * remaining_games as f64;
+
+                let format_dur = |s: f64| -> String {
+                    if s < 0.001 {
+                        "< 1ms".to_string()
+                    } else if s < 1.0 {
+                        format!("{:.0}ms", s * 1000.0)
+                    } else if s < 60.0 {
+                        format!("{:.1}s", s)
+                    } else if s < 3600.0 {
+                        let u = s.round() as u64;
+                        format!("{}m {:02}s", u / 60, u % 60)
+                    } else {
+                        let u = s.round() as u64;
+                        format!("{}h {:02}m {:02}s", u / 3600, (u % 3600) / 60, u % 60)
+                    }
+                };
+
+                let time_str = format_dur(elapsed);
+                let eta_str = format_dur(eta_sec);
+                let per_game_str = format!("{}/game", format_dur(sec_per_game));
+
+                let pct = (completed * 100) / num_games;
+                let bar_width = json_cfg.as_ref().and_then(|c| c.gui.as_ref()?.progress_bar_width).unwrap_or(20);
+                let filled = (completed * bar_width) / num_games;
+                let empty = bar_width - filled;
+                let bar = format!(
+                    "[{}{}{}]",
+                    "=".repeat(filled),
+                    if filled < bar_width { ">" } else { "" },
+                    " ".repeat(if empty > 0 { empty - 1 } else { 0 })
                 );
+
+                eprint!(
+                    "\r\x1B[K[selfplay] {:3}% {} {:4}/{} | avg {:.1} moves | {} | {} | ETA: {}",
+                    pct, bar, completed, num_games, avg_plies, time_str, per_game_str, eta_str
+                );
+                let _ = std::io::stderr().flush();
             }
             game_samples
         })
@@ -291,6 +426,7 @@ fn main() -> ExitCode {
         });
 
     if verbose {
+        eprintln!();
         eprintln!(
             "[selfplay] {} games → {} samples in {:?}",
             num_games,
@@ -363,9 +499,10 @@ fn default_model_path() -> std::path::PathBuf {
 /// of the inference backend (tract-cpu vs ort-cpu vs ort-gpu) so you
 /// can decide if the GPU setup is worth the build/runtime cost.
 fn run_benchmark(args: &[String]) -> ExitCode {
-    let mut iterations: usize = 1000;
-    let mut warmup: usize = 20;
-    let mut model_path = default_model_path().to_string_lossy().to_string();
+    let json_cfg = load_config_from_python();
+    let mut iterations: usize = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.bench_iterations).unwrap_or(1000);
+    let mut warmup: usize = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.warmup).unwrap_or(20);
+    let mut model_path = json_cfg.as_ref().and_then(|c| c.paths.as_ref()?.model_onnx.clone()).unwrap_or_else(|| default_model_path().to_string_lossy().to_string());
     let mut device = network::Device::Auto;
 
     let mut i = 0;

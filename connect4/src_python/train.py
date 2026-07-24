@@ -60,6 +60,9 @@ import argparse
 import random
 import sys
 import time
+from pathlib import Path
+import warnings
+import logging
 
 # Force UTF-8 on stdout/stderr. Windows defaults to cp1252 which crashes on
 # Unicode arrows / Greek letters in print() output. Safe on all platforms.
@@ -68,6 +71,60 @@ try:
     sys.stderr.reconfigure(encoding="utf-8")
 except Exception:
     pass
+
+# Suppress standard Python warnings and specific library warnings
+warnings.filterwarnings("ignore")
+
+# PyTorch 2.5+ uses standard python logging for torch.onnx
+# We set the level to ERROR to suppress the verbose export logs.
+logging.getLogger("torch.onnx").setLevel(logging.ERROR)
+logging.getLogger("torch.onnx._internal").setLevel(logging.ERROR)
+logging.getLogger("torch.export").setLevel(logging.ERROR)
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+try:
+    from config import CONFIG
+    _DEFAULT_DATA = str(CONFIG.paths.selfplay_bin.name)
+    _DEFAULT_OUT = str(CONFIG.paths.model_pt.name)
+    _DEFAULT_EPOCHS = CONFIG.train.epochs
+    _DEFAULT_BATCH = CONFIG.train.batch_size
+    _DEFAULT_LR = CONFIG.train.learning_rate
+    _DEFAULT_WD = CONFIG.train.weight_decay
+    _DEFAULT_SEED = CONFIG.mcts.seed
+    _DEFAULT_NUM_WORKERS = CONFIG.train.num_workers
+    _DEFAULT_LOG_EVERY = CONFIG.train.log_every
+    _DEFAULT_OPSET = CONFIG.dataset.onnx_opset
+    _DEFAULT_PLANES = CONFIG.network.input_planes
+    _DEFAULT_ROWS = CONFIG.network.board_rows
+    _DEFAULT_COLS = CONFIG.network.board_cols
+    _DEFAULT_MAX_ONNX_BATCH = CONFIG.dataset.max_onnx_batch
+    _DEFAULT_MAX_GRAD_NORM = CONFIG.train.max_grad_norm
+    _DEFAULT_SYMMETRY = CONFIG.train.symmetry
+    _DEFAULT_NO_AMP = not CONFIG.train.use_amp
+    _DEFAULT_NO_COMPILE = not CONFIG.train.use_compile
+except Exception as err:
+    print(f"[train] WARNING: Failed to load config.py ({err}); using fallbacks")
+    _DEFAULT_DATA = "selfplay.bin"
+    _DEFAULT_OUT = "connect4_model.pt"
+    _DEFAULT_EPOCHS = 5
+    _DEFAULT_BATCH = 256
+    _DEFAULT_LR = 1e-3
+    _DEFAULT_WD = 1e-4
+    _DEFAULT_SEED = 42
+    _DEFAULT_NUM_WORKERS = 2
+    _DEFAULT_LOG_EVERY = 20
+    _DEFAULT_OPSET = 18
+    _DEFAULT_PLANES = 3
+    _DEFAULT_ROWS = 6
+    _DEFAULT_COLS = 7
+    _DEFAULT_MAX_ONNX_BATCH = 256
+    _DEFAULT_MAX_GRAD_NORM = 5.0
+    _DEFAULT_SYMMETRY = True
+    _DEFAULT_NO_AMP = False
+    _DEFAULT_NO_COMPILE = False
 
 import torch
 import torch.nn.functional as F
@@ -101,7 +158,7 @@ def compute_loss(
     return policy_loss + value_loss, policy_loss, value_loss
 
 
-def export_onnx(model: Connect4Net, onnx_path: str, opset: int = 18) -> None:
+def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET) -> None:
     """Export the (already-trained) model to ONNX.
 
     Output contract — the Rust side (network.rs) reads by name:
@@ -123,20 +180,42 @@ def export_onnx(model: Connect4Net, onnx_path: str, opset: int = 18) -> None:
         model_cpu = model
     model_cpu.eval()
 
-    dummy = torch.randn(1, 3, 6, 7)
+    dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS)
 
-    # Use dynamic_shapes (preferred over deprecated dynamic_axes with dynamo=True).
-    # Batch dimension is symbolic so the Rust backend can feed any batch size.
-    batch = torch.export.Dim("batch", min=1, max=256)
-    dynamic_shapes = {"input": {0: batch}}
+    dynamic_axes = {
+        "input": {0: "batch_size"},
+        "policy": {0: "batch_size"},
+        "value": {0: "batch_size"},
+    }
+    import os, sys
+    class SuppressOutput:
+        def __enter__(self):
+            self._stdout, self._stderr = sys.stdout, sys.stderr
+            sys.stdout = sys.stderr = open(os.devnull, 'w', encoding='utf-8')
+            try:
+                self.fd = os.open(os.devnull, os.O_WRONLY)
+                self.save_out = os.dup(1)
+                self.save_err = os.dup(2)
+                os.dup2(self.fd, 1)
+                os.dup2(self.fd, 2)
+            except Exception: pass
+        def __exit__(self, *args):
+            sys.stdout.close()
+            sys.stdout, sys.stderr = self._stdout, self._stderr
+            try:
+                os.dup2(self.save_out, 1)
+                os.dup2(self.save_err, 2)
+                os.close(self.fd); os.close(self.save_out); os.close(self.save_err)
+            except Exception: pass
 
-    torch.onnx.export(
+    with SuppressOutput():
+        torch.onnx.export(
         model_cpu,
         (dummy,),
         onnx_path,
         input_names=["input"],
         output_names=["policy", "value"],
-        dynamic_shapes=dynamic_shapes,
+        dynamic_axes=dynamic_axes,
         opset_version=opset,
         do_constant_folding=True,
     )
@@ -169,19 +248,20 @@ class _ReplayDataset(torch.utils.data.Dataset):
 # Training loop
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Train Connect4Net on C4D1 data")
-    p.add_argument("--data", default="selfplay.bin",
+    p.add_argument("--data", default=_DEFAULT_DATA,
                    help="path to a single C4D1 file")
     p.add_argument("--data-dir", default=None,
                    help="path to a directory of C4D1 files (replay buffer); "
                         "all *.bin files in the dir are loaded and concatenated. "
                         "Overrides --data if set.")
-    p.add_argument("--out", default="connect4_model.pt", help="output model path")
-    p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--batch", type=int, default=256)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--out", default=_DEFAULT_OUT, help="output model path")
+    p.add_argument("--epochs", type=int, default=_DEFAULT_EPOCHS)
+    p.add_argument("--batch", type=int, default=_DEFAULT_BATCH)
+    p.add_argument("--lr", type=float, default=_DEFAULT_LR)
+    p.add_argument("--weight-decay", type=float, default=_DEFAULT_WD)
     p.add_argument(
         "--device",
         choices=["cpu", "cuda", "auto"],
@@ -193,20 +273,26 @@ def main() -> None:
                    help="force CPU training (overrides --device)")
     p.add_argument("--gpu", action="store_const", const="cuda", dest="device",
                    help="force CUDA training (overrides --device)")
-    p.add_argument("--no-amp", action="store_true", help="disable FP16 autocast")
-    p.add_argument("--no-compile", action="store_true", help="disable torch.compile")
+    p.add_argument("--no-amp", action="store_true", default=_DEFAULT_NO_AMP, help="disable FP16 autocast")
+    p.add_argument("--no-compile", action="store_true", default=_DEFAULT_NO_COMPILE, help="disable torch.compile")
     p.add_argument("--no-onnx", action="store_true",
                    help="skip ONNX export (debug only)")
-    p.add_argument("--onnx-opset", type=int, default=18)
+    p.add_argument("--onnx-opset", type=int, default=_DEFAULT_OPSET)
     p.add_argument("--max-samples", type=int, default=None,
                    help="cap dataset size (for quick smoke tests)")
-    p.add_argument("--log-every", type=int, default=20)
-    p.add_argument("--symmetry", action="store_true",
+    p.add_argument("--log-every", type=int, default=_DEFAULT_LOG_EVERY)
+    p.add_argument("--symmetry", action="store_true", default=_DEFAULT_SYMMETRY,
                    help="enable horizontal-flip augmentation (doubles effective dataset size)")
     p.add_argument("--num-workers", type=int, default=None,
                    help="DataLoader workers (default: 2 for single file, 0 for replay "
                         "because the replay dataset is defined in main() and can't be pickled).")
+    p.add_argument("--seed", type=int, default=_DEFAULT_SEED, help="RNG seed for training")
     args = p.parse_args()
+
+    import numpy as np
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
 
     # Resolve `--device auto` to a concrete device based on CUDA availability.
     if args.device == "auto":
@@ -280,7 +366,7 @@ def main() -> None:
         ds,
         batch_size=args.batch,
         shuffle=True,
-        num_workers=args.num_workers if args.num_workers is not None else 2,
+        num_workers=args.num_workers if args.num_workers is not None else _DEFAULT_NUM_WORKERS,
         pin_memory=(args.device != "cpu"),
         drop_last=False,
     )
@@ -336,7 +422,7 @@ def main() -> None:
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=_DEFAULT_MAX_GRAD_NORM)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -360,16 +446,25 @@ def main() -> None:
                 n_batches = 0
 
         # End-of-epoch summary.
+        epoch_sec = time.time() - t0
+        samples_per_sec = len(ds) / max(0.001, epoch_sec)
+        avg_tot = running["total"] / max(1, n_batches)
+        avg_pol = running["policy"] / max(1, n_batches)
+        avg_val = running["value"] / max(1, n_batches)
+        lr = scheduler.get_last_lr()[0]
+
         model.eval()
         with torch.no_grad():
             sample = ds[0]
             planes = sample[0].unsqueeze(0).to(args.device)
             log_p, v = model(planes)
             policy = log_p.exp().cpu().numpy()[0]
+
         print(
-            f"[train] epoch {epoch+1} done  "
-            f"sample policy: {[f'{p:.2f}' for p in policy]}  "
-            f"sample value: {v.item():+.3f}"
+            f"[train] epoch {epoch+1:2d}/{args.epochs} done in {epoch_sec:.2f}s "
+            f"({samples_per_sec:.0f} samples/s) | loss={avg_tot:.4f} "
+            f"(policy={avg_pol:.4f}, value={avg_val:.4f}) lr={lr:.2e} | "
+            f"sample val={v.item():+.3f}"
         )
 
         # Snapshot the best model (raw state_dict, so GUI can load directly).

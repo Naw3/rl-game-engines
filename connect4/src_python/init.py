@@ -38,49 +38,90 @@ try:
 except Exception:
     pass
 
+import warnings
+warnings.filterwarnings("ignore")
+import logging
+for _log_name in ["torch.onnx", "torch.onnx._internal", "torch.export"]:
+    logging.getLogger(_log_name).setLevel(logging.ERROR)
+
 import torch
 
 from model import Connect4Net
 
 
-# Resolve the project root from this script's location. We use this as the
-# default location for the .pt and .onnx files so they end up in the same
-# place the orchestrator and the Rust CLI look for them. Callers can still
-# override with --out-pt / --out-onnx.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_DEFAULT_PT = str(_PROJECT_ROOT / "connect4_model.pt")
-_DEFAULT_ONNX = str(_PROJECT_ROOT / "connect4_model.onnx")
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+try:
+    from config import CONFIG
+    _DEFAULT_PT = str(CONFIG.paths.model_pt)
+    _DEFAULT_ONNX = str(CONFIG.paths.model_onnx)
+    _DEFAULT_CHANNELS = CONFIG.network.channels
+    _DEFAULT_NUM_BLOCKS = CONFIG.network.num_blocks
+    _DEFAULT_SEED = CONFIG.mcts.seed
+    _DEFAULT_OPSET = CONFIG.dataset.onnx_opset
+    _DEFAULT_PLANES = CONFIG.network.input_planes
+    _DEFAULT_ROWS = CONFIG.network.board_rows
+    _DEFAULT_COLS = CONFIG.network.board_cols
+    _DEFAULT_MAX_ONNX_BATCH = CONFIG.dataset.max_onnx_batch
+except Exception as err:
+    print(f"[init] WARNING: Failed to load config.py ({err}); using fallbacks")
+    _DEFAULT_PT = str(_PROJECT_ROOT / "connect4_model.pt")
+    _DEFAULT_ONNX = str(_PROJECT_ROOT / "connect4_model.onnx")
+    _DEFAULT_CHANNELS = 64
+    _DEFAULT_NUM_BLOCKS = 3
+    _DEFAULT_SEED = 42
+    _DEFAULT_OPSET = 18
+    _DEFAULT_PLANES = 3
+    _DEFAULT_ROWS = 6
+    _DEFAULT_COLS = 7
+    _DEFAULT_MAX_ONNX_BATCH = 256
 
 
 def export_onnx(
     model: Connect4Net,
     onnx_path: str,
-    opset: int = 18,
+    opset: int = _DEFAULT_OPSET,
 ) -> None:
-    """Export `model` to ONNX with dynamic batch dim and named I/O.
-
-    The exported graph has:
-        input  "input"  shape (batch, 3, 6, 7)  f32  (batch is dynamic)
-        output "policy" shape (batch, 7)        f32  (log-probabilities)
-        output "value"  shape (batch,)          f32  (in [-1, 1] via tanh)
-
-    The Rust side (network.rs) reads "policy" and "value" by name and
-    softmaxes the policy (since the model head outputs log-softmax).
-    """
+    """Export `model` to ONNX with dynamic batch dim and named I/O."""
     model.eval()
-    dummy = torch.randn(1, 3, 6, 7)
+    dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS)
 
-    # Use dynamic_shapes (preferred over deprecated dynamic_axes with dynamo=True).
-    batch = torch.export.Dim("batch", min=1, max=256)
-    dynamic_shapes = {"input": {0: batch}}
+    dynamic_axes = {
+        "input": {0: "batch_size"},
+        "policy": {0: "batch_size"},
+        "value": {0: "batch_size"},
+    }
+    import os, sys
+    class SuppressOutput:
+        def __enter__(self):
+            self._stdout, self._stderr = sys.stdout, sys.stderr
+            sys.stdout = sys.stderr = open(os.devnull, 'w', encoding='utf-8')
+            try:
+                self.fd = os.open(os.devnull, os.O_WRONLY)
+                self.save_out = os.dup(1)
+                self.save_err = os.dup(2)
+                os.dup2(self.fd, 1)
+                os.dup2(self.fd, 2)
+            except Exception: pass
+        def __exit__(self, *args):
+            sys.stdout.close()
+            sys.stdout, sys.stderr = self._stdout, self._stderr
+            try:
+                os.dup2(self.save_out, 1)
+                os.dup2(self.save_err, 2)
+                os.close(self.fd); os.close(self.save_out); os.close(self.save_err)
+            except Exception: pass
 
-    torch.onnx.export(
+    with SuppressOutput():
+        torch.onnx.export(
         model,
         (dummy,),
         onnx_path,
         input_names=["input"],
         output_names=["policy", "value"],
-        dynamic_shapes=dynamic_shapes,
+        dynamic_axes=dynamic_axes,
         opset_version=opset,
         do_constant_folding=True,
     )
@@ -96,12 +137,19 @@ def main() -> int:
                    help=f"PyTorch state_dict output path (default {_DEFAULT_PT})")
     p.add_argument("--out-onnx", default=_DEFAULT_ONNX,
                    help=f"ONNX output path, consumed by Rust MCTS (default {_DEFAULT_ONNX})")
-    p.add_argument("--opset", type=int, default=18, help="ONNX opset version")
+    p.add_argument("--opset", type=int, default=_DEFAULT_OPSET, help="ONNX opset version")
     p.add_argument("--force", action="store_true",
                    help="Overwrite existing files")
-    p.add_argument("--channels", type=int, default=64)
-    p.add_argument("--num-blocks", type=int, default=3)
+    p.add_argument("--channels", type=int, default=_DEFAULT_CHANNELS)
+    p.add_argument("--num-blocks", type=int, default=_DEFAULT_NUM_BLOCKS)
+    p.add_argument("--seed", type=int, default=_DEFAULT_SEED, help="RNG seed for model initialization")
     args = p.parse_args()
+
+    import random
+    import numpy as np
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
 
     if os.path.exists(args.out_onnx) and not args.force:
         print(f"[init] {args.out_onnx} already exists — nothing to do (use --force to overwrite)")

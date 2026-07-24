@@ -24,49 +24,43 @@ function Format-Seconds([datetime]$t0, [datetime]$t1) {
     return "$elapsed s"
 }
 
-# --- Config file (optional) -------------------------------------------------
-# pipeline.conf.ps1 sets env vars before the defaults below are read.
-# Edit that file to change devices, games, sims, epochs, etc.
-$_conf = Join-Path $ScriptDir "pipeline.conf.ps1"
-if (Test-Path $_conf) {
-    . $_conf
-    Write-Host "[pipeline] loaded config: $_conf"
+# --- Resolve Python Executable ---
+$venvPy   = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+$PYTHON    = if ($env:PYTHON) { $env:PYTHON } elseif (Test-Path $venvPy) { $venvPy } else { "python" }
+
+# --- Load Central Configuration (config.py) ----------------------------------
+$configScript = Join-Path $ScriptDir "config.py"
+if (Test-Path $configScript) {
+    try {
+        $envCode = & $PYTHON $configScript --powershell 2>$null
+        if ($LASTEXITCODE -eq 0 -and $envCode) {
+            Invoke-Expression $envCode
+            Write-Host "[pipeline] Loaded configuration from config.py" -ForegroundColor Cyan
+        }
+    } catch {}
 }
 
 # --- Defaults / env --------------------------------------------------------
-$GAMES       = if ($env:GAMES)       { [int]$env:GAMES }       else { 64 }
-$SIMS        = if ($env:SIMS)        { [int]$env:SIMS }        else { 800 }
-$EPOCHS      = if ($env:EPOCHS)      { [int]$env:EPOCHS }      else { 5 }
-$BATCH       = if ($env:BATCH)       { [int]$env:BATCH }       else { 256 }
-$DATA        = if ($env:DATA)        { $env:DATA }              else { "selfplay.bin" }
-$MODEL       = if ($env:MODEL)       { $env:MODEL }             else { "connect4_model.pt" }
-$MODEL_ONNX  = if ($env:MODEL_ONNX)  { $env:MODEL_ONNX }        else { "connect4_model.onnx" }
-$SLEEP       = if ($env:SLEEP)       { [int]$env:SLEEP }       else { 2 }
-$MAX_CYCLES  = if ($env:MAX_CYCLES)  { [int]$env:MAX_CYCLES }  else { 0 }   # 0 = infinite (default); >0 = stop after N cycles (for benchmarking)
-$REPLAY_KEEP = if ($env:REPLAY_KEEP) { [int]$env:REPLAY_KEEP } else { 10 }  # Keep last N selfplay files in replay/
-$BATCH_SIZE  = if ($env:BATCH_SIZE)  { [int]$env:BATCH_SIZE }  else { 32 }  # NN inference batch size; 1 = sequential, 32 = good default
-$SYMMETRY    = if ($env:SYMMETRY)    { [bool]($env:SYMMETRY -eq "1" -or $env:SYMMETRY -eq "true") } else { $true }  # horizontal-flip augmentation
-$CARGO       = if ($env:CARGO)       { $env:CARGO }             else { "cargo" }
-$PYTHON      = if ($env:PYTHON)      { $env:PYTHON }            else { "python" }
-# Inference device for the Rust self-play.
-# Values: cpu | gpu | auto (default).
-#   cpu  = tract-onnx in Rust (fastest on small models, no CUDA needed)
-#   gpu  = ort + CUDA in Rust (needs --features cuda at build time)
-#   auto = GPU if available, else CPU
-#
-# Per design, the Python side is ALWAYS trained on GPU (CUDA). The
-# benchmark we're targeting compares (py-gpu + rust-cpu) vs
-# (py-gpu + rust-gpu); the python side is the constant, the rust side
-# is the variable.
-#
-# Backwards compat: if you only set the legacy `DEVICE` env var, both
-# RUST_DEVICE and PYTHON_DEVICE inherit it. PYTHON_DEVICE defaults to
-# `cuda` when nothing is set.
+$GAMES            = if ($env:GAMES)            { [int]$env:GAMES }            else { 64 }
+$SIMS             = if ($env:SIMS)             { [int]$env:SIMS }             else { 800 }
+$EPOCHS           = if ($env:EPOCHS)           { [int]$env:EPOCHS }           else { 5 }
+$BATCH            = if ($env:TRAIN_BATCH_SIZE) { [int]$env:TRAIN_BATCH_SIZE } else { if ($env:BATCH) { [int]$env:BATCH } else { 256 } }
+$DATA             = if ($env:DATA)             { $env:DATA }                  else { "selfplay.bin" }
+$MODEL            = if ($env:MODEL)            { $env:MODEL }                 else { "connect4_model.pt" }
+$MODEL_ONNX       = if ($env:MODEL_ONNX)       { $env:MODEL_ONNX }            else { "connect4_model.onnx" }
+$SLEEP            = if ($env:SLEEP)            { [int]$env:SLEEP }            else { 2 }
+$MAX_CYCLES       = if ($env:MAX_CYCLES)       { [int]$env:MAX_CYCLES }       else { 0 }
+$REPLAY_KEEP      = if ($env:REPLAY_KEEP)      { [int]$env:REPLAY_KEEP }      else { 10 }
+$CPU_BATCH_SIZE   = if ($env:CPU_BATCH_SIZE)   { [int]$env:CPU_BATCH_SIZE }   else { [int]$env:NUMBER_OF_PROCESSORS }
+$GPU_BATCH_SIZE   = if ($env:GPU_BATCH_SIZE)   { [int]$env:GPU_BATCH_SIZE }   else { 32 }
+$SYMMETRY         = if ($env:SYMMETRY)         { [bool]($env:SYMMETRY -eq "1" -or $env:SYMMETRY -eq "true") } else { $true }
+$CARGO            = if ($env:CARGO)            { $env:CARGO }                 else { "cargo" }
+$venvPy          = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+$PYTHON           = if ($env:PYTHON)           { $env:PYTHON }           elseif (Test-Path $venvPy) { $venvPy } else { "python" }
+
 $RUST_DEVICE   = if ($env:RUST_DEVICE)   { $env:RUST_DEVICE }   else { if ($env:DEVICE) { $env:DEVICE } else { "auto" } }
 $PYTHON_DEVICE = if ($env:PYTHON_DEVICE) { $env:PYTHON_DEVICE } else { if ($env:DEVICE) { $env:DEVICE } else { "cuda" } }
-# Always build with `--features cuda` — the resulting binary supports BOTH backends
-# (tract for `-d cpu`, ort+CUDA for `-d gpu`), selected at runtime via `--device`.
-# This avoids a full rebuild every time we switch between the CPU and GPU benches.
+$BATCH_SIZE    = if ($RUST_DEVICE -eq "cpu") { $CPU_BATCH_SIZE } else { $GPU_BATCH_SIZE }
 $FEATURES      = "--features cuda"
 
 Write-Host "[pipeline] starting: games=$GAMES sims=$SIMS epochs=$EPOCHS batch=$BATCH batch_size=$BATCH_SIZE"

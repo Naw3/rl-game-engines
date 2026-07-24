@@ -136,3 +136,224 @@ PS>TerminatingError(python.exe): "The running command stopped because the prefer
 Windows PowerShell transcript end
 End time: 20260709192121
 **********************
+**********************
+Windows PowerShell transcript start
+Start time: 20260724144936
+Username: DESKTOP-BVV0TB3\Ewan
+RunAs User: DESKTOP-BVV0TB3\Ewan
+Configuration Name: 
+Machine: DESKTOP-BVV0TB3 (Microsoft Windows NT 10.0.19044.0)
+Host Application: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -Command Set-Location -Path 'C:\Users\Ewan\Documents\dev\rl-game-engines\connect4'; & 'C:\Users\Ewan\Documents\dev\rl-game-engines\connect4\setup.ps1' -Elevated
+Process ID: 44792
+PSVersion: 5.1.19041.7548
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.19041.7548
+BuildVersion: 10.0.19041.7548
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Transcript started, output file is C:\Users\Ewan\Documents\dev\rl-game-engines\connect4\setup.log
+[setup] Connect4 pipeline setup starting...
+[setup] Project root: C:\Users\Ewan\Documents\dev\rl-game-engines\connect4
+[setup] Derived original user home directory: C:\Users\Ewan
+
+[setup] Python is already available: C:\Users\Ewan\AppData\Local\Microsoft\WindowsApps\python.exe
+[setup] Cargo not found. Installing Rustup via winget...
+Found Rustup: the Rust toolchain installer [Rustlang.Rustup] Version 1.29.0
+This application is licensed to you by its owner.
+Microsoft is not responsible for, nor does it grant any licenses to, third-party packages.
+Downloading https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-pc-windows-msvc/rustup-init.exe
+  ██████████████████████████████  12.2 MB / 12.2 MB
+Successfully verified installer hash
+Starting package install...
+Successfully installed
+[setup] Refreshing environment variables from registry...
+[setup] Ensuring stable Rust toolchain...
+info: using existing install for stable-x86_64-pc-windows-msvc
+info: default toolchain set to stable-x86_64-pc-windows-msvc
+
+  stable-x86_64-pc-windows-msvc unchanged - rustc 1.97.1 (8bab26f4f 2026-07-14)
+[setup] Downloading CUDA 12.6 network installer (~30 MB)...
+PS>TerminatingError(Invoke-WebRequest): "The remote name could not be resolved: 'developer.download.nvidia.com'"
+>> TerminatingError(setup.ps1): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: [setup] An error occurred during setup: The remote name could not be resolved: 'developer.download.nvidia.com'"
+**********************
+Windows PowerShell transcript end
+End time: 20260724145101
+**********************
+**********************
+Windows PowerShell transcript start
+Start time: 20260724145108
+Username: DESKTOP-BVV0TB3\Ewan
+RunAs User: DESKTOP-BVV0TB3\Ewan
+Configuration Name: 
+Machine: DESKTOP-BVV0TB3 (Microsoft Windows NT 10.0.19044.0)
+Host Application: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -Command Set-Location -Path 'C:\Users\Ewan\Documents\dev\rl-game-engines\connect4'; & 'C:\Users\Ewan\Documents\dev\rl-game-engines\connect4\setup.ps1' -Elevated
+Process ID: 49124
+PSVersion: 5.1.19041.7548
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.19041.7548
+BuildVersion: 10.0.19041.7548
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Transcript started, output file is C:\Users\Ewan\Documents\dev\rl-game-engines\connect4\setup.log
+[setup] Connect4 pipeline setup starting...
+[setup] Project root: C:\Users\Ewan\Documents\dev\rl-game-engines\connect4
+[setup] Derived original user home directory: C:\Users\Ewan
+
+[setup] Python is already available: C:\Users\Ewan\AppData\Local\Microsoft\WindowsApps\python.exe
+[setup] Rust is already available: C:\Users\Ewan\.cargo\bin\cargo.exe
+[setup] Ensuring stable Rust toolchain...
+info: using existing install for stable-x86_64-pc-windows-msvc
+info: default toolchain set to stable-x86_64-pc-windows-msvc
+
+  stable-x86_64-pc-windows-msvc unchanged - rustc 1.97.1 (8bab26f4f 2026-07-14)
+[setup] Downloading CUDA 12.6 network installer (~30 MB)...
+PS>TerminatingError(Invoke-WebRequest): "Unable to read data from the transport connection: An existing connection was forcibly closed by the remote host."
+>> TerminatingError(setup.ps1): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: [setup] An error occurred during setup: Unable to read data from the transport connection: An existing connection was forcibly closed by the remote host."
+**********************
+Windows PowerShell transcript end
+End time: 20260724145113
+**********************
+**********************
+Windows PowerShell transcript start
+Start time: 20260724145119
+Username: DESKTOP-BVV0TB3\Ewan
+RunAs User: DESKTOP-BVV0TB3\Ewan
+Configuration Name: 
+Machine: DESKTOP-BVV0TB3 (Microsoft Windows NT 10.0.19044.0)
+Host Application: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -Command Set-Location -Path 'C:\Users\Ewan\Documents\dev\rl-game-engines\connect4'; & 'C:\Users\Ewan\Documents\dev\rl-game-engines\connect4\setup.ps1' -Elevated
+Process ID: 51888
+PSVersion: 5.1.19041.7548
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.19041.7548
+BuildVersion: 10.0.19041.7548
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Transcript started, output file is C:\Users\Ewan\Documents\dev\rl-game-engines\connect4\setup.log
+[setup] Connect4 pipeline setup starting...
+[setup] Project root: C:\Users\Ewan\Documents\dev\rl-game-engines\connect4
+[setup] Derived original user home directory: C:\Users\Ewan
+
+[setup] Python is already available: C:\Users\Ewan\AppData\Local\Microsoft\WindowsApps\python.exe
+[setup] Rust is already available: C:\Users\Ewan\.cargo\bin\cargo.exe
+[setup] Ensuring stable Rust toolchain...
+info: using existing install for stable-x86_64-pc-windows-msvc
+info: default toolchain set to stable-x86_64-pc-windows-msvc
+
+  stable-x86_64-pc-windows-msvc unchanged - rustc 1.97.1 (8bab26f4f 2026-07-14)
+[setup] Running CUDA 12.6 installer (silent install, may take a few minutes)...
+WARNING: [setup] CUDA installer exited with code 8
+PS>TerminatingError(setup.ps1): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: [setup] FAILED: CUDA 12.6 install did not produce expected DLL at C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin"
+>> TerminatingError(setup.ps1): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: [setup] An error occurred during setup: [setup] FAILED: CUDA 12.6 install did not produce expected DLL at C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin"
+**********************
+Windows PowerShell transcript end
+End time: 20260724145120
+**********************
+**********************
+Windows PowerShell transcript start
+Start time: 20260724145317
+Username: DESKTOP-BVV0TB3\Ewan
+RunAs User: DESKTOP-BVV0TB3\Ewan
+Configuration Name: 
+Machine: DESKTOP-BVV0TB3 (Microsoft Windows NT 10.0.19044.0)
+Host Application: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -File .\setup.ps1
+Process ID: 8552
+PSVersion: 5.1.19041.7548
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.19041.7548
+BuildVersion: 10.0.19041.7548
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Transcript started, output file is C:\Users\Ewan\Documents\dev\rl-game-engines\connect4\setup.log
+[setup] Found active local venv at C:\Users\Ewan\Documents\dev\rl-game-engines\connect4\.venv
+[setup] Using Python executable: C:\Users\Ewan\Documents\dev\rl-game-engines\connect4\.venv\Scripts\python.exe
+[setup] Found cargo at C:\Users\Ewan\.cargo\bin. Registering in PATH.
+[setup] Ensuring stable Rust toolchain...
+
+>> TerminatingError(rustup.exe): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: info: using existing install for stable-x86_64-pc-windows-msvc"
+>> TerminatingError(setup.ps1): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: [setup] An error occurred during setup: info: using existing install for stable-x86_64-pc-windows-msvc"
+**********************
+Windows PowerShell transcript end
+End time: 20260724145317
+**********************
+**********************
+Windows PowerShell transcript start
+Start time: 20260724145326
+Username: DESKTOP-BVV0TB3\Ewan
+RunAs User: DESKTOP-BVV0TB3\Ewan
+Configuration Name: 
+Machine: DESKTOP-BVV0TB3 (Microsoft Windows NT 10.0.19044.0)
+Host Application: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -File .\setup.ps1
+Process ID: 11628
+PSVersion: 5.1.19041.7548
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.19041.7548
+BuildVersion: 10.0.19041.7548
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Transcript started, output file is C:\Users\Ewan\Documents\dev\rl-game-engines\connect4\setup.log
+[setup] Found active local venv at C:\Users\Ewan\Documents\dev\rl-game-engines\connect4\.venv
+[setup] Using Python executable: C:\Users\Ewan\Documents\dev\rl-game-engines\connect4\.venv\Scripts\python.exe
+[setup] Found cargo at C:\Users\Ewan\.cargo\bin. Registering in PATH.
+[setup] Ensuring stable Rust toolchain...
+
+[setup] Found existing CUDA 12.x Toolkit at C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin
+[setup] uv is available at: C:\Users\Ewan\.local\bin\uv.exe
+[setup] Installing Python dependencies from src_python/requirements.txt...
+
+[setup] Python dependencies installed successfully.
+[setup] Locating nvidia-cudnn-cu12 package bin directory...
+PS>TerminatingError(python.exe): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: Traceback (most recent call last):"
+>> TerminatingError(setup.ps1): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: [setup] An error occurred during setup: Traceback (most recent call last):"
+**********************
+Windows PowerShell transcript end
+End time: 20260724145703
+**********************
+﻿**********************
+Windows PowerShell transcript start
+Start time: 20260724145405
+Username: DESKTOP-BVV0TB3\Ewan
+RunAs User: DESKTOP-BVV0TB3\Ewan
+Configuration Name: 
+Machine: DESKTOP-BVV0TB3 (Microsoft Windows NT 10.0.19044.0)
+Host Application: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -noexit -command try { . "c:\Users\Ewan\AppData\Local\Programs\Antigravity IDE\resources\app\out\vs\workbench\contrib\terminal\common\scripts\shellIntegration.ps1" } catch {}
+Process ID: 25692
+PSVersion: 5.1.19041.7548
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.19041.7548
+BuildVersion: 10.0.19041.7548
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Transcript started, output file is C:\Users\Ewan\Documents\dev\rl-game-engines\connect4\setup.log
+[setup] Found active local venv at C:\Users\Ewan\Documents\dev\rl-game-engines\connect4\.venv
+[setup] Using Python executable: C:\Users\Ewan\Documents\dev\rl-game-engines\connect4\.venv\Scripts\python.exe
+[setup] Found cargo at C:\Users\Ewan\.cargo\bin. Registering in PATH.
+[setup] Ensuring stable Rust toolchain...
+
+[setup] Found existing CUDA 12.x Toolkit at C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin
+[setup] uv is available at: C:\Users\Ewan\.local\bin\uv.exe
+[setup] Installing Python dependencies from src_python/requirements.txt...
+⠹ numpy==2.4.6
+PS>TerminatingError(): "The pipeline has been stopped."
+>> TerminatingError(): "The pipeline has been stopped."
+**********************
+Windows PowerShell transcript end
+End time: 20260724145705
+**********************

@@ -38,15 +38,33 @@ import torch
 from torch.utils.data import Dataset
 
 
-# Constants — keep in sync with the Rust side.
-MAGIC = b"C4D1"
-HEADER_SIZE = 16
-SAMPLE_SIZE = 56
-N_PLANES = 3
-BOARD_H = 6
-BOARD_W = 7
-N_COLS = 7
-POLICY_SIZE = N_COLS
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+try:
+    from config import CONFIG
+    N_PLANES = CONFIG.network.input_planes
+    BOARD_H = CONFIG.network.board_rows
+    BOARD_W = CONFIG.network.board_cols
+    N_COLS = CONFIG.network.num_actions
+    MAGIC = CONFIG.dataset.magic.encode("ascii")
+    HEADER_SIZE = CONFIG.dataset.header_size
+    SAMPLE_SIZE = CONFIG.dataset.sample_size
+    POLICY_SIZE = CONFIG.dataset.policy_size
+except Exception as err:
+    print(f"[dataset] WARNING: Failed to load config.py ({err}); using fallbacks")
+    N_PLANES = 3
+    BOARD_H = 6
+    BOARD_W = 7
+    N_COLS = 7
+    MAGIC = b"C4D1"
+    HEADER_SIZE = 16
+    SAMPLE_SIZE = 56
+    POLICY_SIZE = 7
 
 
 def decode_bitboard(own: int, opp: int) -> np.ndarray:

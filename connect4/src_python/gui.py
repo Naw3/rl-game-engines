@@ -41,26 +41,44 @@ from model import Connect4Net
 
 
 # --- Visual constants ------------------------------------------------------
-WINDOW_W = 700
-WINDOW_H = 720            # extra strip at the top for the value bar
-BOARD_TOP = 60
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+try:
+    from config import CONFIG
+    WINDOW_W = CONFIG.gui.window_w
+    WINDOW_H = CONFIG.gui.window_h
+    BOARD_TOP = CONFIG.gui.board_top
+    FPS = CONFIG.gui.fps
+    ANIM_FRAMES = CONFIG.gui.anim_frames
+    COLORS = CONFIG.gui.colors
+except Exception as err:
+    print(f"[gui] WARNING: Failed to load config.py ({err}); using fallbacks")
+    WINDOW_W = 700
+    WINDOW_H = 720
+    BOARD_TOP = 60
+    FPS = 60
+    ANIM_FRAMES = 12
+    COLORS = {
+        "bg": (24, 24, 36),
+        "board": (40, 80, 200),
+        "hole": (24, 24, 36),
+        "red": (220, 50, 50),
+        "yellow": (240, 210, 50),
+        "grid": (200, 200, 240),
+        "text": (240, 240, 240),
+        "value_pos": (80, 200, 80),
+        "value_neg": (200, 80, 80),
+        "value_zero": (150, 150, 150),
+    }
+
 CELL_W = (WINDOW_W - 40) // 7
 CELL_H = (WINDOW_H - BOARD_TOP - 40) // 6
 PIECE_R = min(CELL_W, CELL_H) // 2 - 4
-COLORS = {
-    "bg":       (24, 24, 36),
-    "board":    (40, 80, 200),
-    "hole":     (24, 24, 36),
-    "red":      (220, 50, 50),
-    "yellow":   (240, 210, 50),
-    "grid":     (200, 200, 240),
-    "text":     (240, 240, 240),
-    "value_pos":(80, 200, 80),
-    "value_neg":(200, 80, 80),
-    "value_zero":(150, 150, 150),
-}
-FPS = 60
-ANIM_FRAMES = 12  # frames per falling-piece animation
 
 
 # --- Bitboard helpers (mirror of the Rust side) ----------------------------
@@ -311,10 +329,23 @@ def run(model_path: str | None, device_str: str) -> None:
     pygame.quit()
 
 
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+try:
+    from config import CONFIG
+    _DEFAULT_GUI_MODEL = str(CONFIG.paths.model_pt)
+    _DEFAULT_GUI_DEVICE = CONFIG.device.python_device
+except Exception:
+    _DEFAULT_GUI_MODEL = "connect4_model.pt"
+    _DEFAULT_GUI_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Play Connect 4 vs Connect4Net")
-    p.add_argument("--model", default="connect4_model.pt", help="path to .pt state_dict")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--model", default=_DEFAULT_GUI_MODEL, help="path to .pt state_dict")
+    p.add_argument("--device", default=_DEFAULT_GUI_DEVICE)
     args = p.parse_args()
     try:
         run(args.model, args.device)
