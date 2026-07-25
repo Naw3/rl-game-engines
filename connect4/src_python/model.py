@@ -99,7 +99,7 @@ class Connect4Net(nn.Module):
 
         # Residual trunk.
         self.blocks = nn.ModuleList(
-            [ResidualBlock(channels) for _ in range(num_blocks)]
+            [ResBlock(channels) for _ in range(num_blocks)]
         )
 
         # Policy head: 1×1 conv to 2 channels -> flatten -> Linear -> log_softmax.
@@ -127,3 +127,33 @@ class Connect4Net(nn.Module):
         """
         # Trunk.
         h = F.relu(self.input_bn(self.input_conv(x)), inplace=True)
+        for block in self.blocks:
+            h = block(h)
+
+        # Policy head.
+        p = F.relu(self.policy_bn(self.policy_conv(h)), inplace=True)
+        p = p.flatten(start_dim=1)
+        log_p = F.log_softmax(self.policy_fc(p), dim=1)
+
+        # Value head.
+        v = F.relu(self.value_bn(self.value_conv(h)), inplace=True)
+        v = v.flatten(start_dim=1)
+        v = F.relu(self.value_fc1(v), inplace=True)
+        v = torch.tanh(self.value_fc2(v)).squeeze(1)
+
+        return log_p, v
+
+    def num_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def save(self, path: str | Path) -> None:
+        path = Path(path)
+        if path.parent:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self.state_dict(), path)
+
+    @classmethod
+    def load(cls, path: str | Path, channels: int = _DEFAULT_CHANNELS, num_blocks: int = _DEFAULT_NUM_BLOCKS) -> Connect4Net:
+        net = cls(channels=channels, num_blocks=num_blocks)
+        net.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+        return net
