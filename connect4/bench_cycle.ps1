@@ -46,6 +46,7 @@ $CPU_BATCH_SIZE   = if ($env:BENCH_CPU_BATCH_SIZE)   { [int]$env:BENCH_CPU_BATCH
 $GPU_BATCH_SIZE   = if ($env:BENCH_GPU_BATCH_SIZE)   { [int]$env:BENCH_GPU_BATCH_SIZE }   else { 32 }
 $BENCH_SEED       = if ($env:BENCH_SEED)             { [int]$env:BENCH_SEED }             else { 42 }
 $CARGO            = if ($env:CARGO)                  { $env:CARGO }                       else { "cargo" }
+$DURATION         = if ($env:BENCH_DURATION)         { [int]$env:BENCH_DURATION }         else { 30 }
 
 # Register cuDNN and CUDA PATH
 $cudnnBin = $null
@@ -252,6 +253,7 @@ try {
     }
 
     Write-Host ""
+    Write-Host "=================================================================" -ForegroundColor Cyan
     Write-Host "  BENCHMARK SUMMARY & PERFORMANCE REPORT (THROUGHPUT)" -ForegroundColor Cyan
     Write-Host "=================================================================" -ForegroundColor Cyan
     if ($resTrain) {
