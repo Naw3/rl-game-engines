@@ -1,20 +1,15 @@
-"""
-config.py — Central configuration for the Connect4 AlphaZero pipeline.
 
-Single source of truth for:
-- Model Architecture
-- MCTS Search & Parameters
-- PyTorch Training Hyperparameters
-- Binary Dataset Format (C4D1)
-- GUI & Visual Options
-- File Paths & Execution Devices
-"""
 
-from __future__ import annotations
 
-import os
+
+
+
+
+
+
+
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 # Project root directory
@@ -58,12 +53,15 @@ class TrainConfig:
     weight_decay: float = 1e-4
     max_grad_norm: float = 5.0
     replay_keep: int = 10
-    num_workers: int = 2
+    num_workers: int = 0
     log_every: int = 20
     symmetry: bool = True
-    use_amp: bool = True
-    use_compile: bool = True
-
+    train_precision: str = "fp32"  # "fp32", "fp16", "bf16"
+    infer_precision: str = "fp32"  # "fp32", "fp16"
+    compile_mode: str = "reduce-overhead"  # "none", "default", "reduce-overhead", "max-autotune"
+    channels_last: bool = False
+    fused_adamw: bool = False
+    prefetch_queue: int = 2
 
 @dataclass
 class DatasetConfig:
@@ -79,8 +77,6 @@ class DatasetConfig:
 @dataclass
 class GUIConfig:
     """Pygame & Console Interface Configuration"""
-    window_w: int = 700
-    window_h: int = 720
     board_top: int = 60
     fps: int = 60
     anim_frames: int = 12
@@ -97,7 +93,6 @@ class GUIConfig:
         "value_neg": (200, 80, 80),
         "value_zero": (150, 150, 150),
     })
-
 
 @dataclass
 class PathConfig:
@@ -116,16 +111,14 @@ class DeviceConfig:
     rust_device: str = "gpu"      # "gpu", "cpu", "auto"
     python_device: str = "cuda"   # "cuda", "cpu"
 
-
 @dataclass
 class BenchConfig:
     """Benchmark Specific Parameters (Isolated from main pipeline)"""
-    games: int = 32
+    duration: int = 60
     sims: int = 800
-    epochs: int = 5
     cpu_batch_size: int = os.cpu_count() or 8
     gpu_batch_size: int = 32
-    train_batch_size: int = 256
+    train_batch_size: int = 2048
     seed: int = 42
 
 
@@ -142,12 +135,13 @@ class PipelineConfig:
 
 
 # Global Singleton Configuration Instance
+
+# Global Singleton Configuration Instance
 CONFIG = PipelineConfig()
 
 
 def export_json() -> str:
     """Returns JSON string of CONFIG for Rust and external consumers."""
-    import json
     return json.dumps({
         "network": asdict(CONFIG.network),
         "mcts": asdict(CONFIG.mcts),
@@ -184,9 +178,8 @@ def export_powershell_env() -> str:
         f'$env:DATA = "{CONFIG.paths.selfplay_bin.name}"',
         
         # Bench configs (isolated)
-        f'$env:BENCH_GAMES = "{CONFIG.bench.games}"',
+        f'$env:BENCH_DURATION = "{CONFIG.bench.duration}"',
         f'$env:BENCH_SIMS = "{CONFIG.bench.sims}"',
-        f'$env:BENCH_EPOCHS = "{CONFIG.bench.epochs}"',
         f'$env:BENCH_CPU_BATCH_SIZE = "{CONFIG.bench.cpu_batch_size}"',
         f'$env:BENCH_GPU_BATCH_SIZE = "{CONFIG.bench.gpu_batch_size}"',
         f'$env:BENCH_TRAIN_BATCH_SIZE = "{CONFIG.bench.train_batch_size}"',

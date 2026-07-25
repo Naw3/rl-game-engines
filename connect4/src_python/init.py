@@ -1,5 +1,5 @@
-"""
-init.py — Bootstrap a random-init Connect4Net and export to ONNX.
+"""
+init.py � Bootstrap a random
 
 This is the cycle-0 bootstrap. Before the very first self-play, we
 need *some* network — even a random-weight one — so the MCTS has
@@ -65,6 +65,7 @@ try:
     _DEFAULT_ROWS = CONFIG.network.board_rows
     _DEFAULT_COLS = CONFIG.network.board_cols
     _DEFAULT_MAX_ONNX_BATCH = CONFIG.dataset.max_onnx_batch
+    _DEFAULT_INFER_PRECISION = CONFIG.train.infer_precision
 except Exception as err:
     print(f"[init] WARNING: Failed to load config.py ({err}); using fallbacks")
     _DEFAULT_PT = str(_PROJECT_ROOT / "connect4_model.pt")
@@ -77,16 +78,32 @@ except Exception as err:
     _DEFAULT_ROWS = 6
     _DEFAULT_COLS = 7
     _DEFAULT_MAX_ONNX_BATCH = 256
+    _DEFAULT_INFER_PRECISION = "fp32"
 
 
 def export_onnx(
     model: Connect4Net,
     onnx_path: str,
     opset: int = _DEFAULT_OPSET,
+    infer_precision: str = "fp32",
 ) -> None:
     """Export `model` to ONNX with dynamic batch dim and named I/O."""
-    model.eval()
-    dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS)
+    was_cuda = next(model.parameters()).device.type == "cuda"
+    if was_cuda:
+        model_cpu = Connect4Net(
+            channels=model.channels, num_blocks=model.num_blocks
+        ).cpu()
+        model_cpu.load_state_dict(model.state_dict())
+    else:
+        model_cpu = model
+
+    if infer_precision == "fp16":
+        model_cpu = model_cpu.half()
+        dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS, dtype=torch.float16)
+    else:
+        dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS, dtype=torch.float32)
+        
+    model_cpu.eval()
 
     dynamic_axes = {
         "input": {0: "batch_size"},
@@ -116,7 +133,7 @@ def export_onnx(
 
     with SuppressOutput():
         torch.onnx.export(
-        model,
+        model_cpu,
         (dummy,),
         onnx_path,
         input_names=["input"],
@@ -125,7 +142,9 @@ def export_onnx(
         opset_version=opset,
         do_constant_folding=True,
     )
-    # Smoke-check: re-load and run.
+    import onnx
+    onnx_model = onnx.load(onnx_path)
+    onnx.checker.check_model(onnx_model)
     import onnx
     onnx_model = onnx.load(onnx_path)
     onnx.checker.check_model(onnx_model)
@@ -143,6 +162,8 @@ def main() -> int:
     p.add_argument("--channels", type=int, default=_DEFAULT_CHANNELS)
     p.add_argument("--num-blocks", type=int, default=_DEFAULT_NUM_BLOCKS)
     p.add_argument("--seed", type=int, default=_DEFAULT_SEED, help="RNG seed for model initialization")
+    p.add_argument("--infer-precision", choices=["fp32", "fp16"], default=_DEFAULT_INFER_PRECISION,
+                   help="Precision for the exported ONNX model")
     args = p.parse_args()
 
     import random
@@ -163,8 +184,11 @@ def main() -> int:
     print(f"[init] saving state_dict -> {args.out_pt}")
     net.save(args.out_pt)
 
-    print(f"[init] exporting ONNX -> {args.out_onnx} (opset {args.opset})")
-    export_onnx(net, args.out_onnx, opset=args.opset)
+    print(f"[init] exporting ONNX -> {args.out_onnx} (opset {args.opset}, precision {args.infer_precision})")
+    
+    # We must import export_onnx from train.py, or define it here.
+    # Since init.py already copies export_onnx, we will modify the local export_onnx instead.
+    export_onnx(net, args.out_onnx, opset=args.opset, infer_precision=args.infer_precision)
 
     print(f"[init] done. {args.out_pt} + {args.out_onnx} ready for self-play.")
     return 0

@@ -57,23 +57,7 @@ try:
     from config import CONFIG
     _DEFAULT_CHANNELS = CONFIG.network.channels
     _DEFAULT_NUM_BLOCKS = CONFIG.network.num_blocks
-except Exception as err:
-    print(f"[model] WARNING: Failed to load config.py ({err}); using fallbacks (channels=64, num_blocks=3)")
-    _DEFAULT_CHANNELS = 64
-    _DEFAULT_NUM_BLOCKS = 3
-
-
-# ---------------------------------------------------------------------------
-# Building blocks
-# ---------------------------------------------------------------------------
-
-class ResidualBlock(nn.Module):
-    """Two 3×3 convs + skip connection, with BatchNorm. Preserves shape."""
-
-    def __init__(self, channels: int) -> None:
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(channels)
+except Exception:
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
 
@@ -91,15 +75,11 @@ class Connect4Net(nn.Module):
     """AlphaZero-style policy + value network for Connect 4.
 
     Args:
-        channels:  width of the conv trunk.
-        num_blocks: number of residual blocks in the trunk.
+        channels:  width of the conv trunk (default 64).
+        num_blocks: number of residual blocks in the trunk (default 3).
     """
 
-    def __init__(
-        self,
-        channels: int = _DEFAULT_CHANNELS,
-        num_blocks: int = _DEFAULT_NUM_BLOCKS,
-    ) -> None:
+    def __init__(self, channels: int = 64, num_blocks: int = 3) -> None:
         super().__init__()
         self.channels = channels
         self.num_blocks = num_blocks
@@ -138,56 +118,3 @@ class Connect4Net(nn.Module):
         """
         # Trunk.
         h = F.relu(self.input_bn(self.input_conv(x)), inplace=True)
-        for block in self.blocks:
-            h = block(h)
-
-        # Policy head.
-        p = F.relu(self.policy_bn(self.policy_conv(h)), inplace=True)
-        p = p.reshape(p.size(0), -1)  # (B, 84)
-        p = self.policy_fc(p)         # (B, 7) — raw logits
-        log_p = F.log_softmax(p, dim=1)
-
-        # Value head. We use .reshape (not .squeeze) to drop the trailing
-        # size-1 dimension. Empirically onnxruntime mis-handles .squeeze
-        # on a (B, 1) tensor when the batch dim is dynamic — the value
-        # output collapses to shape (1,) instead of (B,). .reshape is a
-        # static shape op that ORT handles correctly.
-        v = F.relu(self.value_bn(self.value_conv(h)), inplace=True)
-        v = v.reshape(v.size(0), -1)  # (B, 42)
-        v = F.relu(self.value_fc1(v), inplace=True)
-        v = torch.tanh(self.value_fc2(v))             # (B, 1)
-        v = v.reshape(v.size(0))                      # (B,)
-
-        return log_p, v
-
-    # -- I/O helpers --------------------------------------------------------
-
-    def save(self, path: str) -> None:
-        """Save state_dict to `path`."""
-        torch.save(self.state_dict(), path)
-
-    def load(self, path: str, map_location: str | torch.device = "cpu") -> None:
-        """Load state_dict from `path`. Tolerates a `model.` prefix on keys
-        (e.g. if the file was saved from a `torch.compile`d module)."""
-        sd = torch.load(path, map_location=map_location)
-        if any(k.startswith("model.") for k in sd.keys()):
-            sd = {k.removeprefix("model."): v for k, v in sd.items()}
-        self.load_state_dict(sd)
-
-    def num_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters())
-
-
-# ---------------------------------------------------------------------------
-# Quick smoke test — `python model.py` will print a forward pass.
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    net = Connect4Net()
-    print(f"Connect4Net: {net.num_parameters():,} parameters")
-    x = torch.randn(4, 3, 6, 7)
-    log_p, v = net(x)
-    print(f"input  : {tuple(x.shape)}")
-    print(f"log_p  : {tuple(log_p.shape)}  (log-probs, sums to ~0)")
-    print(f"v      : {tuple(v.shape)}  range [{v.min().item():.3f}, {v.max().item():.3f}]")
-    print(f"log_p  : {log_p[0].exp()}  (sample policy, sums to {log_p[0].exp().sum().item():.4f})")

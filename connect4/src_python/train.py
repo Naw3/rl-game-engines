@@ -77,7 +77,6 @@ warnings.filterwarnings("ignore")
 
 # PyTorch 2.5+ uses standard python logging for torch.onnx
 # We set the level to ERROR to suppress the verbose export logs.
-logging.getLogger("torch.onnx").setLevel(logging.ERROR)
 logging.getLogger("torch.onnx._internal").setLevel(logging.ERROR)
 logging.getLogger("torch.export").setLevel(logging.ERROR)
 
@@ -103,8 +102,12 @@ try:
     _DEFAULT_MAX_ONNX_BATCH = CONFIG.dataset.max_onnx_batch
     _DEFAULT_MAX_GRAD_NORM = CONFIG.train.max_grad_norm
     _DEFAULT_SYMMETRY = CONFIG.train.symmetry
-    _DEFAULT_NO_AMP = not CONFIG.train.use_amp
-    _DEFAULT_NO_COMPILE = not CONFIG.train.use_compile
+    _DEFAULT_TRAIN_PRECISION = CONFIG.train.train_precision
+    _DEFAULT_INFER_PRECISION = getattr(CONFIG.train, "infer_precision", "fp32")
+    _DEFAULT_COMPILE_MODE = getattr(CONFIG.train, "compile_mode", "reduce-overhead") if hasattr(CONFIG, "train") else "reduce-overhead"
+    _DEFAULT_CHANNELS_LAST = getattr(CONFIG.train, "channels_last", False) if hasattr(CONFIG, "train") else False
+    _DEFAULT_FUSED_ADAMW = getattr(CONFIG.train, "fused_adamw", False) if hasattr(CONFIG, "train") else False
+    _DEFAULT_PREFETCH_QUEUE = getattr(CONFIG.train, "prefetch_queue", 2) if hasattr(CONFIG, "train") else 2
 except Exception as err:
     print(f"[train] WARNING: Failed to load config.py ({err}); using fallbacks")
     _DEFAULT_DATA = "selfplay.bin"
@@ -119,24 +122,88 @@ except Exception as err:
     _DEFAULT_OPSET = 18
     _DEFAULT_PLANES = 3
     _DEFAULT_ROWS = 6
-    _DEFAULT_COLS = 7
-    _DEFAULT_MAX_ONNX_BATCH = 256
-    _DEFAULT_MAX_GRAD_NORM = 5.0
     _DEFAULT_SYMMETRY = True
-    _DEFAULT_NO_AMP = False
-    _DEFAULT_NO_COMPILE = False
+    _DEFAULT_TRAIN_PRECISION = "fp32"
+    _DEFAULT_INFER_PRECISION = "fp16"
+    
+    import sys
+    from pathlib import Path
+    _ROOT = Path(__file__).resolve().parent.parent
+    if str(_ROOT) not in sys.path:
+        sys.path.insert(0, str(_ROOT))
+    try:
+        from config import CONFIG
+        _DEFAULT_COMPILE_MODE = CONFIG.train.compile_mode
+        _DEFAULT_CHANNELS_LAST = getattr(CONFIG.train, "channels_last", False)
+        _DEFAULT_FUSED_ADAMW = getattr(CONFIG.train, "fused_adamw", False)
+        _DEFAULT_PREFETCH_QUEUE = getattr(CONFIG.train, "prefetch_queue", 2)
+    except Exception:
 
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
 
-try:
-    from torch.amp import autocast, GradScaler
-except ImportError:  # PyTorch < 2.0
-    from torch.cuda.amp import autocast, GradScaler
+# ---------------------------------------------------------------------------
+# Data Loading
+# ---------------------------------------------------------------------------
 
-from dataset import C4Dataset
-from model import Connect4Net
+# ---------------------------------------------------------------------------
+
+class CudaPrefetcher:
+    """Asynchronously fetches DataLoader batches and copies them to GPU using a background stream."""
+    def __init__(self, loader, device):
+        self.loader = iter(loader)
+        self.device = device
+        self.stream = torch.cuda.Stream() if device.type == "cuda" else None
+        self.preload()
+
+    def preload(self):
+        try:
+            self.next_batch = next(self.loader)
+        except StopIteration:
+            self.next_batch = None
+            return
+            
+        if self.stream is not None:
+            with torch.cuda.stream(self.stream):
+                planes, target_policy, target_value = self.next_batch
+                planes = planes.to(self.device, non_blocking=True)
+                target_policy = target_policy.to(self.device, non_blocking=True)
+                target_value = target_value.to(self.device, non_blocking=True)
+                self.next_batch = (planes, target_policy, target_value)
+        else:
+            planes, target_policy, target_value = self.next_batch
+            planes = planes.to(self.device, non_blocking=True)
+            target_policy = target_policy.to(self.device, non_blocking=True)
+            target_value = target_value.to(self.device, non_blocking=True)
+            self.next_batch = (planes, target_policy, target_value)
+
+    def next(self):
+        if self.stream is not None:
+            torch.cuda.current_stream().wait_stream(self.stream)
+        model_cpu = model
+        
+    if infer_precision == "fp16":
+        model_cpu = model_cpu.half()
+        dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS, dtype=torch.float16)
+    else:
+        dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS, dtype=torch.float32)
+        
+    model_cpu.eval()
+
+    dynamic_axes = {
+        "input": {0: "batch_size"},
+        "policy": {0: "batch_size"},
+        "value": {0: "batch_size"},
+    }
+    import os, sys
+    class SuppressOutput:
+        def __enter__(self):
+            self._stdout, self._stderr = sys.stdout, sys.stderr
+        batch = self.queue.popleft()
+        if batch is not None:
+            for v in batch:
+                if v.is_cuda:
+                    v.record_stream(torch.cuda.current_stream())
+        self.preload() # queue next batch
+        return batch
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +225,7 @@ def compute_loss(
     return policy_loss + value_loss, policy_loss, value_loss
 
 
-def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET) -> None:
+def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET, infer_precision: str = "fp32") -> None:
     """Export the (already-trained) model to ONNX.
 
     Output contract — the Rust side (network.rs) reads by name:
@@ -178,9 +245,14 @@ def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET)
         model_cpu.load_state_dict(model.state_dict())
     else:
         model_cpu = model
+        
+    if infer_precision == "fp16":
+        model_cpu = model_cpu.half()
+        dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS, dtype=torch.float16)
+    else:
+        dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS, dtype=torch.float32)
+        
     model_cpu.eval()
-
-    dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS)
 
     dynamic_axes = {
         "input": {0: "batch_size"},
@@ -226,69 +298,6 @@ def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET)
 
 
 class _ReplayDataset(torch.utils.data.Dataset):
-    def __init__(self, planes, policy, value):
-        self._planes, self._policy, self._value = planes, policy, value
-        self.count = len(planes)
-        self.symmetry = False
-    def __len__(self): return self.count
-    def __getitem__(self, idx):
-        planes = self._planes[idx]
-        policy = self._policy[idx]
-        value = self._value[idx]
-        if self.symmetry:
-            if random.random() < 0.5:
-                planes = planes[:, :, ::-1].copy()
-                policy = policy[::-1].copy()
-        return (torch.from_numpy(planes),
-                torch.from_numpy(policy),
-                torch.tensor(value, dtype=torch.float32))
-
-
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
-
-
-def main() -> None:
-    p = argparse.ArgumentParser(description="Train Connect4Net on C4D1 data")
-    p.add_argument("--data", default=_DEFAULT_DATA,
-                   help="path to a single C4D1 file")
-    p.add_argument("--data-dir", default=None,
-                   help="path to a directory of C4D1 files (replay buffer); "
-                        "all *.bin files in the dir are loaded and concatenated. "
-                        "Overrides --data if set.")
-    p.add_argument("--out", default=_DEFAULT_OUT, help="output model path")
-    p.add_argument("--epochs", type=int, default=_DEFAULT_EPOCHS)
-    p.add_argument("--batch", type=int, default=_DEFAULT_BATCH)
-    p.add_argument("--lr", type=float, default=_DEFAULT_LR)
-    p.add_argument("--weight-decay", type=float, default=_DEFAULT_WD)
-    p.add_argument(
-        "--device",
-        choices=["cpu", "cuda", "auto"],
-        default="auto",
-        help="compute device (auto = cuda if available else cpu)",
-    )
-    # Convenience flags that override --device.
-    p.add_argument("--cpu", action="store_const", const="cpu", dest="device",
-                   help="force CPU training (overrides --device)")
-    p.add_argument("--gpu", action="store_const", const="cuda", dest="device",
-                   help="force CUDA training (overrides --device)")
-    p.add_argument("--no-amp", action="store_true", default=_DEFAULT_NO_AMP, help="disable FP16 autocast")
-    p.add_argument("--no-compile", action="store_true", default=_DEFAULT_NO_COMPILE, help="disable torch.compile")
-    p.add_argument("--no-onnx", action="store_true",
-                   help="skip ONNX export (debug only)")
-    p.add_argument("--onnx-opset", type=int, default=_DEFAULT_OPSET)
-    p.add_argument("--max-samples", type=int, default=None,
-                   help="cap dataset size (for quick smoke tests)")
-    p.add_argument("--log-every", type=int, default=_DEFAULT_LOG_EVERY)
-    p.add_argument("--symmetry", action="store_true", default=_DEFAULT_SYMMETRY,
-                   help="enable horizontal-flip augmentation (doubles effective dataset size)")
-    p.add_argument("--num-workers", type=int, default=None,
-                   help="DataLoader workers (default: 2 for single file, 0 for replay "
-                        "because the replay dataset is defined in main() and can't be pickled).")
-    p.add_argument("--seed", type=int, default=_DEFAULT_SEED, help="RNG seed for training")
-    args = p.parse_args()
-
     import numpy as np
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -304,8 +313,8 @@ def main() -> None:
               f"falling back to CPU")
         args.device = "cpu"
 
-    print(f"[train] device={args.device}  amp={'off' if args.no_amp else 'on'}  "
-          f"compile={'off' if args.no_compile else 'on'}  "
+    print(f"[train] device={args.device}  train_prec={args.train_precision}  infer_prec={args.infer_precision}  "
+          f"compile={args.compile_mode}  "
           f"onnx={'off' if args.no_onnx else 'on'}")
     print(f"[train] data={args.data}  out={args.out}")
     print(f"[train] epochs={args.epochs}  batch={args.batch}  lr={args.lr}")
@@ -338,10 +347,77 @@ def main() -> None:
         own_arr   = np.concatenate(all_own)
         opp_arr   = np.concatenate(all_opp)
         policy_arr = np.concatenate(all_policy)
+    p.add_argument("--infer-precision", choices=["fp32", "fp16"], default=_DEFAULT_INFER_PRECISION, help="Precision for the exported ONNX model")
+    p.add_argument("--compile-mode", type=str, default=_DEFAULT_COMPILE_MODE, choices=["none", "default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
+    p.add_argument("--no-onnx", action="store_true",
+                   help="skip ONNX export (debug only)")
+    p.add_argument("--onnx-opset", type=int, default=_DEFAULT_OPSET)
+        help="compute device (auto = cuda if available else cpu)",
+    )
+    # Convenience flags that override --device.
+    p.add_argument("--cpu", action="store_const", const="cpu", dest="device",
+                   help="force CPU training (overrides --device)")
+    p.add_argument("--gpu", action="store_const", const="cuda", dest="device",
+                   help="force CUDA training (overrides --device)")
+    p.add_argument("--train-precision", choices=["fp32", "fp16", "bf16"], default=_DEFAULT_TRAIN_PRECISION, help="Precision for PyTorch training")
+    p.add_argument("--infer-precision", choices=["fp32", "fp16"], default=_DEFAULT_INFER_PRECISION, help="Precision for the exported ONNX model")
+    p.add_argument("--compile-mode", type=str, default=_DEFAULT_COMPILE_MODE, choices=["none", "default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
+    p.add_argument("--no-onnx", action="store_true",
+                   help="skip ONNX export (debug only)")
+    p.add_argument("--onnx-opset", type=int, default=_DEFAULT_OPSET)
+    p.add_argument("--max-samples", type=int, default=None,
+                   help="cap dataset size (for quick smoke tests)")
+    p.add_argument("--duration", type=float, default=None,
+                   help="If set, run training continuously for this many seconds (ignores --epochs)")
+    p.add_argument("--log-every", type=int, default=_DEFAULT_LOG_EVERY)
+    p.add_argument("--symmetry", action="store_true", default=_DEFAULT_SYMMETRY,
+                   help="enable horizontal-flip augmentation (doubles effective dataset size)")
+    p.add_argument("--num-workers", type=int, default=0,
+                   help="DataLoader workers (default: 0 because we use an async CudaPrefetcher on the main thread).")
+    p.add_argument("--seed", type=int, default=_DEFAULT_SEED, help="RNG seed for training")
+    p.add_argument("--channels-last", action="store_true", default=True, help="Use channels_last memory format")
+    p.add_argument("--fused-adamw", action="store_true", default=True, help="Use fused AdamW optimizer on CUDA")
+    p.add_argument("--prefetch-queue", type=int, default=2, help="CudaPrefetcher queue size")
+    args = p.parse_args()
+
+    import numpy as np
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
+    # Resolve `--device auto` to a concrete device based on CUDA availability.
+    if args.device == "auto":
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # ---- Data -------------------------------------------------------------
+    # If --data-dir is set, load all C4D1 files in it (replay buffer).
+    # Otherwise load the single --data file.
+    if args.data_dir:
+        from dataset import C4Dataset, decode_bitboard_batched
+        import os, glob
+        bin_files = sorted(glob.glob(os.path.join(args.data_dir, "*.bin")))
+        if not bin_files:
+            print(f"[train] no .bin files found in {args.data_dir} — aborting")
+            return
+        print(f"[train] replay buffer: {len(bin_files)} file(s) from {args.data_dir}")
+        # Concatenate all samples in memory then build one big planes array.
+        all_own, all_opp, all_policy, all_value = [], [], [], []
+        for f in bin_files:
+            sub = C4Dataset(f, max_samples=args.max_samples)
+            print(f"  - {f}: {len(sub):,} samples")
+            all_own.append(sub._own);  all_opp.append(sub._opp)
+            all_policy.append(sub._policy); all_value.append(sub._value)
+            if args.max_samples is not None and sum(len(x) for x in all_own) >= args.max_samples:
+                break
+        import numpy as np
+        own_arr   = np.concatenate(all_own)
+        opp_arr   = np.concatenate(all_opp)
+        policy_arr = np.concatenate(all_policy)
         value_arr = np.concatenate(all_value)
         if args.max_samples is not None and len(own_arr) > args.max_samples:
             own_arr, opp_arr = own_arr[:args.max_samples], opp_arr[:args.max_samples]
             policy_arr, value_arr = policy_arr[:args.max_samples], value_arr[:args.max_samples]
+
         planes_arr = decode_bitboard_batched(own_arr, opp_arr)
         
         ds = _ReplayDataset(planes_arr, policy_arr, value_arr)
@@ -349,8 +425,6 @@ def main() -> None:
         if args.symmetry:
             print("[train] symmetry augmentation ON (horizontal flip, 50/50)")
         
-        if args.num_workers is None:
-            args.num_workers = 0  # 0 is vastly faster on Windows for small memory-loaded datasets (no process spawn overhead)
         n = len(ds)
         n_pos = int((value_arr > 0).sum()); n_neg = int((value_arr < 0).sum())
         print(f"[train] replay dataset: {n:,} samples | wins={n_pos} losses={n_neg} draws={n - n_pos - n_neg}")
@@ -360,59 +434,96 @@ def main() -> None:
         if args.symmetry:
             print("[train] symmetry augmentation ON (horizontal flip, 50/50)")
         print(f"[train] dataset: {ds.stats()}")
-    loader = DataLoader(
-        ds,
-        batch_size=args.batch,
-        shuffle=True,
-        num_workers=args.num_workers if args.num_workers is not None else _DEFAULT_NUM_WORKERS,
+    loader_kwargs = dict(
         pin_memory=(args.device != "cpu"),
-        drop_last=False,
     )
+    if args.num_workers == 0:
+        from torch.utils.data import BatchSampler, RandomSampler
+        loader_kwargs["batch_size"] = None
+        loader_kwargs["sampler"] = BatchSampler(RandomSampler(ds), batch_size=args.batch, drop_last=False)
+        loader_kwargs["num_workers"] = 0
+    else:
+        loader_kwargs["batch_size"] = args.batch
+        loader_kwargs["shuffle"] = True
+        loader_kwargs["num_workers"] = args.num_workers
+        loader_kwargs["drop_last"] = False
+
+    loader = DataLoader(ds, **loader_kwargs)
+    print(f"[train] DataLoader initialized with num_workers={loader.num_workers}, pin_memory={loader.pin_memory}")
 
     # ---- Model ------------------------------------------------------------
     model = Connect4Net().to(args.device)
     n_params = model.num_parameters()
     print(f"[train] model: {n_params:,} parameters")
 
+    use_amp = args.train_precision in ("fp16", "bf16")
+    amp_dtype = torch.float16 if args.train_precision == "fp16" else (torch.bfloat16 if args.train_precision == "bf16" else torch.float32)
+
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs * len(loader)
+        optimizer, T_max=args.epochs * len(loader) if args.duration is None else 1000 * len(loader)
     )
 
-    use_amp = (not args.no_amp) and args.device.startswith("cuda")
     scaler = GradScaler(enabled=use_amp)
 
-    if not args.no_compile and hasattr(torch, "compile"):
-        # Triton is the inductor backend torch.compile uses for CUDA codegen.
-        # On Windows it has no compatible wheel from PyPI — the import fails
-        # and torch.compile crashes at first forward. Auto-detect and skip.
+    if args.compile_mode != "none" and hasattr(torch, "compile"):
         try:
-            import triton  # noqa: F401
-            model = torch.compile(model, mode="reduce-overhead")
-            print("[train] torch.compile enabled (mode=reduce-overhead)")
-        except ImportError:
-            print("[train] triton not installed — skipping torch.compile (use --no-compile to silence this check)")
+            model = torch.compile(model, mode=args.compile_mode)
+            print(f"[train] torch.compile enabled (mode={args.compile_mode})")
         except Exception as e:
             print(f"[train] torch.compile failed: {e}; continuing uncompiled")
 
+    # ---- Warmup -----------------------------------------------------------
+    # Run a full pass over the DataLoader to initialize CUDA, JIT, pinned memory,
+    # and crucially, to allow cuDNN to benchmark BOTH the main batch size AND 
+    # the smaller remainder batch size at the end of the dataset.
+    print("[train] Running warmup pass to initialize CUDA/JIT and cuDNN benchmarks...")
+    warmup_prefetcher = CudaPrefetcher(loader, torch.device(args.device))
+    while True:
+        batch = warmup_prefetcher.next()
+        if batch is None: break
+        warmup_planes, warmup_policy, warmup_value = batch
+        
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(enabled=use_amp, device_type="cuda" if use_amp else "cpu", dtype=amp_dtype):
+            log_p, v = model(warmup_planes)
+            loss, _, _ = compute_loss(log_p, v, warmup_policy, warmup_value)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=_DEFAULT_MAX_GRAD_NORM)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+
     # ---- Train ------------------------------------------------------------
     best_loss = float("inf")
-    for epoch in range(args.epochs):
+    global_start_t = time.time()
+    total_samples = 0
+    epoch = 0
+    done = False
+
+    while not done:
         model.train()
         t0 = time.time()
         running = {"total": 0.0, "policy": 0.0, "value": 0.0}
         n_batches = 0
+        prefetcher = CudaPrefetcher(loader, torch.device(args.device))
 
-        for batch_idx, (planes, target_policy, target_value) in enumerate(loader):
-            planes = planes.to(args.device, non_blocking=True)
-            target_policy = target_policy.to(args.device, non_blocking=True)
-            target_value = target_value.to(args.device, non_blocking=True)
+        batch_idx = 0
+        while True:
+            batch = prefetcher.next()
+            if batch is None: break
+            planes, target_policy, target_value = batch
+            
+            if args.duration is not None and time.time() - global_start_t >= args.duration:
+                done = True
+                break
 
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast(enabled=use_amp, device_type="cuda" if use_amp else "cpu"):
+            with autocast(enabled=use_amp, device_type="cuda" if use_amp else "cpu", dtype=amp_dtype):
                 log_p, v = model(planes)
                 loss, policy_loss, value_loss = compute_loss(
                     log_p, v, target_policy, target_value
@@ -429,12 +540,17 @@ def main() -> None:
             running["policy"] += policy_loss.item()
             running["value"] += value_loss.item()
             n_batches += 1
+            total_samples += planes.size(0)
 
             if (batch_idx + 1) % args.log_every == 0:
                 avg = {k: v / n_batches for k, v in running.items()}
                 lr = scheduler.get_last_lr()[0]
+                if args.duration is not None:
+                    epoch_str = f"epoch {epoch+1}"
+                else:
+                    epoch_str = f"epoch {epoch+1}/{args.epochs}"
                 print(
-                    f"[train] epoch {epoch+1}/{args.epochs}  "
+                    f"[train] {epoch_str}  "
                     f"batch {batch_idx+1}/{len(loader)}  "
                     f"loss={avg['total']:.4f}  policy={avg['policy']:.4f}  "
                     f"value={avg['value']:.4f}  lr={lr:.2e}  "
@@ -442,46 +558,102 @@ def main() -> None:
                 )
                 running = {"total": 0.0, "policy": 0.0, "value": 0.0}
                 n_batches = 0
+            batch_idx += 1
 
         # End-of-epoch summary.
         epoch_sec = time.time() - t0
         samples_per_sec = len(ds) / max(0.001, epoch_sec)
-        avg_tot = running["total"] / max(1, n_batches)
-        avg_pol = running["policy"] / max(1, n_batches)
-        avg_val = running["value"] / max(1, n_batches)
+        if n_batches == 0:
+            avg_tot = avg_pol = avg_val = 0.0
+        else:
+            avg_tot = running["total"] / max(1, n_batches)
+            avg_pol = running["policy"] / max(1, n_batches)
+            avg_val = running["value"] / max(1, n_batches)
         lr = scheduler.get_last_lr()[0]
 
         model.eval()
+        v_item = 0.0
         with torch.no_grad():
-            sample = ds[0]
-            planes = sample[0].unsqueeze(0).to(args.device)
-            log_p, v = model(planes)
-            policy = log_p.exp().cpu().numpy()[0]
+            if len(ds) > 0:
+                sample = ds[0]
+                planes_sample = sample[0].unsqueeze(0).to(args.device)
+                log_p, v = model(planes_sample)
+                v_item = v.item()
+
+        if args.duration is not None:
+            epoch_str = f"epoch {epoch+1:2d}"
+        else:
+            epoch_str = f"epoch {epoch+1:2d}/{args.epochs}"
 
         print(
-            f"[train] epoch {epoch+1:2d}/{args.epochs} done in {epoch_sec:.2f}s "
+            f"[train] {epoch_str} done in {epoch_sec:.2f}s "
+
+        # End-of-epoch summary.
+        epoch_sec = time.time() - t0
+        samples_per_sec = len(ds) / max(0.001, epoch_sec)
+        if n_batches == 0:
+            avg_tot = avg_pol = avg_val = 0.0
+        else:
+            avg_tot = running["total"] / max(1, n_batches)
+            avg_pol = running["policy"] / max(1, n_batches)
+            avg_val = running["value"] / max(1, n_batches)
+        lr = scheduler.get_last_lr()[0]
+
+        model.eval()
+        v_item = 0.0
+        with torch.no_grad():
+            if len(ds) > 0:
+                sample = ds[0]
+                planes_sample = sample[0].unsqueeze(0).to(args.device)
+                log_p, v = model(planes_sample)
+                v_item = v.item()
+
+        if args.duration is not None:
+            epoch_str = f"epoch {epoch+1:2d}"
+        else:
+            epoch_str = f"epoch {epoch+1:2d}/{args.epochs}"
+
+        print(
+            f"[train] {epoch_str} done in {epoch_sec:.2f}s "
             f"({samples_per_sec:.0f} samples/s) | loss={avg_tot:.4f} "
             f"(policy={avg_pol:.4f}, value={avg_val:.4f}) lr={lr:.2e} | "
-            f"sample val={v.item():+.3f}"
+            f"sample val={v_item:+.3f}"
         )
 
-        # Snapshot the best model (raw state_dict, so GUI can load directly).
-        avg_total = running["total"] / max(1, n_batches)
-        if avg_total < best_loss:
-            best_loss = avg_total
-            inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-            inner.save(args.out)
-            print(f"[train] saved best model (loss={best_loss:.4f}) to {args.out}")
+        if n_batches > 0:
+            avg_tot = running["total"] / max(1, n_batches)
+            if avg_tot < best_loss:
+                best_loss = avg_tot
+
+        if done or (args.duration is None and epoch >= args.epochs - 1):
+            done = True
+        
+        epoch += 1
+
+    total_time = time.time() - global_start_t
+    overall_throughput = total_samples / max(0.001, total_time)
+    print(f"[train] overall throughput: {overall_throughput:.1f} samples/s")
+
+    # Save the model ONCE at the very end
+    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+    inner.save(args.out)
+    print(f"[train] saved final model (loss={best_loss:.4f}) to {args.out}")
+
+    metrics_file = Path(args.out).parent / "train_metrics.txt"
+    try:
+        with open(metrics_file, "w") as f:
+            f.write(str(overall_throughput))
+    except Exception as e:
+        print(f"[train] WARNING: Could not write metrics file: {e}")
 
     # ---- ONNX export (consumed by the Rust MCTS) ------------------------
     if not args.no_onnx:
-        onnx_path = args.out[: -len(".pt")] + ".onnx" if args.out.endswith(".pt") \
-            else args.out + ".onnx"
-        print(f"[train] exporting ONNX -> {onnx_path} (opset {args.onnx_opset})")
+        onnx_path = args.out.replace(".pt", ".onnx")
+        print(f"[train] exporting ONNX -> {onnx_path} (opset {args.onnx_opset}, precision {args.infer_precision})")
         # Use the un-compiled underlying model.
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
         try:
-            export_onnx(inner, onnx_path, opset=args.onnx_opset)
+            export_onnx(inner, onnx_path, opset=args.onnx_opset, infer_precision=args.infer_precision)
             print(f"[train] ONNX export OK. Next self-play cycle will use it.")
         except Exception as e:
             print(f"[train] WARNING: ONNX export failed: {e}")

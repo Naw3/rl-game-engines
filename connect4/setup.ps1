@@ -2,7 +2,7 @@
 # setup.ps1 - Interactive & transparent setup for Connect4 pipeline on Windows.
 #
 # Installs & Configures:
-#   1. Python 3.11+ & packages (via src_python/requirements.txt)
+#   1. Python 3.14+ & packages (via pyproject.toml)
 #   2. Rust toolchain (via rustup/cargo)
 #   3. CUDA Toolkit 12.x (detects existing v12.x or guides install)
 #   4. cuDNN 9.x (via pip wheel) & registers DLL path into User PATH
@@ -175,44 +175,38 @@ try {
     # STEP 5: Python Dependencies & cuDNN
     # -------------------------------------------------------------------------
     Write-Host "`n[5/5] Installing Python dependencies (PyTorch CUDA, ONNX, cuDNN...)" -ForegroundColor Yellow
-    $reqFile = Join-Path $PSScriptRoot "src_python\requirements.txt"
-    if (Test-Path $reqFile) {
-        $maxRetries = 3
-        $success = $false
-        for ($i = 1; $i -le $maxRetries; $i++) {
-            Write-Host "  -> Running uv pip install (Attempt $i/$maxRetries)..." -ForegroundColor Cyan
-            
-            # Temporary set ErrorActionPreference to Continue for native command execution
-            $oldEA = $global:ErrorActionPreference
-            $global:ErrorActionPreference = "Continue"
-            
-            if ($uvCmd) {
-                if (Test-Path $venvPy) {
-                    & uv pip install --python $pythonExePath -r $reqFile
-                } else {
-                    & uv pip install --system -r $reqFile
-                }
-            } else {
-                & $pythonExePath -m pip install -r $reqFile
-            }
-            $exitCode = $LASTEXITCODE
-            $global:ErrorActionPreference = $oldEA
-            
-            if ($exitCode -eq 0) {
-                $success = $true
-                break
-            } else {
-                Write-Warning "  -> Download/install failed (exit code $exitCode). Retrying in 3 seconds..."
-                Start-Sleep -Seconds 3
-            }
+    
+    $maxRetries = 3
+    $success = $false
+    for ($i = 1; $i -le $maxRetries; $i++) {
+        Write-Host "  -> Running uv sync (Attempt $i/$maxRetries)..." -ForegroundColor Cyan
+        
+        $oldEA = $global:ErrorActionPreference
+        $global:ErrorActionPreference = "Continue"
+        
+        if ($uvCmd) {
+            & uv sync
+        } else {
+            Write-Warning "  -> 'uv' not found. Falling back to pip install..."
+            & $pythonExePath -m pip install .
         }
-
-        if (-not $success) {
-            Write-Error "[setup] Failed to install Python dependencies after $maxRetries attempts."
-            exit 1
+        $exitCode = $LASTEXITCODE
+        $global:ErrorActionPreference = $oldEA
+        
+        if ($exitCode -eq 0) {
+            $success = $true
+            break
+        } else {
+            Write-Warning "  -> uv sync failed (exit code $exitCode). Retrying in 3 seconds..."
+            Start-Sleep -Seconds 3
         }
-        Write-Host "  -> Dependencies installed successfully!" -ForegroundColor Green
     }
+
+    if (-not $success) {
+        Write-Error "[setup] Failed to install Python dependencies after $maxRetries attempts."
+        exit 1
+    }
+    Write-Host "  -> Dependencies installed successfully!" -ForegroundColor Green
 
     # Locate and register cuDNN bin path
     Write-Host "`n[cuDNN] Registering cuDNN 9.x runtime DLLs into PATH..." -ForegroundColor Yellow

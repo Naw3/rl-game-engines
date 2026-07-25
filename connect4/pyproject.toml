@@ -1,0 +1,27 @@
+[project]
+name = "connect4-alphazero"
+version = "0.1.0"
+description = "Connect4 AlphaZero engine in Rust and PyTorch"
+readme = "README.md"
+requires-python = ">=3.14"
+
+dependencies = [
+    "torch>=2.13.0",
+    "numpy>=2.5.1",
+    "onnx>=1.22.0",
+    "onnxscript>=0.7.1",
+    "onnxruntime>=1.27.0",
+    "nvidia-cudnn-cu12",
+    "nvidia-cublas-cu12"
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.extra-build-dependencies]
+pygame = ["setuptools<70.0.0"]

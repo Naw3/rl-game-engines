@@ -67,7 +67,7 @@ connect4/
 │       ├── mcts.rs          # PUCT search, Dirichlet noise, network eval
 │       └── main.rs          # Parallel self-play, C4D1 writer
 ├── src_python/              # The learner + GUI (GPU)
-│   ├── requirements.txt
+│   ├── pyproject.toml
 │   ├── model.py             # Connect4Net: small ResNet, policy + value heads
 │   ├── dataset.py           # Reads the C4D1 binary
 │   ├── train.py             # AMP FP16 + torch.compile, saves .pt + .onnx
@@ -89,8 +89,13 @@ connect4/
 ```bash
 # Rust toolchain (stable).
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-# Python deps (CUDA build of PyTorch; for CPU-only, change the index URL).
-python -m pip install -r src_python/requirements.txt
+```
+
+### Manual Python Setup (Optional)
+If you prefer not to use the automated setup script, you can install the dependencies manually using `uv`:
+
+```bash
+uv sync
 ```
 
 ### The one-command loop (Windows PowerShell)

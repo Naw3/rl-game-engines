@@ -185,6 +185,7 @@ fn main() -> ExitCode {
 
     // Defaults initialized from config.json if present, fallback to built-in defaults.
     let mut num_games: usize = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.games).unwrap_or(64);
+    let mut duration_secs: Option<u64> = None;
     let mut simulations: usize = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.sims).unwrap_or(mcts::DEFAULT_SIMS);
     let mut batch_size_opt: Option<usize> = None;
     let mut seed: u64 = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.seed).unwrap_or(0xC0FFEE_u64);
@@ -208,6 +209,9 @@ fn main() -> ExitCode {
         match a.as_str() {
             "--games" | "-g" => {
                 num_games = next(&mut i).parse().unwrap_or(64);
+            }
+            "--duration" => {
+                duration_secs = Some(next(&mut i).parse().unwrap_or(60));
             }
             "--sims" | "-s" => {
                 simulations = next(&mut i).parse().unwrap_or(mcts::DEFAULT_SIMS);
@@ -262,8 +266,8 @@ fn main() -> ExitCode {
         i += 1;
     }
 
-    if num_games == 0 {
-        eprintln!("--games must be > 0");
+    if duration_secs.is_none() && num_games == 0 {
+        eprintln!("--games must be > 0 (or use --duration)");
         return ExitCode::from(2);
     }
 
@@ -319,10 +323,17 @@ fn main() -> ExitCode {
     };
 
     if verbose {
-        eprintln!(
-            "[selfplay] games={} sims={} batch_size={} seed=0x{:X} output={} tau={} eps={}",
-            num_games, simulations, batch_size, seed, output, temperature, dirichlet_eps
-        );
+        if let Some(dur) = duration_secs {
+            eprintln!(
+                "[selfplay] duration={}s sims={} batch_size={} seed=0x{:X} output={} tau={} eps={}",
+                dur, simulations, batch_size, seed, output, temperature, dirichlet_eps
+            );
+        } else {
+            eprintln!(
+                "[selfplay] games={} sims={} batch_size={} seed=0x{:X} output={} tau={} eps={}",
+                num_games, simulations, batch_size, seed, output, temperature, dirichlet_eps
+            );
+        }
         // Warn if --device gpu is requested but cuda feature wasn't compiled in.
         if device == network::Device::Gpu && !cfg!(feature = "cuda") {
             eprintln!(
@@ -350,89 +361,175 @@ fn main() -> ExitCode {
     let completed_games = Arc::new(AtomicUsize::new(0));
     let total_plies = Arc::new(AtomicUsize::new(0));
 
+    let format_dur = |s: f64| -> String {
+        if s < 0.001 {
+            "< 1ms".to_string()
+        } else if s < 1.0 {
+            format!("{:.0}ms", s * 1000.0)
+        } else if s < 60.0 {
+            format!("{:.1}s", s)
+        } else if s < 3600.0 {
+            let u = s.round() as u64;
+            format!("{}m {:02}s", u / 60, u % 60)
+        } else {
+            let u = s.round() as u64;
+            format!("{}h {:02}m {:02}s", u / 3600, (u % 3600) / 60, u % 60)
+        }
+    };
+
     if verbose {
         let bar_width = json_cfg.as_ref().and_then(|c| c.gui.as_ref()?.progress_bar_width).unwrap_or(20);
         let bar = format!("[{}]", " ".repeat(bar_width));
-        eprint!(
-            "\r\x1B[K[selfplay]   0% {}    0/{} | avg 0.0 moves | 0.0s | 0.0s/game | ETA: --",
-            bar, num_games
-        );
+        if duration_secs.is_some() {
+            eprint!(
+                "\r\x1B[K[selfplay]   0% {}    0 games | avg 0.0 moves | 0.0s | 0.0s/game",
+                bar
+            );
+        } else {
+            eprint!(
+                "\r\x1B[K[selfplay]   0% {}    0/{} | avg 0.0 moves | 0.0s | 0.0s/game | ETA: --",
+                bar, num_games
+            );
+        }
         let _ = std::io::stderr().flush();
     }
 
-    let samples: Vec<Sample> = (0..num_games)
-        .into_par_iter()
-        .enumerate()
-        .map(|(game_idx, _)| {
-            let game_seed = seed
-                .wrapping_add(game_idx as u64)
-                .wrapping_mul(0x9E3779B97F4A7C15);
-            let mut rng = StdRng::seed_from_u64(game_seed);
-            let mut mcts = MCTS::new(config, Arc::clone(&network));
-            let game_samples = play_game(&mut mcts, &mut rng);
+    let samples: Vec<Sample> = if let Some(dur) = duration_secs {
+        let num_threads = rayon::current_num_threads();
+        (0..num_threads)
+            .into_par_iter()
+            .map(|thread_idx| {
+                let mut local_samples = Vec::new();
+                let mut game_idx = thread_idx;
+                while start.elapsed().as_secs() < dur {
+                    let game_seed = seed
+                        .wrapping_add(game_idx as u64)
+                        .wrapping_mul(0x9E3779B97F4A7C15);
+                    let mut rng = StdRng::seed_from_u64(game_seed);
+                    let mut mcts = MCTS::new(config.clone(), Arc::clone(&network));
+                    
+                    let deadline = Some(start + std::time::Duration::from_secs(dur));
+                    let game_samples = play_game(&mut mcts, &mut rng, deadline);
 
-            let completed = completed_games.fetch_add(1, Ordering::SeqCst) + 1;
-            let current_plies = total_plies.fetch_add(game_samples.len(), Ordering::SeqCst) + game_samples.len();
-
-            if verbose {
-                let elapsed = start.elapsed().as_secs_f64();
-                let avg_plies = current_plies as f64 / completed as f64;
-                let sec_per_game = elapsed / completed as f64;
-                let remaining_games = num_games.saturating_sub(completed);
-                let eta_sec = sec_per_game * remaining_games as f64;
-
-                let format_dur = |s: f64| -> String {
-                    if s < 0.001 {
-                        "< 1ms".to_string()
-                    } else if s < 1.0 {
-                        format!("{:.0}ms", s * 1000.0)
-                    } else if s < 60.0 {
-                        format!("{:.1}s", s)
-                    } else if s < 3600.0 {
-                        let u = s.round() as u64;
-                        format!("{}m {:02}s", u / 60, u % 60)
-                    } else {
-                        let u = s.round() as u64;
-                        format!("{}h {:02}m {:02}s", u / 3600, (u % 3600) / 60, u % 60)
+                    // If it was aborted by the deadline, discard it and break
+                    if game_samples.is_empty() {
+                        break;
                     }
-                };
 
-                let time_str = format_dur(elapsed);
-                let eta_str = format_dur(eta_sec);
-                let per_game_str = format!("{}/game", format_dur(sec_per_game));
+                    local_samples.extend(game_samples.clone());
 
-                let pct = (completed * 100) / num_games;
-                let bar_width = json_cfg.as_ref().and_then(|c| c.gui.as_ref()?.progress_bar_width).unwrap_or(20);
-                let filled = (completed * bar_width) / num_games;
-                let empty = bar_width - filled;
-                let bar = format!(
-                    "[{}{}{}]",
-                    "=".repeat(filled),
-                    if filled < bar_width { ">" } else { "" },
-                    " ".repeat(if empty > 0 { empty - 1 } else { 0 })
-                );
+                    let completed = completed_games.fetch_add(1, Ordering::SeqCst) + 1;
+                    let current_plies = total_plies.fetch_add(game_samples.len(), Ordering::SeqCst) + game_samples.len();
 
-                eprint!(
-                    "\r\x1B[K[selfplay] {:3}% {} {:4}/{} | avg {:.1} moves | {} | {} | ETA: {}",
-                    pct, bar, completed, num_games, avg_plies, time_str, per_game_str, eta_str
-                );
-                let _ = std::io::stderr().flush();
-            }
-            game_samples
-        })
-        .reduce(Vec::new, |mut a, mut b| {
-            a.append(&mut b);
-            a
-        });
+                    if verbose {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        let avg_plies = current_plies as f64 / completed as f64;
+                        let sec_per_game = elapsed / completed as f64;
+                        let time_str = format_dur(elapsed);
+                        let per_game_str = format!("{}/game", format_dur(sec_per_game));
+
+                        let dur_f64 = dur as f64;
+                        let pct = ((elapsed / dur_f64) * 100.0).clamp(0.0, 100.0) as usize;
+                        let bar_width = json_cfg.as_ref().and_then(|c| c.gui.as_ref()?.progress_bar_width).unwrap_or(20);
+                        let filled = ((elapsed / dur_f64) * bar_width as f64).clamp(0.0, bar_width as f64) as usize;
+                        let empty = bar_width.saturating_sub(filled);
+                        let bar = format!(
+                            "[{}{}{}]",
+                            "=".repeat(filled),
+                            if filled < bar_width { ">" } else { "" },
+                            " ".repeat(if empty > 0 { empty - 1 } else { 0 })
+                        );
+
+                        eprint!(
+                            "\r\x1B[K[selfplay] {:3}% {} {:4} games | avg {:.1} moves | {} / {} | {}",
+                            pct, bar, completed, avg_plies, time_str, format_dur(dur_f64), per_game_str
+                        );
+                        let _ = std::io::stderr().flush();
+                    }
+                    game_idx += num_threads;
+                }
+                local_samples
+            })
+            .reduce(Vec::new, |mut a, mut b| {
+                a.append(&mut b);
+                a
+            })
+    } else {
+        (0..num_games)
+            .into_par_iter()
+            .enumerate()
+            .map(|(game_idx, _)| {
+                let game_seed = seed
+                    .wrapping_add(game_idx as u64)
+                    .wrapping_mul(0x9E3779B97F4A7C15);
+                let mut rng = StdRng::seed_from_u64(game_seed);
+                let mut mcts = MCTS::new(config.clone(), Arc::clone(&network));
+                let game_samples = play_game(&mut mcts, &mut rng, None);
+
+                let completed = completed_games.fetch_add(1, Ordering::SeqCst) + 1;
+                let current_plies = total_plies.fetch_add(game_samples.len(), Ordering::SeqCst) + game_samples.len();
+
+                if verbose {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let avg_plies = current_plies as f64 / completed as f64;
+                    let sec_per_game = elapsed / completed as f64;
+                    let remaining_games = num_games.saturating_sub(completed);
+                    let eta_sec = sec_per_game * remaining_games as f64;
+                    let time_str = format_dur(elapsed);
+                    let eta_str = format_dur(eta_sec);
+                    let per_game_str = format!("{}/game", format_dur(sec_per_game));
+
+                    let pct = (completed * 100) / num_games;
+                    let bar_width = json_cfg.as_ref().and_then(|c| c.gui.as_ref()?.progress_bar_width).unwrap_or(20);
+                    let filled = (completed * bar_width) / num_games;
+                    let empty = bar_width - filled;
+                    let bar = format!(
+                        "[{}{}{}]",
+                        "=".repeat(filled),
+                        if filled < bar_width { ">" } else { "" },
+                        " ".repeat(if empty > 0 { empty - 1 } else { 0 })
+                    );
+
+                    eprint!(
+                        "\r\x1B[K[selfplay] {:3}% {} {:4}/{} | avg {:.1} moves | {} | {} | ETA: {}",
+                        pct, bar, completed, num_games, avg_plies, time_str, per_game_str, eta_str
+                    );
+                    let _ = std::io::stderr().flush();
+                }
+                game_samples
+            })
+            .reduce(Vec::new, |mut a, mut b| {
+                a.append(&mut b);
+                a
+            })
+    };
 
     if verbose {
+        if let Some(dur) = duration_secs {
+            let bar_width = json_cfg.as_ref().and_then(|c| c.gui.as_ref()?.progress_bar_width).unwrap_or(20);
+            let bar = format!("[{}]", "=".repeat(bar_width));
+            let elapsed = start.elapsed().as_secs_f64();
+            eprint!(
+                "\r\x1B[K[selfplay] 100% {}  time limit reached | {:.1}s / {}s",
+                bar, elapsed, dur
+            );
+        }
+        
         eprintln!();
+        let elapsed = start.elapsed().as_secs_f64();
+        let final_games = completed_games.load(Ordering::SeqCst);
+        let throughput = final_games as f64 / elapsed;
         eprintln!(
-            "[selfplay] {} games → {} samples in {:?}",
-            num_games,
+            "[selfplay] {} games → {} samples in {:.2}s ({:.1} games/sec)",
+            final_games,
             samples.len(),
-            start.elapsed()
+            elapsed,
+            throughput
         );
+        let sample_throughput = samples.len() as f64 / elapsed;
+        let stats_path = format!("{}.stats", output);
+        let stats_content = format!("{}\n{:.1}\n{:.1}\n", final_games, throughput, sample_throughput);
+        let _ = std::fs::write(stats_path, stats_content);
     }
 
     match write_binary(&output, &samples) {
@@ -587,12 +684,19 @@ fn run_benchmark(args: &[String]) -> ExitCode {
 }
 
 /// Play one self-play game. Returns the (state, policy, value) samples.
-fn play_game<R: Rng + ?Sized>(mcts: &mut MCTS, rng: &mut R) -> Vec<Sample> {
+/// If `deadline` is provided and exceeded, aborts the game and returns an empty Vec.
+fn play_game<R: Rng + ?Sized>(mcts: &mut MCTS, rng: &mut R, deadline: Option<Instant>) -> Vec<Sample> {
     let mut board = Board::new();
     let mut samples: Vec<Sample> = Vec::with_capacity(42);
     let mut last_was_terminal: Option<MoveResult> = None;
 
     loop {
+        if let Some(d) = deadline {
+            if Instant::now() >= d {
+                return Vec::new();
+            }
+        }
+
         // Run network-guided MCTS to get the policy at this state.
         let (policy, _q) = mcts.run(board, rng);
 
