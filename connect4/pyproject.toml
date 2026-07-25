@@ -12,7 +12,8 @@ dependencies = [
     "onnxscript>=0.7.1",
     "onnxruntime>=1.27.0",
     "nvidia-cudnn-cu12",
-    "nvidia-cublas-cu12"
+    "nvidia-cublas-cu12",
+    "triton-windows"
 ]
 
 [tool.uv.sources]
