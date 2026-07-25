@@ -98,6 +98,7 @@ try {
     Pop-Location
     if ($rc -ne 0) {
         Write-Error "[bench/prep] Failed to create baseline model."
+        Write-Error "[bench/prep] Failed to create baseline model."
         exit 1
     }
 
@@ -116,8 +117,6 @@ try {
     $resCpu = $null
     $resGpu = $null
     $trainTime = $null
-    
-    $cpuData = Join-Path $benchDir "selfplay_cpu.bin"
     $gpuData = Join-Path $benchDir "selfplay_gpu.bin"
 
     $runCpu = $Cpu.IsPresent
@@ -143,11 +142,25 @@ try {
         Write-Host "-----------------------------------------------------------------" -ForegroundColor Cyan
         
         $tStart = Get-Date
-        & $cargoExe -g $GAMES -s $SIMS -b $CPU_BATCH_SIZE -o $cpuData -m $initOnnx -d cpu --seed $BENCH_SEED -v
+        & $cargoExe --duration $DURATION -s $SIMS -b $CPU_BATCH_SIZE -o $cpuData -m $initOnnx -d cpu --seed $BENCH_SEED -v
         if ($LASTEXITCODE -eq 0) {
             $dur = (Get-Date) - $tStart
-            $resCpu = @{ SelfplaySec = $dur.TotalSeconds; BatchSize = $CPU_BATCH_SIZE }
-            Write-Host ("[bench/mcts-cpu] Self-play completed in {0}" -f (Format-BenchDur $dur.TotalSeconds)) -ForegroundColor Green
+            if (Test-Path $cpuData) {
+                $samples = (Get-Item $cpuData).Length / 56
+                $tp = $samples / $DURATION
+                
+                $games = 0
+                $gamesTp = 0.0
+                $statsFile = $cpuData + ".stats"
+                if (Test-Path $statsFile) {
+                    $stats = Get-Content $statsFile
+                    $games = [int]$stats[0]
+                    $gamesTp = [double]$stats[1]
+                }
+                
+                $resCpu = @{ Samples = $samples; Throughput = $tp; BatchSize = $CPU_BATCH_SIZE; Duration = $DURATION; Games = $games; GamesTp = $gamesTp }
+                Write-Host ("[bench/mcts-cpu] Generated {0} samples from {1} games in {2}s ({3:F1} samples/s | {4:F1} games/s)" -f $samples, $games, $DURATION, $tp, $gamesTp) -ForegroundColor Green
+            }
         }
     }
 
@@ -159,17 +172,37 @@ try {
         } else {
             Write-Host ""
             Write-Host "-----------------------------------------------------------------" -ForegroundColor Cyan
-            Write-Host ("  STAGE 2: Rust MCTS Self-Play Inference (GPU, batch={0})" -f $GPU_BATCH_SIZE) -ForegroundColor Cyan
-            Write-Host "-----------------------------------------------------------------" -ForegroundColor Cyan
-        }
-        
-        $tStart = Get-Date
-        & $cargoExe -g $GAMES -s $SIMS -b $GPU_BATCH_SIZE -o $gpuData -m $initOnnx -d gpu --seed $BENCH_SEED -v
+                    $samples = (Get-Item $gpuData).Length / 56
+                    $tp = $samples / $DURATION
+                    $resGpu = @{ Samples = $samples; Throughput = $tp; BatchSize = $GPU_BATCH_SIZE; Duration = $DURATION }
+                    Write-Host ("[bench/mcts-gpu] Generated {0} samples in {1}s ({2:F1} samples/s)" -f $samples, $DURATION, $tp) -ForegroundColor Green
+                }
+        & $cargoExe --duration $DURATION -s $SIMS -b $GPU_BATCH_SIZE -o $gpuData -m $initOnnx -d gpu --seed $BENCH_SEED -v
         if ($LASTEXITCODE -eq 0) {
             $dur = (Get-Date) - $tStart
             if (-not $implicitGpuForTrain) {
-                $resGpu = @{ SelfplaySec = $dur.TotalSeconds; BatchSize = $GPU_BATCH_SIZE }
-                Write-Host ("[bench/mcts-gpu] Self-play completed in {0}" -f (Format-BenchDur $dur.TotalSeconds)) -ForegroundColor Green
+                if (Test-Path $gpuData) {
+                    $samples = (Get-Item $gpuData).Length / 56
+                    $tp = $samples / $DURATION
+                    
+                    $games = 0
+                    $gamesTp = 0.0
+                    $statsFile = $gpuData + ".stats"
+                    if (Test-Path $statsFile) {
+                        $stats = Get-Content $statsFile
+                        $games = [int]$stats[0]
+                        $gamesTp = [double]$stats[1]
+                    }
+                    
+                    $resGpu = @{ Samples = $samples; Throughput = $tp; BatchSize = $GPU_BATCH_SIZE; Duration = $DURATION; Games = $games; GamesTp = $gamesTp }
+                    Write-Host ("[bench/mcts-gpu] Generated {0} samples from {1} games in {2}s ({3:F1} samples/s | {4:F1} games/s)" -f $samples, $games, $DURATION, $tp, $gamesTp) -ForegroundColor Green
+                }
+                        }
+                    }
+                    
+                    $resGpu = @{ Samples = $samples; Throughput = $tp; BatchSize = $GPU_BATCH_SIZE; Duration = $DURATION; Games = $games; GamesTp = $gamesTp }
+                    Write-Host ("[bench/mcts-gpu] Generated {0} samples from {1} games in {2}s ({3:F1} samples/s | {4:F1} games/s)" -f $samples, $games, $DURATION, $tp, $gamesTp) -ForegroundColor Green
+                }
             }
         }
     }
@@ -197,10 +230,10 @@ try {
 
         $trainedPt   = Join-Path $benchDir "model_trained.pt"
 
-        Write-Host "[bench/train] Starting PyTorch Training (CUDA GPU, epochs=$EPOCHS, batch=$TRAIN_BATCH_SIZE)..." -ForegroundColor Yellow
+        Write-Host "[bench/train] Starting PyTorch Training (CUDA GPU, duration=$DURATION s, batch=$TRAIN_BATCH_SIZE)..." -ForegroundColor Yellow
         $tTrainStart = Get-Date
         Push-Location "src_python"
-        & $PYTHON "train.py" --data-dir $benchReplay --out $trainedPt --epochs $EPOCHS --batch $TRAIN_BATCH_SIZE --device "cuda" --seed $BENCH_SEED --symmetry
+        & $PYTHON "train.py" --data-dir $benchReplay --out $trainedPt --duration $DURATION --batch $TRAIN_BATCH_SIZE --device "cuda" --seed $BENCH_SEED --symmetry
         $trainRc = $LASTEXITCODE
         Pop-Location
         if ($trainRc -ne 0) {
@@ -208,31 +241,34 @@ try {
             exit 1
         }
         $trainTime = (Get-Date) - $tTrainStart
-        Write-Host ("[bench/train] PyTorch Training & ONNX export completed in {0}" -f (Format-BenchDur $trainTime.TotalSeconds)) -ForegroundColor Green
-    }
-
-    # --- Benchmark Report -----------------------------------------------------
-    Write-Host ""
+        
+        $metricsFile = Join-Path $benchDir "train_metrics.txt"
+        $trainTp = 0.0
+        if (Test-Path $metricsFile) {
+            $trainTp = [double](Get-Content $metricsFile)
+        }
+        $resTrain = @{ Throughput = $trainTp; Duration = $DURATION }
+    Write-Host "  BENCHMARK SUMMARY & PERFORMANCE REPORT (THROUGHPUT)" -ForegroundColor Cyan
     Write-Host "=================================================================" -ForegroundColor Cyan
-    Write-Host "  BENCHMARK SUMMARY & PERFORMANCE REPORT" -ForegroundColor Cyan
-    Write-Host "=================================================================" -ForegroundColor Cyan
-    if ($trainTime) {
-        Write-Host ("  [Stage 3 - PyTorch Training (CUDA)] : {0}" -f (Format-BenchDur $trainTime.TotalSeconds)) -ForegroundColor Yellow
+    if ($resTrain) {
+        Write-Host ("  [Stage 3 - PyTorch Training (CUDA)] : {0:F1} samples/sec (in {1}s)" -f $resTrain.Throughput, $resTrain.Duration) -ForegroundColor Yellow
         Write-Host ""
     }
 
     if ($resCpu) {
         Write-Host ("  [Stage 1 - Rust MCTS CPU  (batch={0})] :" -f $resCpu.BatchSize) -ForegroundColor Yellow
-        Write-Host ("    - Self-Play (Inference) : {0}" -f (Format-BenchDur $resCpu.SelfplaySec))
+        Write-Host ("    - Generation Throughput : {0:F1} samples/sec (in {1}s)" -f $resCpu.Throughput, $resCpu.Duration)
+        Write-Host ("    - Games Played          : {0} games ({1:F1} games/sec)" -f $resCpu.Games, $resCpu.GamesTp)
     }
 
     if ($resGpu) {
         Write-Host ("  [Stage 2 - Rust MCTS GPU  (batch={0})] :" -f $resGpu.BatchSize) -ForegroundColor Yellow
-        Write-Host ("    - Self-Play (Inference) : {0}" -f (Format-BenchDur $resGpu.SelfplaySec))
+        Write-Host ("    - Generation Throughput : {0:F1} samples/sec (in {1}s)" -f $resGpu.Throughput, $resGpu.Duration)
+        Write-Host ("    - Games Played          : {0} games ({1:F1} games/sec)" -f $resGpu.Games, $resGpu.GamesTp)
     }
 
     if ($resCpu -and $resGpu) {
-        $speedupSelfplay = [math]::Round($resCpu.SelfplaySec / $resGpu.SelfplaySec, 2)
+        $speedupSelfplay = [math]::Round($resGpu.Throughput / $resCpu.Throughput, 2)
         Write-Host ""
         Write-Host ("  Self-Play Speedup (CPU -> GPU) : {0}x faster" -f $speedupSelfplay) -ForegroundColor Green
     }
@@ -241,6 +277,5 @@ try {
 } finally {
     # --- Clean up isolated benchmark directory ---
     Write-Host "[bench/clean] Cleaning up isolated benchmark directory .bench_temp/..." -ForegroundColor Gray
-    if (Test-Path $benchDir) { Remove-Item -Recurse -Force $benchDir -ErrorAction SilentlyContinue }
-    Write-Host "[bench/clean] Done. Real project files remain untouched." -ForegroundColor Gray
+    if (Test-Path $benchDir) { Remove-Item -Recurse -Force $benchDir -ErrorAction SilentlyContinue }    Write-Host "[bench/clean] Done. Real project files remain untouched."
 }
