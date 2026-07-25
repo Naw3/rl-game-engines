@@ -58,6 +58,15 @@ try:
     _DEFAULT_CHANNELS = CONFIG.network.channels
     _DEFAULT_NUM_BLOCKS = CONFIG.network.num_blocks
 except Exception:
+    _DEFAULT_CHANNELS = 64
+    _DEFAULT_NUM_BLOCKS = 3
+
+
+class ResBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
 
