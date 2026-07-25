@@ -118,6 +118,7 @@ try {
     $resCpu = $null
     $resGpu = $null
     $trainTime = $null
+    $cpuData = Join-Path $benchDir "selfplay_cpu.bin"
     $gpuData = Join-Path $benchDir "selfplay_gpu.bin"
 
     $runCpu = $Cpu.IsPresent
