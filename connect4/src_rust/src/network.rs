@@ -1,59 +1,28 @@
 // =============================================================================
-// network.rs — ONNX inference with two backends and a CLI-selected device.
+// network.rs — ONNX inference with ORT backend (CPU & GPU dispatcher).
 //
-// Why two backends?
-// -----------------
-// We support BOTH `tract-onnx` (CPU) AND `ort` (GPU via CUDA) so the user
-// can pick the right tool per scenario:
-//
-//   * `--device cpu`  → tract-onnx. Pure Rust, no FFI overhead. Fastest
-//     for our 50K-param model. Always available (no external dep).
-//
-//   * `--device gpu`  → ort with CUDA execution provider. Requires
-//     `--features cuda` at build time, plus `onnxruntime-gpu` and the
-//     CUDA toolkit at runtime.
-//
-//   * `--device auto` → tries GPU first, falls back to CPU if CUDA is
-//     unavailable or fails to initialise.
-//
-// GPU Inference Architecture: Centralised Dispatcher
+// Inference Architecture: Centralised Dispatcher
 // ---------------------------------------------------
-// When `--device gpu`, a single dedicated OS thread owns the one-and-only
-// ort `Session`. All 64 rayon MCTS worker threads send their board states
-// via a `crossbeam_channel` bounded MPSC queue. The dispatcher:
+// A single dedicated OS thread owns the ort `Session`.
+// All MCTS worker threads send their board states via a `crossbeam_channel`
+// bounded MPSC queue. The dispatcher:
 //   1. Blocks on the first request (recv()).
 //   2. Drains additional pending requests without blocking (try_recv()),
 //      up to `MAX_DISPATCHER_BATCH` boards.
 //   3. Builds one (N, 3, 6, 7) tensor and runs a single ort forward pass.
 //   4. Sends each result back to its requester via a oneshot sync channel.
-// This achieves maximum GPU utilisation (large batches) while using only
-// one ort Session (minimum VRAM).
-//
-// CPU Inference Architecture: Tract (no pooling needed)
-// ------------------------------------------------------
-// On CPU, we use tract-onnx. `RunnableModel` is `Send + Sync` and
-// serialises concurrent `run` calls internally — safe by construction,
-// no extra locking needed on the Rust side.
 //
 // What "null" means
 // -----------------
 // `Network::null()` returns a Network with no backend. It produces
-// uniform priors + value=0. The orchestrator's `init.py` ensures a real
-// model exists before the very first self-play.
+// uniform priors + value=0.
 // =============================================================================
 
 use crate::bitboard::{col_mask, Board};
 use std::path::Path;
-use std::sync::Arc;
 use crossbeam_channel::{bounded, Receiver, Sender};
 
-// --- tract imports (CPU backend) ------------------------------------------
-use tract_onnx::prelude::{
-    Framework, InferenceModelExt, RunnableModel, Tensor,
-    TypedFact, TypedModel, TypedOp, tvec,
-};
-
-// --- ort imports (GPU backend) --------------------------------------------
+// --- ort imports ----------------------------------------------------------
 use ort::execution_providers::CPUExecutionProvider;
 #[cfg(feature = "cuda")]
 use ort::execution_providers::CUDAExecutionProvider;
@@ -108,18 +77,8 @@ impl Device {
 /// The inference network. Holds an optional `Backend` (Tract or OrtDispatcher)
 /// shared via `Arc` across all rayon worker threads.
 pub struct Network {
-    backend: Option<Arc<Backend>>,
+    queue: Option<InferQueue>,
     device: Device,
-}
-
-/// Inference backend enum — dispatched at `evaluate` time.
-enum Backend {
-    /// Pure-Rust CPU inference via tract-onnx. `RunnableModel` is Send+Sync.
-    Tract(Arc<TractSession>),
-    /// GPU inference via a centralised dispatcher thread. All worker threads
-    /// push `InferRequest` structs into the shared sender; the dispatcher owns
-    /// the single ort `Session` and batches incoming requests.
-    OrtDispatcher(InferQueue),
 }
 
 /// The sender half of the dispatcher's request queue. Cloned cheaply per thread.
@@ -134,8 +93,6 @@ struct InferRequest {
     reply: Sender<Eval>,
 }
 
-type TractSession = RunnableModel<TypedFact, Box<dyn TypedOp>, TypedModel>;
-
 /// Output of a single NN forward pass. Policy is over the 7 columns
 /// (sums to 1 over the 7 actions). Value is the position evaluation
 /// in [-1, +1] from the perspective of the player to move.
@@ -149,21 +106,9 @@ impl Network {
     /// Load an ONNX model from disk using the backend implied by `device`.
     pub fn load<P: AsRef<Path>>(path: P, device: Device) -> Result<Self, Box<dyn std::error::Error>> {
         let device = device.resolve();
-        let backend = match device {
-            Device::Cpu => {
-                let sess = load_tract(path.as_ref())?;
-                Backend::Tract(Arc::new(sess))
-            }
-            Device::Gpu => {
-                // Spawn the dedicated GPU dispatcher thread. It owns the
-                // single ort Session and processes batched requests.
-                let sender = start_dispatcher(path.as_ref())?;
-                Backend::OrtDispatcher(sender)
-            }
-            Device::Auto => unreachable!("Device::Auto must be resolved before load"),
-        };
+        let queue = start_dispatcher(path.as_ref(), device)?;
         Ok(Network {
-            backend: Some(Arc::new(backend)),
+            queue: Some(queue),
             device,
         })
     }
@@ -173,14 +118,14 @@ impl Network {
     /// file is missing.
     pub fn null() -> Self {
         Network {
-            backend: None,
+            queue: None,
             device: Device::Cpu,
         }
     }
 
     /// True if this is a null network (no underlying backend).
     pub fn is_null(&self) -> bool {
-        self.backend.is_none()
+        self.queue.is_none()
     }
 
     /// The device this network was bound to.
@@ -190,9 +135,8 @@ impl Network {
 
     /// Evaluate a single position. Dispatches to the right backend.
     pub fn evaluate(&self, board: Board) -> Eval {
-        match self.backend.as_deref() {
-            Some(Backend::Tract(sess)) => tract_eval(sess, board),
-            Some(Backend::OrtDispatcher(queue)) => dispatcher_eval(queue, board),
+        match self.queue.as_ref() {
+            Some(queue) => dispatcher_eval(queue, board),
             None => null_eval(board),
         }
     }
@@ -205,9 +149,8 @@ impl Network {
         if boards.is_empty() {
             return Vec::new();
         }
-        match self.backend.as_deref() {
-            Some(Backend::Tract(sess)) => tract_batch_eval(sess, boards),
-            Some(Backend::OrtDispatcher(queue)) => dispatcher_batch_eval(queue, boards),
+        match self.queue.as_ref() {
+            Some(queue) => dispatcher_batch_eval(queue, boards),
             None => boards.iter().map(|&b| null_eval(b)).collect(),
         }
     }
@@ -216,19 +159,6 @@ impl Network {
 // ---------------------------------------------------------------------------
 // Backend loaders
 // ---------------------------------------------------------------------------
-
-/// Load the model with tract-onnx. CPU inference, fastest on this size.
-///
-/// Note: the Python exporter uses `dynamic_shapes` with the batch dimension
-/// symbolic, so the ONNX graph accepts any batch size. We therefore do NOT
-/// call `with_input_fact` here — that would lock the batch dim to 1.
-fn load_tract(path: &Path) -> Result<TractSession, Box<dyn std::error::Error>> {
-    let session = tract_onnx::onnx()
-        .model_for_path(path)?
-        .into_optimized()?
-        .into_runnable()?;
-    Ok(session)
-}
 
 /// Load the model with ort. CUDA if `device == Gpu` and `cuda` feature
 /// compiled in; CPU otherwise.
@@ -259,24 +189,24 @@ fn load_ort(path: &Path, device: Device) -> Result<Session, Box<dyn std::error::
 }
 
 // ---------------------------------------------------------------------------
-// GPU Dispatcher
+// ORT Dispatcher
 // ---------------------------------------------------------------------------
 
-/// Spawn the GPU dispatcher thread. Returns the `Sender` half of the request
+/// Spawn the ORT dispatcher thread. Returns the `Sender` half of the request
 /// queue; the `Receiver` is owned by the dispatcher thread.
 ///
 /// The dispatcher thread exits automatically when all senders are dropped
 /// (i.e., when the `Network` is dropped at end of self-play).
-fn start_dispatcher(path: &Path) -> Result<InferQueue, Box<dyn std::error::Error>> {
+fn start_dispatcher(path: &Path, device: Device) -> Result<InferQueue, Box<dyn std::error::Error>> {
     // Bounded queue so backpressure prevents unbounded queuing.
     // 256 slots: with 64 threads each queuing ~32 requests per sim batch,
     // this gives enough headroom without unbounded memory growth.
     let (tx, rx): (Sender<InferRequest>, Receiver<InferRequest>) = bounded(256);
 
-    let session = load_ort(path, Device::Gpu)?;
+    let session = load_ort(path, device)?;
 
     std::thread::Builder::new()
-        .name("ort-gpu-dispatcher".to_string())
+        .name("ort-dispatcher".to_string())
         .spawn(move || run_dispatcher(session, rx))?;
 
     Ok(tx)
@@ -462,71 +392,6 @@ fn boards_to_input(boards: &[Board]) -> (Vec<usize>, Vec<f32>) {
         }
     }
     (shape, data)
-}
-
-// ---------------------------------------------------------------------------
-// Backend-specific eval (Tract)
-// ---------------------------------------------------------------------------
-
-fn tract_eval(sess: &TractSession, board: Board) -> Eval {
-    let (shape, data) = board_to_input(board);
-    let input_t: Tensor = Tensor::from_shape(&shape, &data).expect("tract shape");
-    let result = sess
-        .run(tvec![input_t.into()])
-        .expect("tract inference failed for single position");
-    let policy_view = result[0]
-        .to_array_view::<f32>()
-        .expect("tract policy output extraction failed");
-    let value_view = result[1]
-        .to_array_view::<f32>()
-        .expect("tract value output extraction failed");
-    let value = value_view
-        .as_slice()
-        .and_then(|s| s.first().copied())
-        .expect("tract value output has no elements");
-    let max = policy_view
-        .iter()
-        .cloned()
-        .fold(f32::NEG_INFINITY, f32::max);
-    let exp_row: Vec<f32> = policy_view.iter().map(|x| (x - max).exp()).collect();
-    let sum: f32 = exp_row.iter().sum();
-    let mut policy = [0.0f32; 7];
-    for c in 0..7 {
-        policy[c] = exp_row[c] / sum;
-    }
-    Eval { policy, value }
-}
-
-fn tract_batch_eval(sess: &TractSession, boards: &[Board]) -> Vec<Eval> {
-    let n = boards.len();
-    let (shape, data) = boards_to_input(boards);
-    let input_t: Tensor = Tensor::from_shape(&shape, &data).expect("tract shape");
-    let result = sess
-        .run(tvec![input_t.into()])
-        .expect("tract inference failed for batch");
-    let policy_view = result[0]
-        .to_array_view::<f32>()
-        .expect("tract policy output extraction failed");
-    let value_view = result[1]
-        .to_array_view::<f32>()
-        .expect("tract value output extraction failed");
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        use tract_core::ndarray::Axis;
-        let row = policy_view.index_axis(Axis(0), i);
-        let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exp_row: Vec<f32> = row.iter().map(|x| (x - max).exp()).collect();
-        let sum: f32 = exp_row.iter().sum();
-        let mut policy = [0.0f32; 7];
-        for c in 0..7 {
-            policy[c] = exp_row[c] / sum;
-        }
-        out.push(Eval {
-            policy,
-            value: value_view[i],
-        });
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
