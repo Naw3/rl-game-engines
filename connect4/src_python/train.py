@@ -103,8 +103,8 @@ try:
     _DEFAULT_MAX_ONNX_BATCH = CONFIG.dataset.max_onnx_batch
     _DEFAULT_MAX_GRAD_NORM = CONFIG.train.max_grad_norm
     _DEFAULT_SYMMETRY = CONFIG.train.symmetry
-    _DEFAULT_NO_AMP = not CONFIG.train.use_amp
-    _DEFAULT_NO_COMPILE = not CONFIG.train.use_compile
+    _DEFAULT_NO_AMP = CONFIG.train.train_precision == "fp32"
+    _DEFAULT_NO_COMPILE = CONFIG.train.compile_mode == "none"
 except Exception as err:
     print(f"[train] WARNING: Failed to load config.py ({err}); using fallbacks")
     _DEFAULT_DATA = "selfplay.bin"
