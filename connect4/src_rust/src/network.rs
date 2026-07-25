@@ -338,36 +338,6 @@ fn dispatcher_batch_eval(queue: &InferQueue, boards: &[Board]) -> Vec<Eval> {
 // Tensor construction (shared by both backends)
 // ---------------------------------------------------------------------------
 
-/// Build a (1, 3, 6, 7) f32 tensor from a single Board.
-///
-/// Plane 0 = "own" (current player's pieces, 1.0 at each cell).
-/// Plane 1 = "opponent" (1.0 at each cell where the opponent has a piece).
-/// Plane 2 = "turn" (all 1.0 — constant bias plane, as per C4D1 format).
-///
-/// The bit layout is the same column-major 7-bits-per-column encoding
-/// used in `bitboard.rs`: cell (row r, col c) → bit (c * 7 + r).
-fn board_to_input(board: Board) -> (Vec<usize>, Vec<f32>) {
-    let shape = vec![1, 3, 6, 7];
-    let mut data = Vec::with_capacity(1 * 3 * 6 * 7);
-
-    for r in 0..6 {
-        for col in 0..7 {
-            let bit = 1u64 << (col * 7 + r);
-            data.push(if board.own & bit != 0 { 1.0 } else { 0.0 });
-        }
-    }
-    for r in 0..6 {
-        for col in 0..7 {
-            let bit = 1u64 << (col * 7 + r);
-            data.push(if board.opp & bit != 0 { 1.0 } else { 0.0 });
-        }
-    }
-    for _ in 0..42 {
-        data.push(1.0);
-    }
-
-    (shape, data)
-}
 
 /// Build a (N, 3, 6, 7) f32 tensor from a batch of Boards.
 fn boards_to_input(boards: &[Board]) -> (Vec<usize>, Vec<f32>) {

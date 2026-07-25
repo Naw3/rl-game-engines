@@ -184,11 +184,11 @@ def main() -> int:
     print(f"[init] saving state_dict -> {args.out_pt}")
     net.save(args.out_pt)
 
-    print(f"[init] exporting ONNX -> {args.out_onnx} (opset {args.opset}, precision {args.infer_precision})")
+    print(f"[init] exporting ONNX -> {args.out_onnx} (opset {args.opset})")
     
     # We must import export_onnx from train.py, or define it here.
-    # Since init.py already copies export_onnx, we will modify the local export_onnx instead.
-    export_onnx(net, args.out_onnx, opset=args.opset, infer_precision=args.infer_precision)
+    if args.out_onnx:
+        export_onnx(net, args.out_onnx, opset=args.opset)
 
     print(f"[init] done. {args.out_pt} + {args.out_onnx} ready for self-play.")
     return 0

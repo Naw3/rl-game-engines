@@ -105,6 +105,10 @@ try:
     _DEFAULT_SYMMETRY = CONFIG.train.symmetry
     _DEFAULT_NO_AMP = CONFIG.train.train_precision == "fp32"
     _DEFAULT_NO_COMPILE = CONFIG.train.compile_mode == "none"
+    _DEFAULT_COMPILE_MODE = CONFIG.train.compile_mode
+    _DEFAULT_INFER_PRECISION = CONFIG.train.infer_precision
+    _DEFAULT_CHANNELS_LAST = CONFIG.train.channels_last
+    _DEFAULT_FUSED_ADAMW = CONFIG.train.fused_adamw
 except Exception as err:
     print(f"[train] WARNING: Failed to load config.py ({err}); using fallbacks")
     _DEFAULT_DATA = "selfplay.bin"
@@ -114,7 +118,7 @@ except Exception as err:
     _DEFAULT_LR = 1e-3
     _DEFAULT_WD = 1e-4
     _DEFAULT_SEED = 42
-    _DEFAULT_NUM_WORKERS = 2
+    _DEFAULT_NUM_WORKERS = 0
     _DEFAULT_LOG_EVERY = 20
     _DEFAULT_OPSET = 18
     _DEFAULT_PLANES = 3
@@ -125,6 +129,10 @@ except Exception as err:
     _DEFAULT_SYMMETRY = True
     _DEFAULT_NO_AMP = False
     _DEFAULT_NO_COMPILE = False
+    _DEFAULT_COMPILE_MODE = "reduce-overhead"
+    _DEFAULT_INFER_PRECISION = "fp32"
+    _DEFAULT_CHANNELS_LAST = False
+    _DEFAULT_FUSED_ADAMW = False
 
 import torch
 import torch.nn.functional as F
@@ -251,9 +259,10 @@ class _ReplayDataset(torch.utils.data.Dataset):
 
 
 class CudaPrefetcher:
-    def __init__(self, loader, device):
+    def __init__(self, loader, device, channels_last=False):
         self.loader = iter(loader)
         self.device = device
+        self.channels_last = channels_last
         self.stream = torch.cuda.Stream(device=device)
         self.next_batch = None
         self.preload()
@@ -266,8 +275,11 @@ class CudaPrefetcher:
             return
             
         with torch.cuda.stream(self.stream):
+            planes = self.next_batch[0].to(self.device, non_blocking=True)
+            if self.channels_last:
+                planes = planes.to(memory_format=torch.channels_last)
             self.next_batch = (
-                self.next_batch[0].to(self.device, non_blocking=True),
+                planes,
                 self.next_batch[1].to(self.device, non_blocking=True),
                 self.next_batch[2].to(self.device, non_blocking=True)
             )
@@ -293,8 +305,8 @@ def main() -> None:
     p.add_argument("--out", default=_DEFAULT_OUT, help="output model path")
     p.add_argument("--epochs", type=int, default=_DEFAULT_EPOCHS)
     p.add_argument("--duration", type=int, default=None, help="Train for a specific duration in seconds")
-    p.add_argument("--infer-precision", choices=["fp32", "fp16"], default="fp32", help="Precision for the exported ONNX model")
-    p.add_argument("--compile-mode", type=str, default="default", choices=["none", "default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
+    p.add_argument("--infer-precision", choices=["fp32", "fp16"], default=_DEFAULT_INFER_PRECISION, help="Precision for the exported ONNX model")
+    p.add_argument("--compile-mode", type=str, default=_DEFAULT_COMPILE_MODE, choices=["none", "default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
     p.add_argument("--batch", type=int, default=_DEFAULT_BATCH)
     p.add_argument("--lr", type=float, default=_DEFAULT_LR)
     p.add_argument("--weight-decay", type=float, default=_DEFAULT_WD)
@@ -317,6 +329,8 @@ def main() -> None:
     p.add_argument("--max-samples", type=int, default=None,
                    help="cap dataset size (for quick smoke tests)")
     p.add_argument("--log-every", type=int, default=_DEFAULT_LOG_EVERY)
+    p.add_argument("--channels-last", action="store_true", default=_DEFAULT_CHANNELS_LAST, help="use channels_last memory format")
+    p.add_argument("--fused-adamw", action="store_true", default=_DEFAULT_FUSED_ADAMW, help="use fused AdamW optimizer")
     p.add_argument("--symmetry", action="store_true", default=_DEFAULT_SYMMETRY,
                    help="enable horizontal-flip augmentation (doubles effective dataset size)")
     p.add_argument("--num-workers", type=int, default=None,
@@ -402,16 +416,18 @@ def main() -> None:
         shuffle=True,
         num_workers=args.num_workers if args.num_workers is not None else _DEFAULT_NUM_WORKERS,
         pin_memory=(args.device != "cpu"),
-        drop_last=False,
+        drop_last=(len(ds) > args.batch),
     )
 
     # ---- Model ------------------------------------------------------------
     model = Connect4Net().to(args.device)
+    if args.channels_last:
+        model = model.to(memory_format=torch.channels_last)
     n_params = model.num_parameters()
     print(f"[train] model: {n_params:,} parameters")
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=args.fused_adamw
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs * len(loader)
@@ -426,12 +442,45 @@ def main() -> None:
         # and torch.compile crashes at first forward. Auto-detect and skip.
         try:
             import triton  # noqa: F401
-            model = torch.compile(model, mode="reduce-overhead")
-            print("[train] torch.compile enabled (mode=reduce-overhead)")
+            model = torch.compile(model, mode=args.compile_mode)
+            print(f"[train] torch.compile enabled (mode={args.compile_mode})")
         except ImportError:
             print("[train] triton not installed — skipping torch.compile (use --no-compile to silence this check)")
         except Exception as e:
             print(f"[train] torch.compile failed: {e}; continuing uncompiled")
+
+    # ---- Warmup -----------------------------------------------------------
+    print("[train] warming up model to trigger compilation...")
+    model.train()
+    
+    # We run 10 warmup steps to fully capture CUDA graphs (reduce-overhead).
+    # Since drop_last is True (if len(ds) > batch), the shapes are perfectly stable.
+    # We also do a full optimizer step to force lazy initialization of AdamW states.
+    warmup_steps = 10
+    steps_done = 0
+    if len(ds) > 0:
+        while steps_done < warmup_steps:
+            for warmup_batch in loader:
+                wp, wtp, wtv = [x.to(args.device) for x in warmup_batch]
+                if args.channels_last:
+                    wp = wp.to(memory_format=torch.channels_last)
+                optimizer.zero_grad(set_to_none=True)
+                with autocast(enabled=use_amp, device_type="cuda" if use_amp else "cpu", dtype=torch.float16 if use_amp else None):
+                    w_log_p, w_v = model(wp)
+                    w_loss, _, _ = compute_loss(w_log_p, w_v, wtp, wtv)
+                scaler.scale(w_loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=_DEFAULT_MAX_GRAD_NORM)
+                scaler.step(optimizer)
+                scaler.update()
+                
+                if args.device == "cuda":
+                    torch.cuda.synchronize()
+                
+                steps_done += 1
+                if steps_done >= warmup_steps:
+                    break
+    print("[train] warmup complete.")
 
     # ---- Train ------------------------------------------------------------
     best_loss = float("inf")
@@ -445,7 +494,7 @@ def main() -> None:
         t0 = time.time()
         running = {"total": 0.0, "policy": 0.0, "value": 0.0}
         n_batches = 0
-        prefetcher = CudaPrefetcher(loader, torch.device(args.device))
+        prefetcher = CudaPrefetcher(loader, torch.device(args.device), channels_last=args.channels_last)
 
         batch_idx = 0
         while True:
@@ -472,14 +521,14 @@ def main() -> None:
             scaler.update()
             scheduler.step()
 
-            running["total"] += loss.item()
-            running["policy"] += policy_loss.item()
-            running["value"] += value_loss.item()
+            running["total"] += loss.detach()
+            running["policy"] += policy_loss.detach()
+            running["value"] += value_loss.detach()
             n_batches += 1
             total_samples += planes.size(0)
 
             if (batch_idx + 1) % args.log_every == 0:
-                avg = {k: v / n_batches for k, v in running.items()}
+                avg = {k: (v.item() if isinstance(v, torch.Tensor) else v) / n_batches for k, v in running.items()}
                 lr = scheduler.get_last_lr()[0]
                 if args.duration is not None:
                     epoch_str = f"epoch {epoch+1}"
@@ -502,34 +551,30 @@ def main() -> None:
         if n_batches == 0:
             avg_tot = avg_pol = avg_val = 0.0
         else:
-            avg_tot = running["total"] / max(1, n_batches)
-            avg_pol = running["policy"] / max(1, n_batches)
-            avg_val = running["value"] / max(1, n_batches)
+            avg_tot = running["total"].item() / max(1, n_batches) if isinstance(running["total"], torch.Tensor) else 0.0
+            avg_pol = running["policy"].item() / max(1, n_batches) if isinstance(running["policy"], torch.Tensor) else 0.0
+            avg_val = running["value"].item() / max(1, n_batches) if isinstance(running["value"], torch.Tensor) else 0.0
         lr = scheduler.get_last_lr()[0]
 
         model.eval()
         v_item = 0.0
-        with torch.no_grad():
-            if len(ds) > 0:
-                sample = ds[0]
-                planes_sample = sample[0].unsqueeze(0).to(args.device)
-                log_p, v = model(planes_sample)
-                v_item = v.item()
+        if 'v' in locals() and v.numel() > 0:
+            v_item = v[-1].item()
 
         if args.duration is not None:
             epoch_str = f"epoch {epoch+1:2d}"
         else:
             epoch_str = f"epoch {epoch+1:2d}/{args.epochs}"
 
+        total_time_so_far = time.time() - global_start_t
         print(
-            f"[train] {epoch_str} done in {epoch_sec:.2f}s "
+            f"[train] {epoch_str} done in {epoch_sec:.2f}s (tot: {total_time_so_far:.1f}s) "
             f"({samples_per_sec:.0f} samples/s) | loss={avg_tot:.4f} "
             f"(policy={avg_pol:.4f}, value={avg_val:.4f}) lr={lr:.2e} | "
             f"sample val={v_item:+.3f}"
         )
 
         if n_batches > 0:
-            avg_tot = running["total"] / max(1, n_batches)
             if avg_tot < best_loss:
                 best_loss = avg_tot
 
@@ -557,11 +602,11 @@ def main() -> None:
     # ---- ONNX export (consumed by the Rust MCTS) ------------------------
     if not args.no_onnx:
         onnx_path = args.out.replace(".pt", ".onnx")
-        print(f"[train] exporting ONNX -> {onnx_path} (opset {args.onnx_opset}, precision {args.infer_precision})")
+        print(f"[train] exporting ONNX -> {onnx_path} (opset {args.onnx_opset})")
         # Use the un-compiled underlying model.
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
         try:
-            export_onnx(inner, onnx_path, opset=args.onnx_opset, infer_precision=args.infer_precision)
+            export_onnx(inner, onnx_path, opset=args.onnx_opset)
             print(f"[train] ONNX export OK. Next self-play cycle will use it.")
         except Exception as e:
             print(f"[train] WARNING: ONNX export failed: {e}")
