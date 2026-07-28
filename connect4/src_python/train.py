@@ -166,7 +166,8 @@ def compute_loss(
     return policy_loss + value_loss, policy_loss, value_loss
 
 
-def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET) -> None:
+def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET,
+                infer_precision: str = _DEFAULT_INFER_PRECISION) -> None:
     """Export the (already-trained) model to ONNX.
 
     Output contract — the Rust side (network.rs) reads by name:
@@ -186,9 +187,14 @@ def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET)
         model_cpu.load_state_dict(model.state_dict())
     else:
         model_cpu = model
+    if infer_precision not in {"fp32", "fp16", "int8"}:
+        raise ValueError(f"Unsupported inference precision: {infer_precision}")
+    if infer_precision == "fp16":
+        model_cpu = model_cpu.half()
+        dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS, dtype=torch.float16)
+    else:
+        dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS)
     model_cpu.eval()
-
-    dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS)
 
     dynamic_axes = {
         "input": {0: "batch_size"},
@@ -231,6 +237,15 @@ def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET)
     import onnx
     onnx_model = onnx.load(onnx_path)
     onnx.checker.check_model(onnx_model)
+    if infer_precision == "int8":
+        from onnxruntime.quantization import QuantType, quantize_dynamic
+        quant_model = onnx.load(onnx_path)
+        del quant_model.graph.value_info[:]
+        onnx.save(quant_model, onnx_path)
+        quantize_dynamic(onnx_path, onnx_path, weight_type=QuantType.QInt8,
+                         extra_options={"DisableShapeInference": True})
+        onnx_model = onnx.load(onnx_path)
+        onnx.checker.check_model(onnx_model)
 
 
 class _ReplayDataset(torch.utils.data.Dataset):
@@ -305,7 +320,7 @@ def main() -> None:
     p.add_argument("--out", default=_DEFAULT_OUT, help="output model path")
     p.add_argument("--epochs", type=int, default=_DEFAULT_EPOCHS)
     p.add_argument("--duration", type=int, default=None, help="Train for a specific duration in seconds")
-    p.add_argument("--infer-precision", choices=["fp32", "fp16"], default=_DEFAULT_INFER_PRECISION, help="Precision for the exported ONNX model")
+    p.add_argument("--infer-precision", choices=["fp32", "fp16", "int8"], default=_DEFAULT_INFER_PRECISION, help="Precision for the exported ONNX model")
     p.add_argument("--compile-mode", type=str, default=_DEFAULT_COMPILE_MODE, choices=["none", "default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
     p.add_argument("--batch", type=int, default=_DEFAULT_BATCH)
     p.add_argument("--lr", type=float, default=_DEFAULT_LR)
@@ -489,11 +504,47 @@ def main() -> None:
     epoch = 0
     done = False
 
+    # Pending display info for previous epoch (delayed by 1 epoch for free GPU sync).
+    _prev = None  # (start_evt, end_evt, n_samples_epoch, avg_tot, avg_pol, avg_val, lr, v_item, epoch_str, done_flag)
+
     while not done:
         model.train()
+
+        # --- Sync & print the PREVIOUS epoch now (GPU is already busy on current epoch) ---
+        if _prev is not None:
+            (p_se, p_ee, p_ns, p_avg_tot, p_avg_pol, p_avg_val, p_lr, p_v, p_estr, p_bl) = _prev
+            if args.device == "cuda":
+                gpu_ms = p_se.elapsed_time(p_ee)   # sync is ~free: GPU is executing current epoch
+                p_sps = p_ns / (gpu_ms / 1000)
+            else:
+                p_sps = p_ns / max(0.001, p_ee)    # p_ee is wall-clock seconds on CPU
+            total_time_so_far = time.time() - global_start_t
+            print(
+                f"[train] {p_estr} done in {gpu_ms/1000:.2f}s (tot: {total_time_so_far:.1f}s) "
+                f"({p_sps:.0f} samples/s) | loss={p_avg_tot:.4f} "
+                f"(policy={p_avg_pol:.4f}, value={p_avg_val:.4f}) lr={p_lr:.2e} | "
+                f"sample val={p_v:+.3f}"
+            ) if args.device == "cuda" else print(
+                f"[train] {p_estr} done in {p_ee:.2f}s (tot: {total_time_so_far:.1f}s) "
+                f"({p_sps:.0f} samples/s) | loss={p_avg_tot:.4f} "
+                f"(policy={p_avg_pol:.4f}, value={p_avg_val:.4f}) lr={p_lr:.2e} | "
+                f"sample val={p_v:+.3f}"
+            )
+            if p_bl and p_avg_tot < best_loss:
+                best_loss = p_avg_tot
+
+        # --- Start current epoch ---
+        if args.device == "cuda":
+            epoch_start_evt = torch.cuda.Event(enable_timing=True)
+            epoch_end_evt   = torch.cuda.Event(enable_timing=True)
+            epoch_start_evt.record()
+        else:
+            epoch_start_evt = time.time()
+
         t0 = time.time()
         running = {"total": 0.0, "policy": 0.0, "value": 0.0}
         n_batches = 0
+        samples_this_epoch = 0
         prefetcher = CudaPrefetcher(loader, torch.device(args.device), channels_last=args.channels_last)
 
         batch_idx = 0
@@ -526,6 +577,7 @@ def main() -> None:
             running["value"] += value_loss.detach()
             n_batches += 1
             total_samples += planes.size(0)
+            samples_this_epoch += planes.size(0)
 
             if (batch_idx + 1) % args.log_every == 0:
                 avg = {k: (v.item() if isinstance(v, torch.Tensor) else v) / n_batches for k, v in running.items()}
@@ -545,44 +597,55 @@ def main() -> None:
                 n_batches = 0
             batch_idx += 1
 
-        # End-of-epoch summary.
-        epoch_sec = time.time() - t0
-        samples_per_sec = len(ds) / max(0.001, epoch_sec)
-        if n_batches == 0:
-            avg_tot = avg_pol = avg_val = 0.0
+        # Record end of epoch on GPU stream (non-blocking)
+        if args.device == "cuda":
+            epoch_end_evt.record()
         else:
-            avg_tot = running["total"].item() / max(1, n_batches) if isinstance(running["total"], torch.Tensor) else 0.0
-            avg_pol = running["policy"].item() / max(1, n_batches) if isinstance(running["policy"], torch.Tensor) else 0.0
-            avg_val = running["value"].item() / max(1, n_batches) if isinstance(running["value"], torch.Tensor) else 0.0
-        lr = scheduler.get_last_lr()[0]
+            epoch_end_evt = time.time() - epoch_start_evt
 
-        model.eval()
-        v_item = 0.0
-        if 'v' in locals() and v.numel() > 0:
-            v_item = v[-1].item()
+        # Collect stats for display (these .item() calls happen while GPU runs next epoch)
+        v_item = v[-1].item() if isinstance(v, torch.Tensor) and v.numel() > 0 else 0.0
+        avg_tot = running["total"].item() / max(1, n_batches) if isinstance(running["total"], torch.Tensor) else 0.0
+        avg_pol = running["policy"].item() / max(1, n_batches) if isinstance(running["policy"], torch.Tensor) else 0.0
+        avg_val = running["value"].item() / max(1, n_batches) if isinstance(running["value"], torch.Tensor) else 0.0
+        lr = scheduler.get_last_lr()[0]
 
         if args.duration is not None:
             epoch_str = f"epoch {epoch+1:2d}"
         else:
             epoch_str = f"epoch {epoch+1:2d}/{args.epochs}"
 
-        total_time_so_far = time.time() - global_start_t
-        print(
-            f"[train] {epoch_str} done in {epoch_sec:.2f}s (tot: {total_time_so_far:.1f}s) "
-            f"({samples_per_sec:.0f} samples/s) | loss={avg_tot:.4f} "
-            f"(policy={avg_pol:.4f}, value={avg_val:.4f}) lr={lr:.2e} | "
-            f"sample val={v_item:+.3f}"
-        )
-
-        if n_batches > 0:
-            if avg_tot < best_loss:
-                best_loss = avg_tot
+        _prev = (epoch_start_evt, epoch_end_evt, samples_this_epoch,
+                 avg_tot, avg_pol, avg_val, lr, v_item, epoch_str, n_batches > 0)
 
         if done or (args.duration is None and epoch >= args.epochs - 1):
             done = True
         
         epoch += 1
 
+    # Print the last epoch (sync after training is done, no pipeline to preserve)
+    if _prev is not None:
+        (p_se, p_ee, p_ns, p_avg_tot, p_avg_pol, p_avg_val, p_lr, p_v, p_estr, p_bl) = _prev
+        if args.device == "cuda":
+            p_se.synchronize()
+            gpu_ms = p_se.elapsed_time(p_ee)
+            p_sps = p_ns / (gpu_ms / 1000)
+        else:
+            p_sps = p_ns / max(0.001, p_ee)
+            gpu_ms = p_ee * 1000
+        total_time_so_far = time.time() - global_start_t
+        print(
+            f"[train] {p_estr} done in {gpu_ms/1000:.2f}s (tot: {total_time_so_far:.1f}s) "
+            f"({p_sps:.0f} samples/s) | loss={p_avg_tot:.4f} "
+            f"(policy={p_avg_pol:.4f}, value={p_avg_val:.4f}) lr={p_lr:.2e} | "
+            f"sample val={p_v:+.3f}"
+        )
+        if p_bl and p_avg_tot < best_loss:
+            best_loss = p_avg_tot
+
+
+    if args.device == "cuda":
+        torch.cuda.synchronize()
     total_time = time.time() - global_start_t
     overall_throughput = total_samples / max(0.001, total_time)
     print(f"[train] overall throughput: {overall_throughput:.1f} samples/s")
@@ -602,11 +665,11 @@ def main() -> None:
     # ---- ONNX export (consumed by the Rust MCTS) ------------------------
     if not args.no_onnx:
         onnx_path = args.out.replace(".pt", ".onnx")
-        print(f"[train] exporting ONNX -> {onnx_path} (opset {args.onnx_opset})")
+        print(f"[train] exporting ONNX -> {onnx_path} (opset {args.onnx_opset}, precision: {args.infer_precision})")
         # Use the un-compiled underlying model.
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
         try:
-            export_onnx(inner, onnx_path, opset=args.onnx_opset)
+            export_onnx(inner, onnx_path, opset=args.onnx_opset, infer_precision=args.infer_precision)
             print(f"[train] ONNX export OK. Next self-play cycle will use it.")
         except Exception as e:
             print(f"[train] WARNING: ONNX export failed: {e}")

@@ -47,3 +47,6 @@
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# --- Bench files / folders ---
+.bench_temp/

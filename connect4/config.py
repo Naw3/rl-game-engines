@@ -59,7 +59,7 @@ class TrainConfig:
     log_every: int = 20
     symmetry: bool = True
     train_precision: str = "fp32"  # "fp32", "fp16", "bf16"
-    infer_precision: str = "fp32"  # "fp32", "fp16"
+    infer_precision: str = "int8"  # "fp32", "fp16", "int8"
     compile_mode: str = "reduce-overhead"  # "none", "default", "reduce-overhead", "max-autotune"
     channels_last: bool = False
     fused_adamw: bool = False

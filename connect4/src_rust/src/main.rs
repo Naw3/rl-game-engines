@@ -52,6 +52,7 @@ mod network;
 use bitboard::{Board, MoveResult};
 use mcts::{MCTS, MCTSConfig};
 use network::Network;
+use network::Device;
 
 use rand::Rng;
 use rand::rngs::StdRng;
@@ -168,6 +169,7 @@ fn main() -> ExitCode {
     if args.len() > 1 && !args[1].starts_with('-') {
         match args[1].as_str() {
             "benchmark" => return run_benchmark(&args[2..]),
+            "matmul-benchmark" => return run_matmul_benchmark(&args[2..]),
             "help" | "--help" | "-h" => {
                 print_help();
                 return ExitCode::SUCCESS;
@@ -578,6 +580,11 @@ fn print_help() {
     eprintln!("        -m, --model <PATH>     ONNX model path (default connect4_model.onnx)");
     eprintln!("        -d, --device <KIND>    cpu | gpu | auto (default auto)");
     eprintln!("        --warmup <N>           Warmup iterations before timing (default 20)");
+    eprintln!();
+    eprintln!("    matmul-benchmark [OPTIONS]  Time a no-input ONNX MatMul graph on CUDA.");
+    eprintln!("        -n, --iterations <N>   Number of MatMul runs (default 100)");
+    eprintln!("        -m, --model <PATH>     ONNX MatMul model path (required)");
+    eprintln!("        --warmup <N>           Warmup iterations before timing (default 20)");
 }
 
 /// Default model path: `<project_root>/connect4_model.onnx`. The
@@ -679,6 +686,101 @@ fn run_benchmark(args: &[String]) -> ExitCode {
     );
     eprintln!(
         "[benchmark] (compare with: cargo run --release -- benchmark -d cpu vs -d gpu)"
+    );
+    ExitCode::SUCCESS
+}
+
+/// Benchmark a self-contained ONNX MatMul graph through the same ORT CUDA
+/// provider used by GPU self-play. Inputs are copied once through IO binding
+/// before timing and outputs stay on CUDA, matching persistent PyTorch tensors.
+fn run_matmul_benchmark(args: &[String]) -> ExitCode {
+    let mut iterations: usize = 100;
+    let mut warmup: usize = 20;
+    let mut model_path: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let next = |k: &mut usize| -> Option<&String> {
+            *k += 1;
+            args.get(*k)
+        };
+        match args[i].as_str() {
+            "--iterations" | "-n" => {
+                iterations = next(&mut i).and_then(|v| v.parse().ok()).unwrap_or(iterations);
+            }
+            "--warmup" => {
+                warmup = next(&mut i).and_then(|v| v.parse().ok()).unwrap_or(warmup);
+            }
+            "--model" | "-m" => model_path = next(&mut i).cloned(),
+            flag => {
+                eprintln!("unknown matmul-benchmark flag: {flag}");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(model_path) = model_path else {
+        eprintln!("matmul-benchmark requires --model <PATH>");
+        return ExitCode::from(2);
+    };
+
+    let mut session = match network::load_ort(std::path::Path::new(&model_path), Device::Gpu) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("[matmul-benchmark] failed to load CUDA model: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let n: usize = 4096 * 4096;
+    let a_data: Vec<f32> = (0..n).map(|i| (i % 127) as f32 - 63.0).collect();
+    let b_data: Vec<f32> = (0..n).map(|i| (i.wrapping_mul(17) % 127) as f32 - 63.0).collect();
+    let a = match ort::value::Value::from_array(([4096_usize, 4096], a_data)) {
+        Ok(value) => value,
+        Err(error) => { eprintln!("[matmul-benchmark] failed to allocate A: {error}"); return ExitCode::from(1); }
+    };
+    let b = match ort::value::Value::from_array(([4096_usize, 4096], b_data)) {
+        Ok(value) => value,
+        Err(error) => { eprintln!("[matmul-benchmark] failed to allocate B: {error}"); return ExitCode::from(1); }
+    };
+    let output_memory = match ort::memory::MemoryInfo::new(
+        ort::memory::AllocationDevice::CUDA,
+        0,
+        ort::memory::AllocatorType::Device,
+        ort::memory::MemoryType::Default,
+    ) {
+        Ok(memory) => memory,
+        Err(error) => { eprintln!("[matmul-benchmark] failed to create CUDA output memory: {error}"); return ExitCode::from(1); }
+    };
+    let mut binding = match session.create_binding() {
+        Ok(binding) => binding,
+        Err(error) => { eprintln!("[matmul-benchmark] failed to create IO binding: {error}"); return ExitCode::from(1); }
+    };
+    if let Err(error) = binding.bind_input("a", &a)
+        .and_then(|_| binding.bind_input("b", &b))
+        .and_then(|_| binding.bind_output_to_device("y", &output_memory)) {
+        eprintln!("[matmul-benchmark] failed to bind CUDA tensors: {error}");
+        return ExitCode::from(1);
+    }
+    eprintln!("[matmul-benchmark] backend bound: Gpu; IO-bound CUDA inputs; warmup={warmup}; iterations={iterations}");
+    for _ in 0..warmup {
+        if let Err(error) = session.run_binding(&binding) {
+            eprintln!("[matmul-benchmark] warmup failed: {error}");
+            return ExitCode::from(1);
+        }
+    }
+
+    let start = Instant::now();
+    for _ in 0..iterations {
+        if let Err(error) = session.run_binding(&binding) {
+            eprintln!("[matmul-benchmark] inference failed: {error}");
+            return ExitCode::from(1);
+        }
+    }
+    let elapsed = start.elapsed();
+    let mean_micros = elapsed.as_nanos() as f64 / iterations as f64 / 1_000.0;
+    let throughput = iterations as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "[matmul-benchmark] total: {:?}  mean: {:.2} µs/call  throughput: {:.0} calls/sec",
+        elapsed, mean_micros, throughput
     );
     ExitCode::SUCCESS
 }

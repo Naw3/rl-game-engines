@@ -162,7 +162,7 @@ impl Network {
 
 /// Load the model with ort. CUDA if `device == Gpu` and `cuda` feature
 /// compiled in; CPU otherwise.
-fn load_ort(path: &Path, device: Device) -> Result<Session, Box<dyn std::error::Error>> {
+pub(crate) fn load_ort(path: &Path, device: Device) -> Result<Session, Box<dyn std::error::Error>> {
     let mut builder = SessionBuilder::new()?;
 
     #[cfg(feature = "cuda")]

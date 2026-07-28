@@ -97,6 +97,8 @@ def export_onnx(
     else:
         model_cpu = model
 
+    if infer_precision not in {"fp32", "fp16", "int8"}:
+        raise ValueError(f"Unsupported inference precision: {infer_precision}")
     if infer_precision == "fp16":
         model_cpu = model_cpu.half()
         dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS, dtype=torch.float16)
@@ -145,6 +147,15 @@ def export_onnx(
     import onnx
     onnx_model = onnx.load(onnx_path)
     onnx.checker.check_model(onnx_model)
+    if infer_precision == "int8":
+        from onnxruntime.quantization import QuantType, quantize_dynamic
+        quant_model = onnx.load(onnx_path)
+        del quant_model.graph.value_info[:]
+        onnx.save(quant_model, onnx_path)
+        quantize_dynamic(onnx_path, onnx_path, weight_type=QuantType.QInt8,
+                         extra_options={"DisableShapeInference": True})
+        onnx_model = onnx.load(onnx_path)
+        onnx.checker.check_model(onnx_model)
     import onnx
     onnx_model = onnx.load(onnx_path)
     onnx.checker.check_model(onnx_model)
@@ -162,7 +173,7 @@ def main() -> int:
     p.add_argument("--channels", type=int, default=_DEFAULT_CHANNELS)
     p.add_argument("--num-blocks", type=int, default=_DEFAULT_NUM_BLOCKS)
     p.add_argument("--seed", type=int, default=_DEFAULT_SEED, help="RNG seed for model initialization")
-    p.add_argument("--infer-precision", choices=["fp32", "fp16"], default=_DEFAULT_INFER_PRECISION,
+    p.add_argument("--infer-precision", choices=["fp32", "fp16", "int8"], default=_DEFAULT_INFER_PRECISION,
                    help="Precision for the exported ONNX model")
     args = p.parse_args()
 
@@ -184,11 +195,11 @@ def main() -> int:
     print(f"[init] saving state_dict -> {args.out_pt}")
     net.save(args.out_pt)
 
-    print(f"[init] exporting ONNX -> {args.out_onnx} (opset {args.opset})")
+    print(f"[init] exporting ONNX -> {args.out_onnx} (opset {args.opset}, precision: {args.infer_precision})")
     
     # We must import export_onnx from train.py, or define it here.
     if args.out_onnx:
-        export_onnx(net, args.out_onnx, opset=args.opset)
+        export_onnx(net, args.out_onnx, opset=args.opset, infer_precision=args.infer_precision)
 
     print(f"[init] done. {args.out_pt} + {args.out_onnx} ready for self-play.")
     return 0
