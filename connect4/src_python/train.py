@@ -597,6 +597,11 @@ def main() -> None:
                 n_batches = 0
             batch_idx += 1
 
+        if batch_idx == 0:
+            # We didn't process a single batch (e.g. duration limit hit immediately).
+            # Don't record this as an epoch.
+            break
+
         # Record end of epoch on GPU stream (non-blocking)
         if args.device == "cuda":
             epoch_end_evt.record()
