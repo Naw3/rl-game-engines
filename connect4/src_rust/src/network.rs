@@ -1,5 +1,5 @@
 // =============================================================================
-// network.rs — ONNX inference with ORT backend (CPU & GPU dispatcher).
+// network.rs — ONNX inference via ORT (CPU & GPU dispatcher).
 //
 // Inference Architecture: Centralised Dispatcher
 // ---------------------------------------------------
@@ -74,7 +74,7 @@ impl Device {
     }
 }
 
-/// The inference network. Holds an optional `Backend` (Tract or OrtDispatcher)
+/// The inference network. Holds an optional `Backend` (OrtDispatcher)
 /// shared via `Arc` across all rayon worker threads.
 pub struct Network {
     queue: Option<InferQueue>,
@@ -144,7 +144,7 @@ impl Network {
     /// Evaluate a batch of positions. On GPU, each board is submitted
     /// individually to the dispatcher — the dispatcher will merge them with
     /// concurrent requests from other threads into a single large GPU batch.
-    /// On CPU (tract), they are forwarded as a single batch directly.
+    /// On CPU, they are forwarded as a single batch directly.
     pub fn evaluate_batch(&self, boards: &[Board]) -> Vec<Eval> {
         if boards.is_empty() {
             return Vec::new();
@@ -259,7 +259,7 @@ fn run_dispatcher(mut session: Session, rx: Receiver<InferRequest>) {
             }
         };
 
-        // Single GPU forward pass — the key to saturating the 4060.
+        // Single GPU forward pass — the key to saturating the GPU.
         let outputs = match session.run(ort::inputs!["input" => input_val]) {
             Ok(o) => o,
             Err(e) => {
@@ -335,30 +335,32 @@ fn dispatcher_batch_eval(queue: &InferQueue, boards: &[Board]) -> Vec<Eval> {
 }
 
 // ---------------------------------------------------------------------------
-// Tensor construction (shared by both backends)
+// Tensor construction
 // ---------------------------------------------------------------------------
 
-
 /// Build a (N, 3, 6, 7) f32 tensor from a batch of Boards.
+///
+/// Layout: plane 0 = own, plane 1 = opp, plane 2 = turn (all 1.0).
+/// All three planes are written in a single pass over the 42 cells so the
+/// data is written sequentially per-board without backtracking.
 fn boards_to_input(boards: &[Board]) -> (Vec<usize>, Vec<f32>) {
     let n = boards.len();
     let shape = vec![n, 3, 6, 7];
-    let mut data = Vec::with_capacity(n * 3 * 6 * 7);
-    for board in boards {
-        for r in 0..6 {
-            for col in 0..7 {
+    // Each board contributes 3 × 6 × 7 = 126 f32 values.
+    let mut data = vec![0.0f32; n * 126];
+    for (b_idx, board) in boards.iter().enumerate() {
+        let base = b_idx * 126;
+        for r in 0..6usize {
+            for col in 0..7usize {
                 let bit = 1u64 << (col * 7 + r);
-                data.push(if board.own & bit != 0 { 1.0 } else { 0.0 });
+                let cell = r * 7 + col;
+                // Plane 0 — own pieces.
+                data[base + cell] = if board.own & bit != 0 { 1.0 } else { 0.0 };
+                // Plane 1 — opponent pieces.
+                data[base + 42 + cell] = if board.opp & bit != 0 { 1.0 } else { 0.0 };
+                // Plane 2 — turn indicator (constant 1.0).
+                data[base + 84 + cell] = 1.0;
             }
-        }
-        for r in 0..6 {
-            for col in 0..7 {
-                let bit = 1u64 << (col * 7 + r);
-                data.push(if board.opp & bit != 0 { 1.0 } else { 0.0 });
-            }
-        }
-        for _ in 0..42 {
-            data.push(1.0);
         }
     }
     (shape, data)
@@ -373,15 +375,18 @@ fn null_eval(board: Board) -> Eval {
     let mut policy = [0.0f32; 7];
     let occupied = board.own | board.opp;
     let mut n_legal = 0u32;
-    for c in 0..7 {
-        if (occupied & col_mask(c)) != col_mask(c) {
+    // Check legality and fill in one pass — col_mask computed once per column.
+    for c in 0..7usize {
+        let mask = col_mask(c);
+        if (occupied & mask) != mask {
             n_legal += 1;
         }
     }
     if n_legal > 0 {
         let p = 1.0 / n_legal as f32;
-        for c in 0..7 {
-            if (occupied & col_mask(c)) != col_mask(c) {
+        for c in 0..7usize {
+            let mask = col_mask(c);
+            if (occupied & mask) != mask {
                 policy[c] = p;
             }
         }
@@ -424,10 +429,11 @@ mod tests {
 
     #[test]
     fn board_to_input_layout() {
+        // own: bit 21 = row 0, col 3.  opp: bit 37 = row 2, col 5.
         let own = 1u64 << 21;
         let opp = 1u64 << 37;
         let board = Board { own, opp };
-        let (shape, data) = board_to_input(board);
+        let (shape, data) = boards_to_input(&[board]);
         assert_eq!(shape, vec![1, 3, 6, 7]);
         // Plane 0 (own), row 0, col 3 → 1.0
         assert_eq!(data[0 * 6 * 7 + 0 * 7 + 3], 1.0);

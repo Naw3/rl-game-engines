@@ -15,19 +15,19 @@ ndarray = "0.17"             # Input tensor construction. Bumped to 0.17 to matc
 crossbeam-channel = "0.5"   # Lock-free MPSC for the dispatcher request queue.
 
 [features]
-# Default: CPU only (tract). Build with `--features cuda` to enable
-# the GPU execution provider via ort. CUDA requires the CUDA toolkit
-# and `onnxruntime-gpu` installed at runtime.
+# Default: CPU via ORT (onnxruntime). Build with `--features cuda` to enable
+# the CUDA execution provider. CUDA requires the CUDA toolkit and a compatible
+# onnxruntime-gpu DLL at runtime.
 default = []
 cuda = ["ort/cuda"]
 
 [profile.release]
 # Tuning notes for low-RAM machines (target: 8 GB total, 1 GB free at link time):
 # - `lto = false` — fat LTO and even thin LTO both push peak RAM past 1.5 GB
-#   at link time on this crate (ort + tract + connect4_mcts combined). With
-#   only 1 GB free on an 8 GB machine, the linker swap-thrashes the SSD
-#   and turns a 30 s link into 5-9 min. No LTO = no cross-crate bitcode
-#   phase; runtime cost on the 227K-param model: ~5-10 % vs fat LTO.
+#   at link time on this crate (ort + connect4_mcts combined). With only 1 GB
+#   free on an 8 GB machine the linker swap-thrashes the SSD and turns a 30 s
+#   link into 5-9 min. No LTO = no cross-crate bitcode phase; runtime cost on
+#   the model: ~5-10 % vs fat LTO.
 # - `codegen-units = 1` (NOT 16) — higher values spawn parallel LLVM
 #   instances, each carrying its own data structures. On a low-RAM
 #   machine, 1 instance at a time keeps the peak lower than 16 parallel

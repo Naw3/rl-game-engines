@@ -85,14 +85,10 @@
 // network is shared across games via `Arc<Network>` (see `main.rs`)
 // so the 64 games spawned by rayon all share the same inference backend.
 //
-// On CPU (tract), `RunnableModel` is `Send + Sync` and serialises
-// concurrent `run` calls internally — safe by construction.
-//
-// On GPU (ort), a single dispatcher thread owns the one ort `Session`
-// and receives board states from all 64 MCTS threads via a
-// `crossbeam_channel` queue. It batches incoming requests (up to 64
-// boards at once) into a single GPU forward pass, then routes results
-// back to their requesting threads. This eliminates per-call FFI
+// On CPU, the ORT session serialises concurrent run() calls internally.
+// On GPU (CUDA execution provider via the dispatcher thread), each MCTS
+// worker submits its board state via a channel and blocks until the
+// dispatcher returns the batch result. This eliminates per-call FFI
 // overhead and fully saturates the GPU.
 //
 // Reference: Silver et al., 2017, §3.3.2 (PUCT), §3.4.1 (value
@@ -111,7 +107,7 @@ pub const DEFAULT_C_PUCT: f32 = 1.5;
 /// Default number of simulations per move during self-play data generation.
 pub const DEFAULT_SIMS: usize = 800;
 /// Default batch size for NN inference. 1 = sequential (legacy). 32 is a
-/// reasonable default for both CPU tract (no slowdown) and GPU ort (huge
+/// reasonable default for both CPU ORT and GPU ORT (huge
 /// speedup). CLI flag `--batch-size` overrides.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
 /// Dirichlet concentration parameter for root noise (legal-move uniform).

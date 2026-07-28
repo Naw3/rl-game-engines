@@ -73,29 +73,22 @@ def decode_bitboard(own: int, opp: int) -> np.ndarray:
     Plane layout:
         0 : own pieces    (1.0 where the current player has a piece)
         1 : opponent      (1.0 where the opponent has a piece)
-        2 : empty + turn  (1.0 elsewhere; the third u64 in the format
-                           is all 1s, so this plane is just a bias)
+        2 : empty + turn  (all 1.0 elsewhere — constant bias plane)
 
     For each cell (r, c), the corresponding bit in the u64 is at index
-    `c * 7 + r`. The guard bit at index `c * 7 + 6` is dropped here
-    (it's never set in valid states, but defensively excluded).
+    ``c * 7 + r``. The guard bit at index ``c * 7 + 6`` is dropped.
     """
-    planes = np.zeros((N_PLANES, BOARD_H, BOARD_W), dtype=np.float32)
+    # Build a flat array of bit indices for all 42 cells (6 rows × 7 cols),
+    # then extract own / opp / empty in three vectorised steps.
+    r_idx = np.arange(BOARD_H, dtype=np.uint64)[:, None]  # (6, 1)
+    c_idx = np.arange(BOARD_W, dtype=np.uint64)[None, :]  # (1, 7)
+    shifts = (c_idx * 7 + r_idx).ravel()                  # (42,)
+    bits = (np.uint64(1) << shifts)                        # (42,)
 
-    # Fast path: precompute the bit mask for each cell. We can vectorize
-    # the per-sample decode by lifting (own, opp) to numpy arrays and
-    # using bitwise operations on the (N, 6, 7) view of the bits. For a
-    # single sample the Python loop is fine — 42 iterations is nothing.
-    for r in range(BOARD_H):
-        for c in range(BOARD_W):
-            bit = 1 << (c * 7 + r)
-            if own & bit:
-                planes[0, r, c] = 1.0
-            elif opp & bit:
-                planes[1, r, c] = 1.0
-            else:
-                planes[2, r, c] = 1.0
-    return planes
+    own_mask  = ((np.uint64(own) & bits) != 0).reshape(BOARD_H, BOARD_W).astype(np.float32)
+    opp_mask  = ((np.uint64(opp) & bits) != 0).reshape(BOARD_H, BOARD_W).astype(np.float32)
+    turn_mask = np.ones((BOARD_H, BOARD_W), dtype=np.float32)
+    return np.stack([own_mask, opp_mask, turn_mask])
 
 
 def decode_bitboard_batched(
@@ -111,20 +104,20 @@ def decode_bitboard_batched(
         (N, 3, 6, 7) float32 numpy array of input planes.
     """
     N = own_arr.shape[0]
-    planes = np.zeros((N, N_PLANES, BOARD_H, BOARD_W), dtype=np.float32)
-    # Precompute the (6, 7) bit-index table.
-    bit_idx = np.arange(BOARD_H * BOARD_W).reshape(BOARD_W, BOARD_H).T  # (6, 7)
-    bit_idx = (bit_idx * 0 + np.arange(BOARD_W)[None, :]) * 7 + np.arange(BOARD_H)[:, None]
-    # ^ Equivalent to: bit_idx[r, c] = c * 7 + r.
+    # Precompute the (6, 7) shift table: shift[r, c] = c * 7 + r.
+    r_idx = np.arange(BOARD_H, dtype=np.uint64)[:, None]  # (6, 1)
+    c_idx = np.arange(BOARD_W, dtype=np.uint64)[None, :]  # (1, 7)
+    shifts = (c_idx * 7 + r_idx)                          # (6, 7)
 
+    planes = np.zeros((N, N_PLANES, BOARD_H, BOARD_W), dtype=np.float32)
     for r in range(BOARD_H):
         for c in range(BOARD_W):
-            bit = np.uint64(1) << np.uint64(c * 7 + r)
-            own_mask = (own_arr & bit) != 0
-            opp_mask = (opp_arr & bit) != 0
+            bit = np.uint64(1) << shifts[r, c]
+            own_mask   = (own_arr & bit) != 0
+            opp_mask   = (opp_arr & bit) != 0
             empty_mask = ~(own_mask | opp_mask)
-            planes[own_mask, 0, r, c] = 1.0
-            planes[opp_mask, 1, r, c] = 1.0
+            planes[own_mask,   0, r, c] = 1.0
+            planes[opp_mask,   1, r, c] = 1.0
             planes[empty_mask, 2, r, c] = 1.0
     return planes
 
@@ -220,15 +213,14 @@ class C4Dataset(Dataset):
     def stats(self) -> dict:
         """Summary statistics for the dataset — useful in train.py for logging."""
         n = self.count
-        n_pos = int((self._value > 0).sum())
-        n_neg = int((self._value < 0).sum())
+        n_pos  = int((self._value > 0).sum())
+        n_neg  = int((self._value < 0).sum())
         n_draw = int((self._value == 0).sum())
-        avg_plies = n / max(1, n)  # we don't track game boundaries here
         return {
-            "samples": n,
-            "wins": n_pos,
-            "losses": n_neg,
-            "draws": n_draw,
+            "samples":  n,
+            "wins":     n_pos,
+            "losses":   n_neg,
+            "draws":    n_draw,
             "win_rate": n_pos / max(1, n_pos + n_neg),
         }
 

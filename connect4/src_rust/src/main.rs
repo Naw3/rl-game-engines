@@ -16,7 +16,7 @@
 //    rayon. Each worker gets its own MCTS instance (per-game tree)
 //    and its own seeded RNG, but they ALL share the same
 //    `Arc<Network>` — the inference is the only synchronisation point
-//    and tract serialises that internally.
+//    and the ORT dispatcher serialises that internally.
 // 4. For each move, MCTS runs `simulations` PUCT-guided simulations,
 //    using the network's policy as the prior and the network's value
 //    as the leaf value. The visit-count distribution is the policy
@@ -68,17 +68,15 @@ use std::time::Instant;
 
 /// 56 bytes per sample. Manually serialized to keep the wire format tight.
 ///
-/// `policy` is stored as `Vec<f32>` rather than `[f32; 7]` because the
-/// MCTS returns a `Vec<f32>` (length always 7) and the on-disk format
-/// writes 7 `f32`s regardless of the in-memory representation. This
-/// keeps `play_game` zero-copy: it just hands the policy straight to
-/// the Sample without any fixed-size array shuffle.
+/// `policy` uses a fixed-size `[f32; 7]` array (known at compile time)
+/// to avoid heap allocation per game-move. The on-disk format writes exactly
+/// 7 `f32`s, so the in-memory representation matches the wire format 1:1.
 #[derive(Clone)]
 struct Sample {
     own: u64,
     opp: u64,
     turn_mask: u64,
-    policy: Vec<f32>,
+    policy: [f32; 7],
     value: f32,
 }
 
@@ -357,27 +355,12 @@ fn main() -> ExitCode {
 
     // Parallel self-play. Each worker builds its own MCTS (per-game
     // tree) and its own RNG, but ALL workers share the same
-    // Arc<Network>. The network is the only synchronisation point
-    // across threads; tract serialises concurrent run() calls internally.
+    // Arc<Network>. The ORT dispatcher serialises concurrent calls.
     use std::sync::atomic::{AtomicUsize, Ordering};
     let completed_games = Arc::new(AtomicUsize::new(0));
     let total_plies = Arc::new(AtomicUsize::new(0));
 
-    let format_dur = |s: f64| -> String {
-        if s < 0.001 {
-            "< 1ms".to_string()
-        } else if s < 1.0 {
-            format!("{:.0}ms", s * 1000.0)
-        } else if s < 60.0 {
-            format!("{:.1}s", s)
-        } else if s < 3600.0 {
-            let u = s.round() as u64;
-            format!("{}m {:02}s", u / 60, u % 60)
-        } else {
-            let u = s.round() as u64;
-            format!("{}h {:02}m {:02}s", u / 3600, (u % 3600) / 60, u % 60)
-        }
-    };
+    let format_dur = |s: f64| format_duration(s);
 
     if verbose {
         let bar_width = json_cfg.as_ref().and_then(|c| c.gui.as_ref()?.progress_bar_width).unwrap_or(20);
@@ -563,9 +546,9 @@ fn print_help() {
     eprintln!("    -o, --output <PATH>    Output binary file (default selfplay.bin)");
     eprintln!("    -m, --model <PATH>     ONNX model path (default connect4_model.onnx)");
     eprintln!("    -d, --device <KIND>    Inference device: cpu, gpu, auto (default auto)");
-    eprintln!("                           cpu = tract-onnx (fastest, pure Rust)");
-    eprintln!("                           gpu = ort + CUDA (needs --features cuda at build)");
-    eprintln!("                           auto = gpu if available else cpu");
+    eprintln!("                           cpu = ORT CPU execution provider");
+    eprintln!("                           gpu = ORT CUDA execution provider (needs --features cuda at build)");
+    eprintln!("                           auto = gpu if 'cuda' feature compiled else cpu");
     eprintln!("    -t, --temperature <F>  Visit-count temperature (default 1.0)");
     eprintln!("        --no-noise         Disable Dirichlet noise at the root");
     eprintln!("    -v, --verbose          Print progress to stderr");
@@ -600,8 +583,8 @@ fn default_model_path() -> std::path::PathBuf {
 
 /// Run a pure NN inference benchmark: load the model, run N forward
 /// passes, report mean/throughput. Used to measure the per-call cost
-/// of the inference backend (tract-cpu vs ort-cpu vs ort-gpu) so you
-/// can decide if the GPU setup is worth the build/runtime cost.
+/// of each execution provider (ort-cpu vs ort-gpu) so you can decide
+/// if the GPU setup is worth the build/runtime cost.
 fn run_benchmark(args: &[String]) -> ExitCode {
     let json_cfg = load_config_from_python();
     let mut iterations: usize = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.bench_iterations).unwrap_or(1000);
@@ -800,11 +783,15 @@ fn play_game<R: Rng + ?Sized>(mcts: &mut MCTS, rng: &mut R, deadline: Option<Ins
         }
 
         // Run network-guided MCTS to get the policy at this state.
-        let (policy, _q) = mcts.run(board, rng);
+        let (policy_vec, _q) = mcts.run(board, rng);
 
-        // Sample the move BEFORE pushing the sample so we still own
-        // the `Vec<f32>` (the policy would otherwise be moved into
-        // the Sample and we couldn't borrow it for sampling).
+        // Convert the MCTS policy Vec<f32> (always length 7) to [f32; 7].
+        let mut policy = [0.0f32; 7];
+        for (i, &v) in policy_vec.iter().enumerate().take(7) {
+            policy[i] = v;
+        }
+
+        // Sample the move BEFORE pushing the sample so we still own the data.
         let legal = board.legal_moves();
         let action = sample_action_from_policy(&policy, legal, rng);
 
@@ -882,13 +869,34 @@ fn sample_action_from_policy<R: Rng + ?Sized>(
     0
 }
 
+/// Format a duration in seconds to a human-readable string.
+/// Used both in the self-play progress display and the benchmark output.
+fn format_duration(s: f64) -> String {
+    if s < 0.001 {
+        "< 1ms".to_string()
+    } else if s < 1.0 {
+        format!("{:.0}ms", s * 1000.0)
+    } else if s < 60.0 {
+        format!("{:.1}s", s)
+    } else if s < 3600.0 {
+        let u = s.round() as u64;
+        format!("{}m {:02}s", u / 60, u % 60)
+    } else {
+        let u = s.round() as u64;
+        format!("{}h {:02}m {:02}s", u / 3600, (u % 3600) / 60, u % 60)
+    }
+}
+
+/// C4D1 format magic bytes.
+const C4D1_MAGIC: &[u8; 4] = b"C4D1";
+
 /// Write the C4D1 binary file.
 fn write_binary(path: &str, samples: &[Sample]) -> std::io::Result<()> {
     let f = File::create(path)?;
     let mut w = BufWriter::with_capacity(1 << 20, f);
 
     // Header.
-    w.write_all(b"C4D1")?;
+    w.write_all(C4D1_MAGIC)?;
     w.write_all(&(samples.len() as u32).to_le_bytes())?;
     w.write_all(&[0u8; 8])?;
 

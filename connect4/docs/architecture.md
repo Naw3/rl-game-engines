@@ -411,28 +411,28 @@ random-rollout variant in earlier versions of this project was missing.
 The pipeline needs the Rust MCTS to call the trained PyTorch model. We
 bridge this by exporting the model to ONNX at the end of every training
 cycle (`train.py`) and loading it in Rust via
-[`tract-onnx`](https://github.com/sonos/tract), a pure-Rust ONNX runtime.
+[`onnxruntime` (ORT)](https://github.com/microsoft/onnxruntime) via the
+[`ort`](https://crates.io/crates/ort) Rust crate.
 
-### 6.1 Why tract (and not `ort`)?
+### 6.1 Why ORT for both CPU and GPU?
 
-* **Pure Rust** — no system dependency on `libonnxruntime`, no install
-  step. The whole stack compiles from `cargo build` alone.
-* **`RunnableModel<TypedModel, TypedFact>` is `Send + Sync`**, so we
-  wrap the session in `Arc` and share it across all rayon worker
-  threads. Each worker calls `evaluate` on the shared `Network` and
-  tract serialises the calls internally with optional intra-op
-  parallelism (BLAS-backed GEMM/conv).
-* **Our model is small** (~50K params, 3 conv blocks, 2 linear heads).
-  CPU inference dominates the MCTS cost, not the NN cost.
+* **Unified backend** — the same `Session` and inference path works for
+  both CPU and CUDA. No code branches between "CPU backend" and "GPU backend".
+* **Session is owned by a single dispatcher thread** which receives boards
+  from all rayon workers via a `crossbeam_channel` queue, batches them, runs
+  one forward pass, and returns results. This avoids per-call FFI overhead
+  and saturates the GPU on the `cuda` feature path.
+* **`ort`** downloads the matching `onnxruntime` DLL at build time via
+  `ort-sys` (feature `download-binaries`). No manual install step.
 
-### 6.2 Trade-off vs `ort` with CUDA
+### 6.2 CPU vs GPU performance
 
-`ort`'s CUDA support is more mature than tract's. For our model on a
-single 1650, CPU inference is plenty: ~50 µs per call on a modern
-desktop, ~200 µs on a low-end laptop. If GPU inference becomes a
-bottleneck, swap the `Network` body for an `ort`-backed implementation
-— the `Eval` struct and `evaluate(&self, board)` API are stable, so the
-MCTS doesn't need to change.
+For our model (~227K params, 5 conv blocks, 2 linear heads), CPU ORT is
+fast enough for the self-play loop: ~50 µs per call on a modern desktop.
+GPU (`--features cuda`) provides a significant speedup when many games run
+in parallel since the dispatcher batches all requests into one GPU pass.
+The `Eval` struct and `evaluate(&self, board)` API are stable regardless
+of which execution provider is chosen.
 
 ### 6.3 The Network wrapper
 
@@ -440,7 +440,8 @@ MCTS doesn't need to change.
 
 ```rust
 pub struct Network {
-    model: Option<Arc<OnnxModel>>,  // None → null network
+    queue: Option<InferQueue>,  // None → null network
+    device: Device,
 }
 
 pub struct Eval {
@@ -449,7 +450,7 @@ pub struct Eval {
 }
 
 impl Network {
-    pub fn load(path: &Path) -> Result<Self, ...>;
+    pub fn load(path: &Path, device: Device) -> Result<Self, ...>;
     pub fn null() -> Self;
     pub fn evaluate(&self, board: Board) -> Eval;
     pub fn evaluate_batch(&self, boards: &[Board]) -> Vec<Eval>;
@@ -457,8 +458,8 @@ impl Network {
 ```
 
 The `Network` is shared across all rayon workers via `Arc<Network>`. Each
-worker calls `evaluate` on the shared reference; tract serialises the
-calls internally.
+worker calls `evaluate` on the shared reference; the ORT dispatcher thread
+serialises inference calls via a bounded channel queue.
 
 ### 6.4 The "null" network
 
@@ -485,12 +486,14 @@ parallel via rayon. Each game has:
 * **One `Arc<Network>` reference** — shared with all other games.
 
 The `Network` is the only synchronisation point across threads.
-tract's `RunnableModel::run` is internally serialised, but tract also
-parallelises individual ops (e.g. the convs use BLAS-backed GEMM with
-intra-op threads). On a 4-core / 8-thread CPU, the MCTS search and
-the NN inference overlap nicely: while game $i$ is doing the PUCT
-selection / back-up, game $i+1$ is in the middle of an NN forward
-pass, and the BLAS threads are splitting the conv work for game $i$'s
+The ORT dispatcher thread owns the `Session` and serialises all
+inference calls. The rayon workers submit board states via a
+`crossbeam_channel` queue. The dispatcher batches pending requests (up
+to `MAX_DISPATCHER_BATCH = 64` boards) and executes a single forward
+pass, then routes results back via per-request oneshot channels.
+On a 4-core / 8-thread CPU, the MCTS search and the NN inference overlap:
+while game $i$ is doing the PUCT selection / back-up, game $i+1$ has its
+board in the dispatcher queue, and the ORT session is executing the conv
 forward. There is no per-thread lock on the Rust side.
 
 This is the cleanest possible thread-safety story for a multi-game
@@ -537,7 +540,7 @@ Source: [`init.py`](../src_python/init.py).
 ```text
    ┌──────────────── RUST (CPU) ──────────────────┐
    │                                              │
-   │   load Arc<Network> from .onnx (tract)       │
+   │   load Arc<Network> from .onnx (ORT)          │
    │                                              │
    │   rayon::par_iter                            │
    │     for game in 0..N:                        │
@@ -631,4 +634,5 @@ Source: [`init.py`](../src_python/init.py).
   The residual block in `model.py` follows this paper's bottleneck-free
   variant.
 - ONNX: Open Neural Network Exchange format, [onnx.ai](https://onnx.ai).
-- tract: pure-Rust ONNX runtime, [github.com/sonos/tract](https://github.com/sonos/tract).
+- ort: Rust bindings for ONNX Runtime, [crates.io/crates/ort](https://crates.io/crates/ort).
+- onnxruntime: Microsoft's ONNX Runtime, [github.com/microsoft/onnxruntime](https://github.com/microsoft/onnxruntime).

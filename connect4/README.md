@@ -18,7 +18,7 @@ The full training loop is:
 │  MCTS × 800 sims per move,                      │
 │   priors from policy head,                      │
 │   leaf values from value head.                  │
-│   backend: tract-onnx (CPU) or ort+CUDA (GPU)   │
+│   backend: ORT CPU or ORT+CUDA (GPU)            │
 │       │                                         │
 │       ▼                                         │
 │  write C4D1 binary (state, π, z)                │
@@ -42,8 +42,8 @@ The full training loop is:
 ```
 
 **Design contract:** the Python side is **always** trained on GPU
-(CUDA). The Rust side is the variable — it can run on CPU (`tract`) or
-GPU (`ort`+CUDA). This means the interesting benchmark is
+(CUDA). The Rust side is the variable — it can run on CPU (`ort-cpu`)
+or GPU (`ort`+CUDA). This means the interesting benchmark is
 `(py-gpu + rust-cpu)` vs `(py-gpu + rust-gpu)`, see the
 [Benchmarking](#benchmarking--is-gpu-worth-it-for-rust) section.
 
@@ -63,7 +63,7 @@ connect4/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── bitboard.rs      # Board, move, win — pure bit math
-│       ├── network.rs       # ONNX inference wrapper (tract)
+│       ├── network.rs       # ONNX inference wrapper (ORT)
 │       ├── mcts.rs          # PUCT search, Dirichlet noise, network eval
 │       └── main.rs          # Parallel self-play, C4D1 writer
 ├── src_python/              # The learner + GUI (GPU)
@@ -143,7 +143,7 @@ Available env vars:
 
 The split exists because the Python side is **always GPU** by design —
 varying it isn't useful and CUDA training is dramatically faster than CPU.
-Only the Rust side varies between CPU (`tract`) and GPU (`ort`+CUDA).
+Only the Rust side varies between CPU (`ort-cpu`) and GPU (`ort`+CUDA).
 
 ### Play against the model
 
@@ -227,24 +227,25 @@ For the math, the binary format, and the data flow, see
 
 The pipeline needs the Rust MCTS to call the trained PyTorch model. We
 bridge this by exporting the model to ONNX at the end of every training
-cycle (`train.py`) and loading it in Rust. **Two inference backends are
-supported** so the user can pick the right tool per scenario:
+cycle (`train.py`) and loading it in Rust via
+[`ort`](https://crates.io/crates/ort) (Rust bindings for Microsoft's
+onnxruntime). **A single ORT backend is used for both CPU and GPU** —
+the execution provider is selected at runtime via the `--device` flag:
 
-* **`tract-onnx`** (CPU): pure Rust, no FFI, no external install.
-  ~50 µs/call on a modern desktop, ~200 µs on a low-end laptop.
-  Fastest on small models like ours (227K params) because there's
-  no FFI marshalling overhead. Always available.
+* **`--device cpu`** (ORT CPU EP): no extra install needed. ~50 µs/call
+  on a modern desktop. Always available regardless of build features.
 
-* **`ort`** (GPU/CPU): FFI to Microsoft onnxruntime. Supports CUDA
-  via the CUDA execution provider. Needs `--features cuda` at build
-  time + `onnnxruntime-gpu` installed at runtime.
+* **`--device gpu`** (ORT CUDA EP): needs `--features cuda` at build
+  time + a compatible `onnxruntime-gpu` DLL at runtime. Provides a
+  significant throughput gain when many games run concurrently because
+  the dispatcher thread batches all pending boards into a single GPU
+  forward pass.
 
-The Rust-side choice is made at runtime via the `--device` flag (driven
-by the `RUST_DEVICE` env var):
+The runtime choice is driven by the `RUST_DEVICE` env var:
 
 | `RUST_DEVICE` | Rust backend                | Rust build flag                  |
 |---------------|-----------------------------|----------------------------------|
-| `cpu`         | `tract-onnx` (pure Rust)    | `cargo build --release`          |
+| `cpu`         | ORT CPU execution provider  | `cargo build --release`          |
 | `gpu`         | `ort` + CUDA EP             | `cargo build --release --features cuda` |
 | `auto`        | GPU if compiled-in & init OK, else CPU | `--features cuda` (graceful fallback) |
 
@@ -285,7 +286,7 @@ We compare two configurations:
 
 | Config | Rust self-play | Python training |
 |--------|----------------|-----------------|
-| **A**  | CPU (`tract`)  | CUDA            |
+| **A**  | CPU (ORT-cpu)  | CUDA            |
 | **B**  | GPU (`ort`+CUDA) | CUDA          |
 
 Each "cycle" = one full run of the orchestrator (self-play + train +
@@ -372,9 +373,8 @@ runs `init.py` once. After that the step is a no-op (idempotent).
 
 1. **Replay buffer** — keep the last N cycles of self-play data, weighted
    toward the most recent. Expected effect: more sample-efficient training.
-2. **Batched NN evaluation** in MCTS — collect unique states to evaluate,
-   flush as a single batch. tract's batched path is much faster than
-   per-state calls.
+2. **Batched NN evaluation** in MCTS — already implemented via the
+   ORT dispatcher; the batch size is tunable via `--batch-size`.
 3. **Symmetry augmentation** in `dataset.py` (horizontal flip).
 4. **Periodic evaluation** against a fixed baseline (random player or the
    model from K cycles ago) to track real strength.

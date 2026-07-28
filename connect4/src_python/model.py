@@ -148,8 +148,7 @@ class Connect4Net(nn.Module):
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
-        if path.parent:
-            path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(self.state_dict(), path)
 
     @classmethod

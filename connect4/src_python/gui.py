@@ -41,7 +41,6 @@ from model import Connect4Net
 
 
 # --- Visual constants ------------------------------------------------------
-import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent

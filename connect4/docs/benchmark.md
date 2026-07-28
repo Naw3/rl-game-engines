@@ -49,7 +49,7 @@ amp -> fp32 training - fp32 inference:
   Self-Play Speedup (CPU -> GPU) : 17.4x faster
 =================================================================
 
-no-compil -> compil reduce-overhead + cudastream and no gil calculation + channel last (off) + fused adamw (off)
+no-compil -> compil reduce-overhead + cudastream and no gil calculation + channel last (off) + fused adamw (off):
 11:03am 7/25/206
 =================================================================
   BENCHMARK SUMMARY & PERFORMANCE REPORT (THROUGHPUT)
@@ -64,4 +64,21 @@ no-compil -> compil reduce-overhead + cudastream and no gil calculation + channe
     - Games Played          : 144 games (2.4 games/sec)
 
   Self-Play Speedup (CPU -> GPU) : 18.02x faster
+=================================================================
+
+After break ...:
+2:00pm 7/28/2026
+=================================================================
+  BENCHMARK SUMMARY & PERFORMANCE REPORT (THROUGHPUT)
+=================================================================
+  [Stage 3 - PyTorch Training (CUDA)] : 15902.4 samples/sec (in 60s)
+
+  [Stage 1 - Rust MCTS CPU  (batch=8)] :
+    - Generation Throughput : 4.6 samples/sec (in 60s)
+    - Games Played          : 8 games (0.1 games/sec)
+  [Stage 2 - Rust MCTS GPU  (batch=32)] :
+    - Generation Throughput : 67.7 samples/sec (in 60s)
+    - Games Played          : 120 games (2.0 games/sec)
+
+  Self-Play Speedup (CPU -> GPU) : 14.87x faster
 =================================================================

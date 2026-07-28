@@ -129,12 +129,18 @@ impl Board {
     }
 
     /// 7-bit bitmask: bit `c` is 1 iff column `c` is a legal move.
+    ///
+    /// A column is full when its row-5 bit (bit `c*7+5`) is occupied.
+    /// We test that bit directly via `col_top_guard(c) >> 1`, which equals
+    /// `1u64 << (c*7+5)` — the topmost valid row (row 5, 0-indexed).
     #[inline]
     pub fn legal_moves(&self) -> u8 {
         let mut mask = 0u8;
         let occ = self.own | self.opp;
         for c in 0..7usize {
-            if (occ & (1u64 << (c * 7 + 5))) == 0 {
+            // col_top_guard(c) is bit c*7+6 (the sentinel/guard bit).
+            // The actual top row is one below: bit c*7+5 = col_top_guard(c) >> 1.
+            if (occ & (col_top_guard(c) >> 1)) == 0 {
                 mask |= 1 << c;
             }
         }

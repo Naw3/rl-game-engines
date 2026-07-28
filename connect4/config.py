@@ -1,13 +1,3 @@
-
-
-
-
-
-
-
-
-
-
 import json
 import os
 import sys
@@ -59,7 +49,7 @@ class TrainConfig:
     log_every: int = 20
     symmetry: bool = True
     train_precision: str = "fp32"  # "fp32", "fp16", "bf16"
-    infer_precision: str = "int8"  # "fp32", "fp16", "int8"
+    infer_precision: str = "fp32"  # "fp32", "fp16", "int8"
     compile_mode: str = "reduce-overhead"  # "none", "default", "reduce-overhead", "max-autotune"
     channels_last: bool = False
     fused_adamw: bool = False
@@ -79,6 +69,8 @@ class DatasetConfig:
 @dataclass
 class GUIConfig:
     """Pygame & Console Interface Configuration"""
+    window_w: int = 700
+    window_h: int = 720
     board_top: int = 60
     fps: int = 60
     anim_frames: int = 12
@@ -135,8 +127,6 @@ class PipelineConfig:
     device: DeviceConfig = field(default_factory=DeviceConfig)
     bench: BenchConfig = field(default_factory=BenchConfig)
 
-
-# Global Singleton Configuration Instance
 
 # Global Singleton Configuration Instance
 CONFIG = PipelineConfig()
