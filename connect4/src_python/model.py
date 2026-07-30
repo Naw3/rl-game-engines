@@ -144,7 +144,14 @@ class Connect4Net(nn.Module):
         # Policy head
         p = F.relu(self.policy_bn(self.policy_conv(h_spatial)), inplace=True)
         p = p.flatten(start_dim=1)
-        log_p = F.log_softmax(self.policy_fc(p), dim=1)
+        logits = self.policy_fc(p)
+        
+        # --- ACTION MASKING ---
+        # x[:, 0, 5, :] = own pieces at top row (r=5)
+        # x[:, 1, 5, :] = opp pieces at top row (r=5)
+        top_row_occupied = (x[:, 0, 5, :] + x[:, 1, 5, :]) > 0.5
+        logits = logits.masked_fill(top_row_occupied, -1e9)
+        log_p = F.log_softmax(logits, dim=1)
 
         # Value head
         v = F.relu(self.value_bn(self.value_conv(h_spatial)), inplace=True)

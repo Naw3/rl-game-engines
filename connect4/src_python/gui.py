@@ -99,7 +99,7 @@ def find_row(bitboard: int, c: int) -> int | None:
     # bit rolls a carry through occupied cells and lands on the first empty.
     bottom = 1 << (c * 7)
     next_pos = ((occ | (1 << (c * 7 + 6))) + bottom) & col_mask(c)
-    bit = next_pos.bit_length() - 1
+    bit = (next_pos & -next_pos).bit_length() - 1
     return bit - c * 7  # row index within the column
 
 
@@ -125,18 +125,17 @@ def has_win(bitboard: int) -> bool:
 
 # --- Network inference ----------------------------------------------------
 
-def board_to_planes(red: int, yellow: int) -> np.ndarray:
+def board_to_planes(own: int, opp: int) -> np.ndarray:
     """Canonical: own = current player to move, opp = the other."""
     planes = np.zeros((3, 6, 7), dtype=np.float32)
     for r in range(6):
         for c in range(7):
             bit = 1 << (c * 7 + r)
-            if red & bit:
+            if own & bit:
                 planes[0, r, c] = 1.0  # own
-            elif yellow & bit:
+            if opp & bit:
                 planes[1, r, c] = 1.0  # opp
-            else:
-                planes[2, r, c] = 1.0
+            planes[2, r, c] = 1.0      # turn mask is all 1s
     return planes
 
 
@@ -150,7 +149,8 @@ def ai_select(model: Connect4Net, own: int, opp: int, device: torch.device) -> i
     # Mask illegal columns.
     occ = own | opp
     for c in range(7):
-        if (occ & col_mask(c)) == col_mask(c):
+        # A column is full if row 5 (bit c*7 + 5) is occupied
+        if (occ & (1 << (c * 7 + 5))) != 0:
             p[c] = 0.0
     return int(np.argmax(p))
 
@@ -218,6 +218,13 @@ def draw_board(screen: pygame.Surface, game: Game) -> None:
         status = f"  —  {'RED' if game.winner == 0 else 'YELLOW'} WINS"
     s = pygame.font.SysFont("consolas", 18).render(status, True, COLORS["text"])
     screen.blit(s, (WINDOW_W // 2, 3))
+    
+    if game.winner is not None:
+        # Draw Play Again button
+        btn_rect = pygame.Rect(WINDOW_W // 2 + 150, 0, 140, 24)
+        pygame.draw.rect(screen, (80, 80, 100), btn_rect, border_radius=5)
+        btn_s = pygame.font.SysFont("consolas", 18).render("PLAY AGAIN", True, (255, 255, 255))
+        screen.blit(btn_s, (WINDOW_W // 2 + 160, 3))
 
     # Board background.
     board_rect = pygame.Rect(
@@ -290,19 +297,27 @@ def run(model_path: str | None, device_str: str) -> None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_q, pygame.K_ESCAPE):
-                    running = False
-                elif event.key == pygame.K_r:
-                    game = Game()
-                    ai_thinking = False
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+                game = Game()
+                ai_thinking = False
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if game.turn == 0 and game.winner is None and game.anim is None and not ai_thinking:
-                    mx = event.pos[0]
-                    col = max(0, min(6, (mx - 20) // CELL_W))
-                    row = game.drop(col)
-                    if row is not None:
-                        game.anim = (col, row, COLORS["red"], 0)
+                mx, my = event.pos
+                
+                # Check Play Again button click
+                if game.winner is not None:
+                    if WINDOW_W // 2 + 120 <= mx <= WINDOW_W // 2 + 260 and 0 <= my <= 24:
+                        game = Game()
+                        ai_thinking = False
+                        continue
+                
+                # Check column click
+                if game.winner is None and game.turn == 0 and game.anim is None:
+                    # Is it inside the board area?
+                    if 20 <= mx <= 20 + CELL_W * 7 and BOARD_TOP <= my <= BOARD_TOP + CELL_H * 6:
+                        col = (mx - 20) // CELL_W
+                        row = game.drop(col)
+                        if row is not None:
+                            game.anim = (col, row, COLORS["red"], 0)
 
         # Animate falling piece.
         if game.anim is not None:

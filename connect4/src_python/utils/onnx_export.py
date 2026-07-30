@@ -91,6 +91,7 @@ def export_onnx(
     onnx_path: str | Path,
     opset: int = _DEFAULT_OPSET,
     infer_precision: str = _DEFAULT_INFER_PRECISION,
+    calibration_samples: "numpy.ndarray | None" = None,
 ) -> None:
     """Export *model* to ONNX with dynamic batch dim and named I/O.
 
@@ -156,20 +157,31 @@ def export_onnx(
     onnx.checker.check_model(onnx_model)
 
     if infer_precision == "int8":
-        from onnxruntime.quantization import QuantType, quantize_dynamic  # type: ignore[import]
+        from onnxruntime.quantization import QuantType, quantize_static, QuantFormat, CalibrationDataReader  # type: ignore[import]
+        
+        class Connect4CalibrationReader(CalibrationDataReader):
+            def __init__(self, samples_np):
+                self.enum_data = iter([{"input": samples_np}])
+            def get_next(self):
+                return next(self.enum_data, None)
 
-        # ORT's shape inference can conflict with certain model architectures;
-        # clearing value_info before quantisation avoids those failures.
-        quant_model = onnx.load(str(onnx_path))
-        del quant_model.graph.value_info[:]
-        onnx.save(quant_model, str(onnx_path))
+        if calibration_samples is None:
+            # Fallback random calibration for init.py
+            import numpy as np
+            calibration_samples = np.random.randn(32, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS).astype(np.float32)
 
-        quantize_dynamic(
-            str(onnx_path),
-            str(onnx_path),
+        reader = Connect4CalibrationReader(calibration_samples)
+        quantize_static(
+            onnx_path,
+            onnx_path,
+            calibration_data_reader=reader,
+            quant_format=QuantFormat.QOperator,
             weight_type=QuantType.QInt8,
+            activation_type=QuantType.QInt8,
+            nodes_to_exclude=["node_linear_17", "node_masked_fill"],
             extra_options={"DisableShapeInference": True},
         )
+        
         # Re-validate after quantisation.
         onnx_model = onnx.load(str(onnx_path))
         onnx.checker.check_model(onnx_model)

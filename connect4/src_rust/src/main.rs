@@ -278,7 +278,7 @@ fn main() -> ExitCode {
     // back to the null network (uniform priors, value=0). The null
     // network is a safety net — the orchestrator's init.py ensures
     // a real model exists before the very first self-play.
-    let network: Arc<Network> = match Network::load(&model_path, device) {
+    let mut network: Arc<Network> = match Network::load(&model_path, device) {
         Ok(net) => {
             if verbose {
                 eprintln!(
@@ -492,8 +492,50 @@ fn main() -> ExitCode {
             })
     };
 
+    let (onnx_tx, onnx_rx) = crossbeam_channel::bounded(1);
+
     if stream_mode {
+        // --- IPC: Listen for ONNX model on stdin ---
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut stdin = std::io::stdin().lock();
+            loop {
+                let mut len_buf = [0u8; 4];
+                if stdin.read_exact(&mut len_buf).is_err() {
+                    break; // Stdin closed by Python
+                }
+                let len = u32::from_le_bytes(len_buf) as usize;
+                let mut data = vec![0u8; len];
+                if stdin.read_exact(&mut data).is_err() {
+                    break;
+                }
+                // Send new model to the main thread (overwrites if one is already pending)
+                let _ = onnx_tx.try_send(data);
+            }
+        });
+
         loop {
+            // --- HOT RELOAD ONNX MODEL FROM RAM ---
+            // If multiple models arrived while we were generating, just grab the latest one.
+            let mut latest_model: Option<Vec<u8>> = None;
+            while let Ok(model_bytes) = onnx_rx.try_recv() {
+                latest_model = Some(model_bytes);
+            }
+
+            if let Some(model_bytes) = latest_model {
+                if verbose {
+                    eprintln!("[selfplay] Received ONNX model from Python via stdin, hot-reloading...");
+                }
+                match Network::load_from_memory(&model_bytes, device) {
+                    Ok(new_net) => {
+                        network = Arc::new(new_net);
+                    }
+                    Err(e) => {
+                        eprintln!("[selfplay] WARNING: failed to hot-reload ONNX from stdin: {}", e);
+                    }
+                }
+            }
+
             let samples: Vec<Sample> = (0..num_games)
                 .into_par_iter()
                 .enumerate()

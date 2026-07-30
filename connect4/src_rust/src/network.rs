@@ -115,6 +115,16 @@ impl Network {
         })
     }
 
+    /// Load an ONNX model from RAM bytes.
+    pub fn load_from_memory(bytes: &[u8], device: Device) -> Result<Self, Box<dyn std::error::Error>> {
+        let device = device.resolve();
+        let queue = start_dispatcher_from_memory(bytes, device)?;
+        Ok(Network {
+            queue: Some(queue),
+            device,
+        })
+    }
+
     /// Construct a "null" network with no backend. Returns uniform
     /// priors and value=0 — used as a safety net when the ONNX
     /// file is missing.
@@ -165,7 +175,8 @@ impl Network {
 /// Load the model with ort. CUDA if `device == Gpu` and `cuda` feature
 /// compiled in; CPU otherwise.
 pub(crate) fn load_ort(path: &Path, device: Device) -> Result<Session, Box<dyn std::error::Error>> {
-    let mut builder = SessionBuilder::new()?;
+    let mut builder = SessionBuilder::new()?
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?;
 
     #[cfg(feature = "cuda")]
     {
@@ -190,6 +201,33 @@ pub(crate) fn load_ort(path: &Path, device: Device) -> Result<Session, Box<dyn s
     Ok(session)
 }
 
+pub(crate) fn load_ort_from_memory(bytes: &[u8], device: Device) -> Result<Session, Box<dyn std::error::Error>> {
+    let mut builder = SessionBuilder::new()?
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?;
+
+    #[cfg(feature = "cuda")]
+    {
+        if device == Device::Gpu {
+            builder = builder.with_execution_providers([
+                CUDAExecutionProvider::default()
+                    .with_device_id(0)
+                    .build()
+                    .error_on_failure(),
+                CPUExecutionProvider::default().build(),
+            ])?;
+        }
+    }
+
+    if device == Device::Cpu {
+        builder = builder.with_execution_providers([
+            CPUExecutionProvider::default().build(),
+        ])?;
+    }
+
+    let session = builder.commit_from_memory(bytes)?;
+    Ok(session)
+}
+
 // ---------------------------------------------------------------------------
 // ORT Dispatcher
 // ---------------------------------------------------------------------------
@@ -209,6 +247,17 @@ fn start_dispatcher(path: &Path, device: Device) -> Result<InferQueue, Box<dyn s
 
     std::thread::Builder::new()
         .name("ort-dispatcher".to_string())
+        .spawn(move || run_dispatcher(session, rx))?;
+
+    Ok(tx)
+}
+
+fn start_dispatcher_from_memory(bytes: &[u8], device: Device) -> Result<InferQueue, Box<dyn std::error::Error>> {
+    let (tx, rx) = bounded(256);
+    let session = load_ort_from_memory(bytes, device)?;
+    
+    std::thread::Builder::new()
+        .name("ort-dispatcher-ram".to_string())
         .spawn(move || run_dispatcher(session, rx))?;
 
     Ok(tx)
@@ -289,12 +338,9 @@ fn run_dispatcher(mut session: Session, rx: Receiver<InferRequest>) {
         // Dispatch results back to each requester.
         for (i, req) in batch.into_iter().enumerate() {
             let row = &policy_data[i * 7..(i + 1) * 7];
-            let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let exp_row: Vec<f32> = row.iter().map(|x| (x - max).exp()).collect();
-            let sum: f32 = exp_row.iter().sum();
             let mut policy = [0.0f32; 7];
             for c in 0..7 {
-                policy[c] = exp_row[c] / sum;
+                policy[c] = row[c].exp();
             }
             let eval = Eval {
                 policy,

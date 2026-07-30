@@ -196,7 +196,8 @@ def compute_loss(
 
 
 def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET,
-                infer_precision: str = _DEFAULT_INFER_PRECISION) -> None:
+                infer_precision: str = _DEFAULT_INFER_PRECISION,
+                calibration_samples: np.ndarray | None = None) -> None:
     """Export the (already-trained) model to ONNX.
 
     Output contract — the Rust side (network.rs) reads by name:
@@ -268,12 +269,26 @@ def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET,
     onnx_model = onnx.load(onnx_path)
     onnx.checker.check_model(onnx_model)
     if infer_precision == "int8":
-        from onnxruntime.quantization import QuantType, quantize_dynamic
-        quant_model = onnx.load(onnx_path)
-        del quant_model.graph.value_info[:]
-        onnx.save(quant_model, onnx_path)
-        quantize_dynamic(onnx_path, onnx_path, weight_type=QuantType.QInt8,
-                         extra_options={"DisableShapeInference": True})
+        from onnxruntime.quantization import QuantType, quantize_static, QuantFormat, CalibrationDataReader
+        
+        class Connect4CalibrationReader(CalibrationDataReader):
+            def __init__(self, samples_np):
+                self.enum_data = iter([{"input": samples_np}])
+            def get_next(self):
+                return next(self.enum_data, None)
+
+        if calibration_samples is None:
+            # Fallback to random calibration data if none provided
+            import numpy as np
+            calibration_samples = np.random.randn(32, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS).astype(np.float32)
+            
+        reader = Connect4CalibrationReader(calibration_samples)
+        quantize_static(onnx_path, onnx_path, calibration_data_reader=reader,
+                        quant_format=QuantFormat.QOperator,
+                        weight_type=QuantType.QInt8,
+                        activation_type=QuantType.QInt8,
+                        nodes_to_exclude=["node_linear_17", "node_masked_fill"],
+                        extra_options={"DisableShapeInference": True})
         onnx_model = onnx.load(onnx_path)
         onnx.checker.check_model(onnx_model)
 
@@ -488,8 +503,8 @@ def main() -> None:
             "-g", "128", "-s", "200", "-b", "32", "-d", "gpu",
             "-m", str(onnx_model_path), "-o", "-", "--stream"
         ]
-        print("[train] Starting Rust MCTS stream process (ZERO disk I/O, direct RAM stream)...")
-        sp_proc = subprocess.Popen(cargo_cmd, stdout=subprocess.PIPE, stderr=sys.stderr)
+        print("[train] Starting Rust MCTS stream process (ZERO disk I/O, pure RAM IPC)...")
+        sp_proc = subprocess.Popen(cargo_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr)
         ds, loader = None, None
         while ds is None:
             if sp_proc.poll() is not None:
@@ -642,13 +657,17 @@ def main() -> None:
         if sp_proc is not None:
             # Direct RAM streaming from Rust stdout pipe
             if sp_proc.poll() is not None:
+                if done: break
                 raise RuntimeError(f"Rust MCTS process exited unexpectedly with code {sp_proc.returncode}")
             ds, loader = read_stream_batch(sp_proc.stdout)
             while ds is None:
                 if sp_proc.poll() is not None:
+                    if done: break
                     raise RuntimeError(f"Rust MCTS process exited unexpectedly with code {sp_proc.returncode}")
+                if done: break
                 time.sleep(0.1)
                 ds, loader = read_stream_batch(sp_proc.stdout)
+            if done: break
         elif args.data_dir and epoch > 0:
             # Poll data_dir until fresh self-play data arrives from Rust generator
             new_ds, new_loader, _ = load_dynamic_dataset(args.data_dir, args.data, args.max_samples, args.symmetry, args.num_workers, consume=True)
@@ -693,10 +712,16 @@ def main() -> None:
         prefetcher = CudaPrefetcher(loader, torch.device(args.device), channels_last=args.channels_last)
 
         batch_idx = 0
+        calibration_batch = None
         while True:
             batch = prefetcher.next()
             if batch is None: break
             planes, target_policy, target_value, target_moves_left = batch
+            
+            if calibration_batch is None and planes.size(0) > 0:
+                # Save a small subset of the first batch for INT8 static calibration
+                # Convert to float32 numpy arrays as expected by ONNX
+                calibration_batch = planes[:128].detach().cpu().to(torch.float32).numpy()
             
             if args.duration is not None and time.time() - global_start_t >= args.duration:
                 done = True
@@ -773,20 +798,41 @@ def main() -> None:
             or done
         )
         if should_export_onnx:
-            # Export raw ONNX model
-            onnx_path = args.out.replace(".pt", ".onnx")
-            try:
-                export_onnx(inner, onnx_path, opset=args.onnx_opset, infer_precision=args.infer_precision)
-            except Exception as e:
-                pass
-            
-            # Export EMA ONNX model
-            if ema_model is not None:
-                onnx_ema_path = args.out.replace(".pt", "_ema.onnx")
+            if sp_proc is not None and sp_proc.stdin is not None:
+                import tempfile, os
+                with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
+                    tmp_path = tmp.name
                 try:
-                    export_onnx(ema_model, onnx_ema_path, opset=args.onnx_opset, infer_precision=args.infer_precision)
+                    export_onnx(inner, tmp_path, opset=args.onnx_opset, infer_precision=args.infer_precision, calibration_samples=calibration_batch)
+                    with open(tmp_path, "rb") as f:
+                        data = f.read()
+                    # Write length prefix (4 bytes, little-endian) and data to Rust's stdin
+                    sp_proc.stdin.write(len(data).to_bytes(4, byteorder="little"))
+                    sp_proc.stdin.write(data)
+                    sp_proc.stdin.flush()
+                except Exception as e:
+                    print(f"[train] WARNING: ONNX IPC export to Rust failed: {e}")
+                finally:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+            else:
+                # Fallback to disk if not in stream mode
+                onnx_path = args.out.replace(".pt", ".onnx")
+                try:
+                    export_onnx(inner, onnx_path, opset=args.onnx_opset, infer_precision=args.infer_precision, calibration_samples=calibration_batch)
                 except Exception as e:
                     pass
+                
+                # Export EMA ONNX model
+                if ema_model is not None:
+                    onnx_ema_path = args.out.replace(".pt", "_ema.onnx")
+                    try:
+                        export_onnx(ema_model, onnx_ema_path, opset=args.onnx_opset, infer_precision=args.infer_precision, calibration_samples=calibration_batch)
+                    except Exception as e:
+                        pass
 
         t_export = time.time() - t_export_start
         t_epoch_total = time.time() - t_epoch_start
