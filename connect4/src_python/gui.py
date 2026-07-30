@@ -145,8 +145,8 @@ def ai_select(model: Connect4Net, own: int, opp: int, device: torch.device) -> i
     planes = board_to_planes(own, opp)
     x = torch.from_numpy(planes).unsqueeze(0).to(device)
     with torch.no_grad():
-        log_p, v = model(x)
-    p = log_p.exp().cpu().numpy()[0]
+        log_p, v, _ = model(x)
+    p = torch.exp(log_p[0]).cpu().numpy()
     # Mask illegal columns.
     occ = own | opp
     for c in range(7):
@@ -178,8 +178,8 @@ class Game:
     def drop(self, c: int) -> int | None:
         """Drop a piece in column `c` for the current player. Returns the
         row index of the new piece, or None if the column is full."""
-        bb = self.red if self.turn == 0 else self.yellow
-        row = find_row(bb, c)
+        occ = self.red | self.yellow
+        row = find_row(occ, c)
         if row is None:
             return None
         if self.turn == 0:
@@ -227,12 +227,20 @@ def draw_board(screen: pygame.Surface, game: Game) -> None:
     pygame.draw.rect(screen, COLORS["board"], board_rect)
 
     # Pieces.
+    anim_col = -1
+    anim_row = -1
+    if game.anim is not None:
+        anim_col, anim_row, _, _ = game.anim
+        
     for r in range(6):
         for c in range(7):
             cx = 20 + c * CELL_W + CELL_W // 2
             cy = BOARD_TOP + (5 - r) * CELL_H + CELL_H // 2  # row 0 at the bottom
             bit = 1 << (c * 7 + r)
-            if game.red & bit:
+            
+            if c == anim_col and r == anim_row:
+                color = COLORS["hole"]
+            elif game.red & bit:
                 color = COLORS["red"]
             elif game.yellow & bit:
                 color = COLORS["yellow"]
@@ -337,7 +345,7 @@ try:
     _DEFAULT_GUI_MODEL = str(CONFIG.paths.model_pt)
     _DEFAULT_GUI_DEVICE = CONFIG.device.python_device
 except Exception:
-    _DEFAULT_GUI_MODEL = "connect4_model.pt"
+    _DEFAULT_GUI_MODEL = str(_PROJECT_ROOT / "models" / "connect4_model.pt")
     _DEFAULT_GUI_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 

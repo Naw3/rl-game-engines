@@ -78,6 +78,25 @@ warnings.filterwarnings("ignore")
 # PyTorch 2.5+ uses standard python logging for torch.onnx
 # We set the level to ERROR to suppress the verbose export logs.
 logging.getLogger("torch.onnx").setLevel(logging.ERROR)
+
+
+class ExponentialMovingAverage:
+    """Exponential Moving Average (EMA) for PyTorch model weights."""
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {name: param.clone().detach() for name, param in model.named_parameters() if param.requires_grad}
+
+    def update(self, model: torch.nn.Module) -> None:
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in self.shadow:
+                    self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
+
+    def apply_shadow(self, model: torch.nn.Module) -> None:
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in self.shadow:
+                    param.data.copy_(self.shadow[name])
 logging.getLogger("torch.onnx._internal").setLevel(logging.ERROR)
 logging.getLogger("torch.export").setLevel(logging.ERROR)
 
@@ -88,7 +107,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 try:
     from config import CONFIG
     _DEFAULT_DATA = str(CONFIG.paths.selfplay_bin.name)
-    _DEFAULT_OUT = str(CONFIG.paths.model_pt.name)
+    _DEFAULT_OUT = str(CONFIG.paths.model_pt)
     _DEFAULT_EPOCHS = CONFIG.train.epochs
     _DEFAULT_BATCH = CONFIG.train.batch_size
     _DEFAULT_LR = CONFIG.train.learning_rate
@@ -96,6 +115,9 @@ try:
     _DEFAULT_SEED = CONFIG.mcts.seed
     _DEFAULT_NUM_WORKERS = CONFIG.train.num_workers
     _DEFAULT_LOG_EVERY = CONFIG.train.log_every
+    _DEFAULT_ONNX_EVERY = CONFIG.train.onnx_every
+    _DEFAULT_USE_EMA = CONFIG.train.use_ema
+    _DEFAULT_EMA_DECAY = CONFIG.train.ema_decay
     _DEFAULT_OPSET = CONFIG.dataset.onnx_opset
     _DEFAULT_PLANES = CONFIG.network.input_planes
     _DEFAULT_ROWS = CONFIG.network.board_rows
@@ -112,7 +134,7 @@ try:
 except Exception as err:
     print(f"[train] WARNING: Failed to load config.py ({err}); using fallbacks")
     _DEFAULT_DATA = "selfplay.bin"
-    _DEFAULT_OUT = "connect4_model.pt"
+    _DEFAULT_OUT = str(_PROJECT_ROOT / "models" / "connect4_model.pt")
     _DEFAULT_EPOCHS = 5
     _DEFAULT_BATCH = 256
     _DEFAULT_LR = 1e-3
@@ -120,6 +142,9 @@ except Exception as err:
     _DEFAULT_SEED = 42
     _DEFAULT_NUM_WORKERS = 0
     _DEFAULT_LOG_EVERY = 20
+    _DEFAULT_ONNX_EVERY = 0
+    _DEFAULT_USE_EMA = True
+    _DEFAULT_EMA_DECAY = 0.999
     _DEFAULT_OPSET = 18
     _DEFAULT_PLANES = 3
     _DEFAULT_ROWS = 6
@@ -154,16 +179,20 @@ from model import Connect4Net
 def compute_loss(
     log_p: torch.Tensor,
     v: torch.Tensor,
+    m: torch.Tensor,
     target_policy: torch.Tensor,
     target_value: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Returns (total_loss, policy_loss, value_loss)."""
+    target_moves_left: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Returns (total_loss, policy_loss, value_loss, moves_left_loss)."""
     # Policy: cross-entropy with soft targets. target_policy is (B, 7),
     # log_p is (B, 7) of log-probabilities. Sum over columns, mean over batch.
     policy_loss = -(target_policy * log_p).sum(dim=1).mean()
     # Value: standard MSE.
     value_loss = F.mse_loss(v, target_value)
-    return policy_loss + value_loss, policy_loss, value_loss
+    # Moves left: standard MSE, scaled down to prevent dominating the gradients.
+    moves_left_loss = F.mse_loss(m, target_moves_left) * 0.02
+    return policy_loss + value_loss + moves_left_loss, policy_loss, value_loss, moves_left_loss
 
 
 def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET,
@@ -191,15 +220,16 @@ def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET,
         raise ValueError(f"Unsupported inference precision: {infer_precision}")
     if infer_precision == "fp16":
         model_cpu = model_cpu.half()
-        dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS, dtype=torch.float16)
+        dummy = torch.randn(2, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS, dtype=torch.float16)
     else:
-        dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS)
+        dummy = torch.randn(2, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS)
     model_cpu.eval()
 
     dynamic_axes = {
         "input": {0: "batch_size"},
         "policy": {0: "batch_size"},
         "value": {0: "batch_size"},
+        "moves_left": {0: "batch_size"},
     }
     import os, sys
     class SuppressOutput:
@@ -228,7 +258,7 @@ def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET,
         (dummy,),
         onnx_path,
         input_names=["input"],
-        output_names=["policy", "value"],
+        output_names=["policy", "value", "moves_left"],
         dynamic_axes=dynamic_axes,
         opset_version=opset,
         do_constant_folding=True,
@@ -249,8 +279,8 @@ def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET,
 
 
 class _ReplayDataset(torch.utils.data.Dataset):
-    def __init__(self, planes, policy, value):
-        self._planes, self._policy, self._value = planes, policy, value
+    def __init__(self, planes, policy, value, moves_left):
+        self._planes, self._policy, self._value, self._moves_left = planes, policy, value, moves_left
         self.count = len(planes)
         self.symmetry = False
     def __len__(self): return self.count
@@ -258,13 +288,15 @@ class _ReplayDataset(torch.utils.data.Dataset):
         planes = self._planes[idx]
         policy = self._policy[idx]
         value = self._value[idx]
+        moves_left = self._moves_left[idx]
         if self.symmetry:
             if random.random() < 0.5:
                 planes = planes[:, :, ::-1].copy()
                 policy = policy[::-1].copy()
         return (torch.from_numpy(planes),
                 torch.from_numpy(policy),
-                torch.tensor(value, dtype=torch.float32))
+                torch.tensor(value, dtype=torch.float32),
+                torch.tensor(moves_left, dtype=torch.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +328,8 @@ class CudaPrefetcher:
             self.next_batch = (
                 planes,
                 self.next_batch[1].to(self.device, non_blocking=True),
-                self.next_batch[2].to(self.device, non_blocking=True)
+                self.next_batch[2].to(self.device, non_blocking=True),
+                self.next_batch[3].to(self.device, non_blocking=True)
             )
 
     def next(self):
@@ -306,6 +339,7 @@ class CudaPrefetcher:
             batch[0].record_stream(torch.cuda.current_stream())
             batch[1].record_stream(torch.cuda.current_stream())
             batch[2].record_stream(torch.cuda.current_stream())
+            batch[3].record_stream(torch.cuda.current_stream())
             self.preload()
         return batch
 
@@ -344,6 +378,9 @@ def main() -> None:
     p.add_argument("--max-samples", type=int, default=None,
                    help="cap dataset size (for quick smoke tests)")
     p.add_argument("--log-every", type=int, default=_DEFAULT_LOG_EVERY)
+    p.add_argument("--onnx-every", type=int, default=_DEFAULT_ONNX_EVERY, help="Frequency (in epochs) to export ONNX model (0 = export only at final epoch)")
+    p.add_argument("--use-ema", action="store_true", default=_DEFAULT_USE_EMA, help="enable Exponential Moving Average (EMA) of model weights")
+    p.add_argument("--ema-decay", type=float, default=_DEFAULT_EMA_DECAY, help="EMA decay rate (default: 0.999)")
     p.add_argument("--channels-last", action="store_true", default=_DEFAULT_CHANNELS_LAST, help="use channels_last memory format")
     p.add_argument("--fused-adamw", action="store_true", default=_DEFAULT_FUSED_ADAMW, help="use fused AdamW optimizer")
     p.add_argument("--symmetry", action="store_true", default=_DEFAULT_SYMMETRY,
@@ -358,6 +395,9 @@ def main() -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
+
+    if args.compile_mode == "none":
+        args.no_compile = True
 
     # Resolve `--device auto` to a concrete device based on CUDA availability.
     if args.device == "auto":
@@ -379,82 +419,166 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
         print("[train] enabled cudnn.benchmark for faster convolutions")
 
-    # ---- Data -------------------------------------------------------------
-    # If --data-dir is set, load all C4D1 files in it (replay buffer).
-    # Otherwise load the single --data file.
-    if args.data_dir:
-        from dataset import C4Dataset, decode_bitboard_batched
-        import os, glob
-        bin_files = sorted(glob.glob(os.path.join(args.data_dir, "*.bin")))
-        if not bin_files:
-            print(f"[train] no .bin files found in {args.data_dir} — aborting")
-            return
-        print(f"[train] replay buffer: {len(bin_files)} file(s) from {args.data_dir}")
-        # Concatenate all samples in memory then build one big planes array.
-        all_own, all_opp, all_policy, all_value = [], [], [], []
-        for f in bin_files:
-            sub = C4Dataset(f, max_samples=args.max_samples)
-            print(f"  - {f}: {len(sub):,} samples")
-            all_own.append(sub._own);  all_opp.append(sub._opp)
-            all_policy.append(sub._policy); all_value.append(sub._value)
-            if args.max_samples is not None and sum(len(x) for x in all_own) >= args.max_samples:
-                break
-        import numpy as np
-        own_arr   = np.concatenate(all_own)
-        opp_arr   = np.concatenate(all_opp)
-        policy_arr = np.concatenate(all_policy)
-        value_arr = np.concatenate(all_value)
-        if args.max_samples is not None and len(own_arr) > args.max_samples:
-            own_arr, opp_arr = own_arr[:args.max_samples], opp_arr[:args.max_samples]
-            policy_arr, value_arr = policy_arr[:args.max_samples], value_arr[:args.max_samples]
-        planes_arr = decode_bitboard_batched(own_arr, opp_arr)
-        
-        ds = _ReplayDataset(planes_arr, policy_arr, value_arr)
-        ds.symmetry = args.symmetry
-        if args.symmetry:
-            print("[train] symmetry augmentation ON (horizontal flip, 50/50)")
-        
-        if args.num_workers is None:
-            args.num_workers = 0  # 0 is vastly faster on Windows for small memory-loaded datasets (no process spawn overhead)
-        n = len(ds)
-        n_pos = int((value_arr > 0).sum()); n_neg = int((value_arr < 0).sum())
-        print(f"[train] replay dataset: {n:,} samples | wins={n_pos} losses={n_neg} draws={n - n_pos - n_neg}")
-    else:
-        ds = C4Dataset(args.data, max_samples=args.max_samples)
-        ds.symmetry = args.symmetry
-        if args.symmetry:
-            print("[train] symmetry augmentation ON (horizontal flip, 50/50)")
-        print(f"[train] dataset: {ds.stats()}")
-    loader = DataLoader(
-        ds,
-        batch_size=args.batch,
-        shuffle=True,
-        num_workers=args.num_workers if args.num_workers is not None else _DEFAULT_NUM_WORKERS,
-        pin_memory=(args.device != "cpu"),
-        drop_last=(len(ds) > args.batch),
-    )
-
     # ---- Model ------------------------------------------------------------
     model = Connect4Net().to(args.device)
+    out_path = Path(args.out)
+    if out_path.exists():
+        print(f"[train] Loading existing weights from {out_path} to resume training...")
+        try:
+            state_dict = torch.load(out_path, map_location=args.device, weights_only=True)
+            model.load_state_dict(state_dict)
+            print("[train] Successfully restored model weights!")
+        except Exception as e:
+            print(f"[train] WARNING: Could not load existing weights from {out_path} ({e}); starting with fresh weights")
+
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
     n_params = model.num_parameters()
     print(f"[train] model: {n_params:,} parameters")
 
+    # ---- Stream Reader Helper (Read Rust MCTS stdout directly into RAM) ----
+    def read_stream_batch(stream):
+        import struct
+        header = stream.read(16)
+        if not header or len(header) < 16:
+            return None, None
+        magic = header[:4]
+        if magic != b"C4D1":
+            return None, None
+        (count, n_games) = struct.unpack("<II", header[4:12])
+        if count == 0:
+            return None, None
+        
+        n_bytes = count * 60
+        buf = bytearray()
+        while len(buf) < n_bytes:
+            chunk = stream.read(n_bytes - len(buf))
+            if not chunk:
+                break
+            buf.extend(chunk)
+        if len(buf) < n_bytes:
+            return None, None
+        
+        import numpy as np
+        from dataset import decode_bitboard_batched
+        # Parse 60-byte structs from RAM buffer
+        raw_arr = np.frombuffer(buf, dtype=np.uint8).reshape(count, 60)
+        own_arr = raw_arr[:, 0:8].view(np.uint64).reshape(count)
+        opp_arr = raw_arr[:, 8:16].view(np.uint64).reshape(count)
+        policy_arr = raw_arr[:, 24:52].view(np.float32).reshape(count, 7)
+        value_arr = raw_arr[:, 52:56].view(np.float32).reshape(count)
+        moves_left_arr = raw_arr[:, 56:60].view(np.float32).reshape(count)
+
+        planes_arr = decode_bitboard_batched(own_arr, opp_arr)
+        ds = _ReplayDataset(planes_arr, policy_arr, value_arr, moves_left_arr)
+        ds.symmetry = args.symmetry
+        ds.n_games = n_games if n_games > 0 else 128
+        loader = DataLoader(ds, batch_size=args.batch, shuffle=True, num_workers=0,
+                            pin_memory=(args.device != "cpu"), drop_last=(len(ds) > args.batch))
+        return ds, loader
+
+    # ---- Dataset Setup (Consume-on-Train Queue / RAM Stream) ----------------
+    sp_proc = None
+    if args.data == "-" or args.data_dir == "-":
+        import subprocess
+        onnx_model_path = Path(args.out).with_suffix(".onnx").resolve()
+        cargo_cmd = [
+            "cargo", "run", "--release", "--features", "cuda",
+            "--manifest-path", "../src_rust/Cargo.toml", "--",
+            "-g", "128", "-s", "200", "-b", "32", "-d", "gpu",
+            "-m", str(onnx_model_path), "-o", "-", "--stream"
+        ]
+        print("[train] Starting Rust MCTS stream process (ZERO disk I/O, direct RAM stream)...")
+        sp_proc = subprocess.Popen(cargo_cmd, stdout=subprocess.PIPE, stderr=sys.stderr)
+        ds, loader = None, None
+        while ds is None:
+            if sp_proc.poll() is not None:
+                raise RuntimeError(f"Rust MCTS process exited unexpectedly with code {sp_proc.returncode}")
+            ds, loader = read_stream_batch(sp_proc.stdout)
+            if ds is None:
+                time.sleep(0.1)
+    else:
+        # Disk-based dataset loading
+        def load_dynamic_dataset(data_dir, data_file, max_samples, symmetry, num_workers_cfg, consume=False):
+            if data_dir:
+                from dataset import C4Dataset, decode_bitboard_batched
+                import os, glob
+                bin_files = sorted(glob.glob(os.path.join(data_dir, "*.bin")))
+                if not bin_files:
+                    return None, None, []
+                
+                all_own, all_opp, all_policy, all_value, all_moves_left = [], [], [], [], []
+                loaded_files = []
+                for f in bin_files:
+                    try:
+                        sub = C4Dataset(f, max_samples=max_samples)
+                        if len(sub) > 0:
+                            all_own.append(sub._own)
+                            all_opp.append(sub._opp)
+                            all_policy.append(sub._policy)
+                            all_value.append(sub._value)
+                            all_moves_left.append(getattr(sub, "_moves_left", np.zeros_like(sub._value)))
+                            loaded_files.append(f)
+                    except Exception as e:
+                        continue
+
+                if not loaded_files:
+                    return None, None, []
+
+                import numpy as np
+                own_arr = np.concatenate(all_own)
+                opp_arr = np.concatenate(all_opp)
+                policy_arr = np.concatenate(all_policy)
+                value_arr = np.concatenate(all_value)
+                moves_left_arr = np.concatenate(all_moves_left)
+                if max_samples is not None and len(own_arr) > max_samples:
+                    own_arr, opp_arr = own_arr[:max_samples], opp_arr[:max_samples]
+                    policy_arr, value_arr, moves_left_arr = policy_arr[:max_samples], value_arr[:max_samples], moves_left_arr[:max_samples]
+                planes_arr = decode_bitboard_batched(own_arr, opp_arr)
+                ds = _ReplayDataset(planes_arr, policy_arr, value_arr, moves_left_arr)
+                ds.symmetry = symmetry
+
+                if consume:
+                    for f in loaded_files:
+                        try:
+                            os.remove(f)
+                        except OSError:
+                            pass
+
+                workers = 0
+                loader = DataLoader(ds, batch_size=args.batch, shuffle=True, num_workers=workers,
+                                    pin_memory=(args.device != "cpu"), drop_last=(len(ds) > args.batch))
+                return ds, loader, loaded_files
+            else:
+                ds = C4Dataset(data_file, max_samples=max_samples)
+                ds.symmetry = symmetry
+                workers = num_workers_cfg if num_workers_cfg is not None else _DEFAULT_NUM_WORKERS
+                loader = DataLoader(ds, batch_size=args.batch, shuffle=True, num_workers=workers,
+                                    pin_memory=(args.device != "cpu"), drop_last=(len(ds) > args.batch))
+                return ds, loader, [data_file]
+
+        print(f"[train] Waiting for self-play data from Rust generator in {args.data_dir or args.data}...")
+        ds, loader, loaded_files = None, None, []
+        while ds is None or len(ds) == 0:
+            ds, loader, loaded_files = load_dynamic_dataset(args.data_dir, args.data, args.max_samples, args.symmetry, args.num_workers, consume=True)
+            if ds is None or len(ds) == 0:
+                time.sleep(0.2)
+
+    # ---- Optimizer / Scheduler / EMA / Compile -----------------------------
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=args.fused_adamw
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs * len(loader)
+        optimizer, T_max=args.epochs * max(1, len(loader))
     )
 
     use_amp = (not args.no_amp) and args.device.startswith("cuda")
     scaler = GradScaler(enabled=use_amp)
+    ema = ExponentialMovingAverage(model, decay=args.ema_decay) if args.use_ema else None
+    if args.use_ema:
+        print(f"[train] Exponential Moving Average (EMA) enabled (decay={args.ema_decay})")
 
     if not args.no_compile and hasattr(torch, "compile"):
-        # Triton is the inductor backend torch.compile uses for CUDA codegen.
-        # On Windows it has no compatible wheel from PyPI — the import fails
-        # and torch.compile crashes at first forward. Auto-detect and skip.
         try:
             import triton  # noqa: F401
             model = torch.compile(model, mode=args.compile_mode)
@@ -468,21 +592,18 @@ def main() -> None:
     print("[train] warming up model to trigger compilation...")
     model.train()
     
-    # We run 10 warmup steps to fully capture CUDA graphs (reduce-overhead).
-    # Since drop_last is True (if len(ds) > batch), the shapes are perfectly stable.
-    # We also do a full optimizer step to force lazy initialization of AdamW states.
     warmup_steps = 10
     steps_done = 0
     if len(ds) > 0:
         while steps_done < warmup_steps:
             for warmup_batch in loader:
-                wp, wtp, wtv = [x.to(args.device) for x in warmup_batch]
+                wp, wtp, wtv, wtm = [x.to(args.device) for x in warmup_batch]
                 if args.channels_last:
                     wp = wp.to(memory_format=torch.channels_last)
                 optimizer.zero_grad(set_to_none=True)
                 with autocast(enabled=use_amp, device_type="cuda" if use_amp else "cpu", dtype=torch.float16 if use_amp else None):
-                    w_log_p, w_v = model(wp)
-                    w_loss, _, _ = compute_loss(w_log_p, w_v, wtp, wtv)
+                    w_log_p, w_v, w_m = model(wp)
+                    w_loss, _, _, _ = compute_loss(w_log_p, w_v, w_m, wtp, wtv, wtm)
                 scaler.scale(w_loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=_DEFAULT_MAX_GRAD_NORM)
@@ -497,43 +618,67 @@ def main() -> None:
                     break
     print("[train] warmup complete.")
 
-    # ---- Train ------------------------------------------------------------
+    # ---- Train Loop -------------------------------------------------------
     best_loss = float("inf")
     global_start_t = time.time()
     total_samples = 0
     epoch = 0
     done = False
+    _prev = None
 
-    # Pending display info for previous epoch (delayed by 1 epoch for free GPU sync).
-    _prev = None  # (start_evt, end_evt, n_samples_epoch, avg_tot, avg_pol, avg_val, lr, v_item, epoch_str, done_flag)
+    import signal
+    def handle_sigint(sig, frame):
+        nonlocal done
+        print("\n[train] Caught KeyboardInterrupt (Ctrl+C). Gracefully stopping and saving the model...")
+        done = True
+    signal.signal(signal.SIGINT, handle_sigint)
 
     while not done:
+        t_epoch_start = time.time()
         model.train()
 
-        # --- Sync & print the PREVIOUS epoch now (GPU is already busy on current epoch) ---
+        # 1. Measure dataset reload / queue waiting time
+        t_data_start = time.time()
+        if sp_proc is not None:
+            # Direct RAM streaming from Rust stdout pipe
+            if sp_proc.poll() is not None:
+                raise RuntimeError(f"Rust MCTS process exited unexpectedly with code {sp_proc.returncode}")
+            ds, loader = read_stream_batch(sp_proc.stdout)
+            while ds is None:
+                if sp_proc.poll() is not None:
+                    raise RuntimeError(f"Rust MCTS process exited unexpectedly with code {sp_proc.returncode}")
+                time.sleep(0.1)
+                ds, loader = read_stream_batch(sp_proc.stdout)
+        elif args.data_dir and epoch > 0:
+            # Poll data_dir until fresh self-play data arrives from Rust generator
+            new_ds, new_loader, _ = load_dynamic_dataset(args.data_dir, args.data, args.max_samples, args.symmetry, args.num_workers, consume=True)
+            while new_ds is None or len(new_ds) == 0:
+                time.sleep(0.1)
+                new_ds, new_loader, _ = load_dynamic_dataset(args.data_dir, args.data, args.max_samples, args.symmetry, args.num_workers, consume=True)
+            ds, loader = new_ds, new_loader
+        t_data = time.time() - t_data_start
+
         if _prev is not None:
-            (p_se, p_ee, p_ns, p_avg_tot, p_avg_pol, p_avg_val, p_lr, p_v, p_estr, p_bl) = _prev
+            (p_se, p_ee, p_ns, p_avg_tot, p_avg_pol, p_avg_val, p_avg_mvl, p_lr, p_v, p_estr, p_bl, p_tdata, p_texport, p_ttot) = _prev
             if args.device == "cuda":
-                gpu_ms = p_se.elapsed_time(p_ee)   # sync is ~free: GPU is executing current epoch
-                p_sps = p_ns / (gpu_ms / 1000)
+                gpu_ms = p_se.elapsed_time(p_ee)
+                p_train_sec = gpu_ms / 1000.0
             else:
-                p_sps = p_ns / max(0.001, p_ee)    # p_ee is wall-clock seconds on CPU
+                p_train_sec = p_ee
+            p_sps = p_ns / max(0.001, p_train_sec)
+            p_tother = max(0.0, p_ttot - p_train_sec - p_tdata - p_texport)
             total_time_so_far = time.time() - global_start_t
+            n_g = getattr(ds, "n_games", 128)
             print(
-                f"[train] {p_estr} done in {gpu_ms/1000:.2f}s (tot: {total_time_so_far:.1f}s) "
+                f"[train] {p_estr} done in {p_ttot:.2f}s (train={p_train_sec:.2f}s, data={p_tdata:.2f}s, ema/export={p_texport:.2f}s, other={p_tother:.2f}s | tot={total_time_so_far:.1f}s) "
                 f"({p_sps:.0f} samples/s) | loss={p_avg_tot:.4f} "
-                f"(policy={p_avg_pol:.4f}, value={p_avg_val:.4f}) lr={p_lr:.2e} | "
-                f"sample val={p_v:+.3f}"
-            ) if args.device == "cuda" else print(
-                f"[train] {p_estr} done in {p_ee:.2f}s (tot: {total_time_so_far:.1f}s) "
-                f"({p_sps:.0f} samples/s) | loss={p_avg_tot:.4f} "
-                f"(policy={p_avg_pol:.4f}, value={p_avg_val:.4f}) lr={p_lr:.2e} | "
-                f"sample val={p_v:+.3f}"
+                f"(policy={p_avg_pol:.4f}, value={p_avg_val:.4f}, mvl={p_avg_mvl:.4f}) lr={p_lr:.2e} | "
+                f"samples={len(ds):,} | games={n_g:,}"
             )
             if p_bl and p_avg_tot < best_loss:
                 best_loss = p_avg_tot
 
-        # --- Start current epoch ---
+        # 2. Measure CUDA training time
         if args.device == "cuda":
             epoch_start_evt = torch.cuda.Event(enable_timing=True)
             epoch_end_evt   = torch.cuda.Event(enable_timing=True)
@@ -542,7 +687,7 @@ def main() -> None:
             epoch_start_evt = time.time()
 
         t0 = time.time()
-        running = {"total": 0.0, "policy": 0.0, "value": 0.0}
+        running = {"total": 0.0, "policy": 0.0, "value": 0.0, "moves_left": 0.0}
         n_batches = 0
         samples_this_epoch = 0
         prefetcher = CudaPrefetcher(loader, torch.device(args.device), channels_last=args.channels_last)
@@ -551,7 +696,7 @@ def main() -> None:
         while True:
             batch = prefetcher.next()
             if batch is None: break
-            planes, target_policy, target_value = batch
+            planes, target_policy, target_value, target_moves_left = batch
             
             if args.duration is not None and time.time() - global_start_t >= args.duration:
                 done = True
@@ -560,9 +705,9 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
 
             with autocast(enabled=use_amp, device_type="cuda" if use_amp else "cpu", dtype=torch.float16 if use_amp else None):
-                log_p, v = model(planes)
-                loss, policy_loss, value_loss = compute_loss(
-                    log_p, v, target_policy, target_value
+                log_p, v, m = model(planes)
+                loss, policy_loss, value_loss, moves_left_loss = compute_loss(
+                    log_p, v, m, target_policy, target_value, target_moves_left
                 )
 
             scaler.scale(loss).backward()
@@ -570,11 +715,14 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=_DEFAULT_MAX_GRAD_NORM)
             scaler.step(optimizer)
             scaler.update()
+            if ema is not None:
+                ema.update(model)
             scheduler.step()
 
             running["total"] += loss.detach()
             running["policy"] += policy_loss.detach()
             running["value"] += value_loss.detach()
+            running["moves_left"] += moves_left_loss.detach()
             n_batches += 1
             total_samples += planes.size(0)
             samples_this_epoch += planes.size(0)
@@ -582,46 +730,78 @@ def main() -> None:
             if (batch_idx + 1) % args.log_every == 0:
                 avg = {k: (v.item() if isinstance(v, torch.Tensor) else v) / n_batches for k, v in running.items()}
                 lr = scheduler.get_last_lr()[0]
-                if args.duration is not None:
-                    epoch_str = f"epoch {epoch+1}"
-                else:
-                    epoch_str = f"epoch {epoch+1}/{args.epochs}"
+                epoch_str = f"epoch {epoch+1}/{args.epochs}"
                 print(
                     f"[train] {epoch_str}  "
                     f"batch {batch_idx+1}/{len(loader)}  "
                     f"loss={avg['total']:.4f}  policy={avg['policy']:.4f}  "
-                    f"value={avg['value']:.4f}  lr={lr:.2e}  "
+                    f"value={avg['value']:.4f}  mvl={avg['moves_left']:.4f}  lr={lr:.2e}  "
                     f"({(time.time()-t0):.1f}s)"
                 )
-                running = {"total": 0.0, "policy": 0.0, "value": 0.0}
+                running = {"total": 0.0, "policy": 0.0, "value": 0.0, "moves_left": 0.0}
                 n_batches = 0
             batch_idx += 1
 
         if batch_idx == 0:
-            # We didn't process a single batch (e.g. duration limit hit immediately).
-            # Don't record this as an epoch.
             break
 
-        # Record end of epoch on GPU stream (non-blocking)
         if args.device == "cuda":
             epoch_end_evt.record()
         else:
             epoch_end_evt = time.time() - epoch_start_evt
 
-        # Collect stats for display (these .item() calls happen while GPU runs next epoch)
+        # 3. Measure model save & ONNX export time (both raw & EMA)
+        t_export_start = time.time()
+        inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+        
+        # Save raw PyTorch model
+        inner.save(args.out)
+
+        # Save EMA PyTorch model if active
+        if 'ema' in locals() and ema is not None:
+            import copy
+            ema_model = copy.deepcopy(inner)
+            ema.apply_shadow(ema_model)
+            ema_pt_path = args.out.replace(".pt", "_ema.pt")
+            ema_model.save(ema_pt_path)
+        else:
+            ema_model = None
+
+        should_export_onnx = (not args.no_onnx) and (
+            (args.onnx_every > 0 and (epoch + 1) % args.onnx_every == 0)
+            or (epoch == args.epochs - 1)
+            or done
+        )
+        if should_export_onnx:
+            # Export raw ONNX model
+            onnx_path = args.out.replace(".pt", ".onnx")
+            try:
+                export_onnx(inner, onnx_path, opset=args.onnx_opset, infer_precision=args.infer_precision)
+            except Exception as e:
+                pass
+            
+            # Export EMA ONNX model
+            if ema_model is not None:
+                onnx_ema_path = args.out.replace(".pt", "_ema.onnx")
+                try:
+                    export_onnx(ema_model, onnx_ema_path, opset=args.onnx_opset, infer_precision=args.infer_precision)
+                except Exception as e:
+                    pass
+
+        t_export = time.time() - t_export_start
+        t_epoch_total = time.time() - t_epoch_start
+
         v_item = v[-1].item() if isinstance(v, torch.Tensor) and v.numel() > 0 else 0.0
         avg_tot = running["total"].item() / max(1, n_batches) if isinstance(running["total"], torch.Tensor) else 0.0
         avg_pol = running["policy"].item() / max(1, n_batches) if isinstance(running["policy"], torch.Tensor) else 0.0
         avg_val = running["value"].item() / max(1, n_batches) if isinstance(running["value"], torch.Tensor) else 0.0
+        avg_mvl = running["moves_left"].item() / max(1, n_batches) if isinstance(running["moves_left"], torch.Tensor) else 0.0
         lr = scheduler.get_last_lr()[0]
 
-        if args.duration is not None:
-            epoch_str = f"epoch {epoch+1:2d}"
-        else:
-            epoch_str = f"epoch {epoch+1:2d}/{args.epochs}"
-
+        epoch_str = f"epoch {epoch+1:2d}/{args.epochs}"
         _prev = (epoch_start_evt, epoch_end_evt, samples_this_epoch,
-                 avg_tot, avg_pol, avg_val, lr, v_item, epoch_str, n_batches > 0)
+                 avg_tot, avg_pol, avg_val, avg_mvl, lr, v_item, epoch_str, n_batches > 0,
+                 t_data, t_export, t_epoch_total)
 
         if done or (args.duration is None and epoch >= args.epochs - 1):
             done = True
@@ -630,19 +810,20 @@ def main() -> None:
 
     # Print the last epoch (sync after training is done, no pipeline to preserve)
     if _prev is not None:
-        (p_se, p_ee, p_ns, p_avg_tot, p_avg_pol, p_avg_val, p_lr, p_v, p_estr, p_bl) = _prev
+        (p_se, p_ee, p_ns, p_avg_tot, p_avg_pol, p_avg_val, p_avg_mvl, p_lr, p_v, p_estr, p_bl, p_tdata, p_texport, p_ttot) = _prev
         if args.device == "cuda":
             p_se.synchronize()
             gpu_ms = p_se.elapsed_time(p_ee)
-            p_sps = p_ns / (gpu_ms / 1000)
+            p_train_sec = gpu_ms / 1000.0
         else:
-            p_sps = p_ns / max(0.001, p_ee)
-            gpu_ms = p_ee * 1000
+            p_train_sec = p_ee
+        p_sps = p_ns / max(0.001, p_train_sec)
+        p_tother = max(0.0, p_ttot - p_train_sec - p_tdata - p_texport)
         total_time_so_far = time.time() - global_start_t
         print(
-            f"[train] {p_estr} done in {gpu_ms/1000:.2f}s (tot: {total_time_so_far:.1f}s) "
+            f"[train] {p_estr} done in {p_ttot:.2f}s (train={p_train_sec:.2f}s, data={p_tdata:.2f}s, ema/export={p_texport:.2f}s, other={p_tother:.2f}s | tot={total_time_so_far:.1f}s) "
             f"({p_sps:.0f} samples/s) | loss={p_avg_tot:.4f} "
-            f"(policy={p_avg_pol:.4f}, value={p_avg_val:.4f}) lr={p_lr:.2e} | "
+            f"(policy={p_avg_pol:.4f}, value={p_avg_val:.4f}, mvl={p_avg_mvl:.4f}) lr={p_lr:.2e} | "
             f"sample val={p_v:+.3f}"
         )
         if p_bl and p_avg_tot < best_loss:
@@ -679,6 +860,12 @@ def main() -> None:
         except Exception as e:
             print(f"[train] WARNING: ONNX export failed: {e}")
             print(f"[train] Rust MCTS will fall back to null network on the next cycle.")
+
+    if sp_proc is not None:
+        try:
+            sp_proc.terminate()
+        except Exception:
+            pass
 
     print(f"[train] done. best epoch loss = {best_loss:.4f}")
 

@@ -127,13 +127,13 @@ Available env vars:
 
 | Var             | Default | Notes                                                              |
 |-----------------|---------|--------------------------------------------------------------------|
-| `GAMES`         | `64`    | self-play games per cycle                                          |
+| `GAMES`         | `128`   | self-play games per cycle                                          |
 | `SIMS`          | `800`   | MCTS simulations per move                                          |
 | `EPOCHS`        | `5`     | training epochs per cycle                                          |
 | `BATCH`         | `256`   | training batch size                                                |
 | `DATA`          | `selfplay.bin` | path to the C4D1 dataset file                              |
-| `MODEL`         | `connect4_model.pt`    | output path for the trained `.pt`              |
-| `MODEL_ONNX`    | `connect4_model.onnx`  | output path for the ONNX export                |
+| `MODEL`         | `models/connect4_model.pt`    | output path for the trained `.pt`              |
+| `MODEL_ONNX`    | `models/connect4_model.onnx`  | output path for the ONNX export                |
 | `SLEEP`         | `2`     | seconds between cycles                                             |
 | `CARGO`         | `cargo` | cargo binary path                                                  |
 | `PYTHON`        | `python`| python binary path                                                 |
@@ -147,10 +147,10 @@ Only the Rust side varies between CPU (`ort-cpu`) and GPU (`ort`+CUDA).
 
 ### Play against the model
 
-Once you have a trained `connect4_model.pt`:
+Once you have a trained model:
 
 ```bash
-python src_python/gui.py --model connect4_model.pt
+python src_python/gui.py --model models/connect4_model.pt
 ```
 
 The human plays Red, the AI plays Yellow. Left-click to drop a piece. Press
@@ -169,13 +169,13 @@ Push-Location src_rust
 cargo run --release -- -g 64 -s 800 -o ..\selfplay.bin -v
 Pop-Location
 
-# 2. Train + ONNX re-export.
+# 2. Train + ONNX re-export (resumes automatically if models/connect4_model.pt exists).
 Push-Location src_python
-python train.py --data ..\selfplay.bin --out ..\connect4_model.pt
+python train.py --data ..\selfplay.bin --out ..\models\connect4_model.pt
 Pop-Location
 
 # 3. Play.
-python gui.py --model ..\connect4_model.pt
+python gui.py --model ..\models\connect4_model.pt
 ```
 
 ---

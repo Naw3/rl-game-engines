@@ -13,7 +13,8 @@ dependencies = [
     "onnxruntime>=1.27.0",
     "nvidia-cudnn-cu12",
     "nvidia-cublas-cu12",
-    "triton-windows==3.7.1.post27"
+    "triton-windows==3.7.1.post27",
+    "pygame-ce>=2.5.7",
 ]
 
 [tool.uv.sources]

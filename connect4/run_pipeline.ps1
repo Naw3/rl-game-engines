@@ -34,39 +34,52 @@ if (Test-Path $configScript) {
     try {
         $envCode = & $PYTHON $configScript --powershell 2>$null
         if ($LASTEXITCODE -eq 0 -and $envCode) {
-            Invoke-Expression $envCode
+            Invoke-Expression ($envCode -join "`n")
             Write-Host "[pipeline] Loaded configuration from config.py" -ForegroundColor Cyan
         }
-    } catch {}
+    } catch {
+        Write-Warning "[pipeline] Failed to parse config.py output: $_"
+    }
 }
 
 # --- Defaults / env --------------------------------------------------------
-$GAMES            = if ($env:GAMES)            { [int]$env:GAMES }            else { 64 }
+$GAMES            = if ($env:GAMES)            { [int]$env:GAMES }            else { 128 }
 $SIMS             = if ($env:SIMS)             { [int]$env:SIMS }             else { 800 }
-$EPOCHS           = if ($env:EPOCHS)           { [int]$env:EPOCHS }           else { 5 }
+$C_PUCT           = if ($env:C_PUCT)           { [float]$env:C_PUCT }         else { 1.5 }
+$TEMPERATURE      = if ($env:TEMPERATURE)      { [float]$env:TEMPERATURE }    else { 1.0 }
+$EPOCHS           = if ($env:EPOCHS)           { [int]$env:EPOCHS }           else { 1000000 }
 $BATCH            = if ($env:TRAIN_BATCH_SIZE) { [int]$env:TRAIN_BATCH_SIZE } else { if ($env:BATCH) { [int]$env:BATCH } else { 256 } }
+$LEARNING_RATE    = if ($env:LEARNING_RATE)    { $env:LEARNING_RATE }         else { "1e-3" }
+$WEIGHT_DECAY     = if ($env:WEIGHT_DECAY)     { $env:WEIGHT_DECAY }          else { "1e-4" }
+$COMPILE_MODE     = if ($env:COMPILE_MODE)     { $env:COMPILE_MODE }          else { "none" }
+$INFER_PRECISION  = if ($env:INFER_PRECISION)  { $env:INFER_PRECISION }       else { "fp32" }
+$ONNX_EVERY       = if ($env:ONNX_EVERY)       { [int]$env:ONNX_EVERY }       else { 0 }
 $DATA             = if ($env:DATA)             { $env:DATA }                  else { "selfplay.bin" }
-$MODEL            = if ($env:MODEL)            { $env:MODEL }                 else { "connect4_model.pt" }
-$MODEL_ONNX       = if ($env:MODEL_ONNX)       { $env:MODEL_ONNX }            else { "connect4_model.onnx" }
+$MODEL            = if ($env:MODEL)            { $env:MODEL }                 else { "models\connect4_model.pt" }
+$MODEL_ONNX       = if ($env:MODEL_ONNX)       { $env:MODEL_ONNX }            else { "models\connect4_model.onnx" }
 $SLEEP            = if ($env:SLEEP)            { [int]$env:SLEEP }            else { 2 }
 $MAX_CYCLES       = if ($env:MAX_CYCLES)       { [int]$env:MAX_CYCLES }       else { 0 }
 $REPLAY_KEEP      = if ($env:REPLAY_KEEP)      { [int]$env:REPLAY_KEEP }      else { 10 }
 $CPU_BATCH_SIZE   = if ($env:CPU_BATCH_SIZE)   { [int]$env:CPU_BATCH_SIZE }   else { [int]$env:NUMBER_OF_PROCESSORS }
 $GPU_BATCH_SIZE   = if ($env:GPU_BATCH_SIZE)   { [int]$env:GPU_BATCH_SIZE }   else { 32 }
 $SYMMETRY         = if ($env:SYMMETRY)         { [bool]($env:SYMMETRY -eq "1" -or $env:SYMMETRY -eq "true") } else { $true }
+$CHANNELS_LAST    = if ($env:CHANNELS_LAST)    { [bool]($env:CHANNELS_LAST -eq "1" -or $env:CHANNELS_LAST -eq "true") } else { $false }
+$FUSED_ADAMW      = if ($env:FUSED_ADAMW)      { [bool]($env:FUSED_ADAMW -eq "1" -or $env:FUSED_ADAMW -eq "true") } else { $false }
 $CARGO            = if ($env:CARGO)            { $env:CARGO }                 else { "cargo" }
-$venvPy          = Join-Path $ScriptDir ".venv\Scripts\python.exe"
-$PYTHON           = if ($env:PYTHON)           { $env:PYTHON }           elseif (Test-Path $venvPy) { $venvPy } else { "python" }
+$IN_PROCESS       = if ($env:IN_PROCESS)       { [bool]($env:IN_PROCESS -eq "1" -or $env:IN_PROCESS -eq "true") } else { $false }
 
 $RUST_DEVICE   = if ($env:RUST_DEVICE)   { $env:RUST_DEVICE }   else { if ($env:DEVICE) { $env:DEVICE } else { "auto" } }
 $PYTHON_DEVICE = if ($env:PYTHON_DEVICE) { $env:PYTHON_DEVICE } else { if ($env:DEVICE) { $env:DEVICE } else { "cuda" } }
 $BATCH_SIZE    = if ($RUST_DEVICE -eq "cpu") { $CPU_BATCH_SIZE } else { $GPU_BATCH_SIZE }
 $FEATURES      = "--features cuda"
 
-Write-Host "[pipeline] starting: games=$GAMES sims=$SIMS epochs=$EPOCHS batch=$BATCH batch_size=$BATCH_SIZE"
-Write-Host "[pipeline] devices: rust=$RUST_DEVICE python=$PYTHON_DEVICE (python is always GPU)"
-Write-Host "[pipeline] data=$DATA model=$MODEL onnx=$MODEL_ONNX"
-Write-Host "[pipeline] project root: $ScriptDir"
+Write-Host "=====================================================================" -ForegroundColor Cyan
+Write-Host "[pipeline] Starting Connect4 Self-Play Pipeline" -ForegroundColor Cyan
+Write-Host "  * Self-Play : games=$GAMES sims=$SIMS c_puct=$C_PUCT temp=$TEMPERATURE batch_size=$BATCH_SIZE"
+Write-Host "  * Training  : epochs=$EPOCHS batch=$BATCH lr=$LEARNING_RATE wd=$WEIGHT_DECAY compile=$COMPILE_MODE"
+Write-Host "  * Hardware  : rust_device=$RUST_DEVICE python_device=$PYTHON_DEVICE"
+Write-Host "  * Paths     : model=$MODEL onnx=$MODEL_ONNX replay_keep=$REPLAY_KEEP"
+Write-Host "=====================================================================" -ForegroundColor Cyan
 
 # --- Bootstrap: if no ONNX model exists, create a random-init one. ---------
 if (-not (Test-Path $MODEL_ONNX)) {
@@ -74,7 +87,7 @@ if (-not (Test-Path $MODEL_ONNX)) {
     Write-Host "[pipeline] ===== bootstrap (no ONNX model found) ====="
     Write-Host "[pipeline] running init.py to create $MODEL + $MODEL_ONNX"
     Push-Location "src_python"
-    & $PYTHON "init.py" --out-pt "../$MODEL" --out-onnx "../$MODEL_ONNX"
+    & $PYTHON "init.py" --out-pt "../$MODEL" --out-onnx "../$MODEL_ONNX" --infer-precision $INFER_PRECISION
     $rc = $LASTEXITCODE
     Pop-Location
     if ($rc -ne 0) {
@@ -82,77 +95,44 @@ if (-not (Test-Path $MODEL_ONNX)) {
         Pop-Location
         exit $rc
     }
-    Write-Host "[pipeline] bootstrap done. Starting cycle 1."
+    Write-Host "[pipeline] bootstrap done."
 }
 
-$cycle = 0
-try {
-    while ($true) {
-        $cycle++
-        if ($MAX_CYCLES -gt 0 -and $cycle -gt $MAX_CYCLES) {
-            Write-Host "[pipeline] MAX_CYCLES=$MAX_CYCLES reached - stopping."
-            break
-        }
+# --- Zero-Disk Rust Pipe Streaming Setup -----------------------------------
+
+    try {
         Write-Host ""
-        Write-Host "[pipeline] ===== cycle $cycle ====="
+        Write-Host "[pipeline] ===== Starting Continuous Training Process ($EPOCHS Epochs) =====" -ForegroundColor Cyan
 
-        # 1. Rust self-play (network-guided MCTS).
         $t0 = Get-Date
-        # Build the cargo arg list. `--features cuda` is added when
-        # RUST_DEVICE is gpu or auto so the binary has CUDA support
-        # available at runtime (it's a no-op if --device cpu is selected
-        # at runtime).
-        $cargo_args = @("run", "--release")
-        if ($FEATURES -ne "") { $cargo_args += $FEATURES.Split(' ') }
-        $cargo_args += @("--manifest-path", "src_rust/Cargo.toml", "--",
-                         "-g", $GAMES, "-s", $SIMS, "-b", $BATCH_SIZE, "-o", $DATA,
-                         "-m", $MODEL_ONNX, "-d", $RUST_DEVICE, "-v")
-        Write-Host "[pipeline] ($cycle) cargo run --release $FEATURES -- ...  (rust-device=$RUST_DEVICE)"
-        & $CARGO @cargo_args
-        $rc = $LASTEXITCODE
-        $t1 = Get-Date
-        if ($rc -ne 0) {
-            $secs = Format-Seconds $t0 $t1
-            Write-Host "[pipeline] ($cycle) cargo failed (rc=$rc) after $secs - sleeping $SLEEP s"
-            Start-Sleep -Seconds $SLEEP
-            continue
-        }
-        $secs = Format-Seconds $t0 $t1
-        Write-Host "[pipeline] ($cycle) self-play done in $secs"
+        $py_args = @("train.py", "--data", "-", "--out", "../$MODEL", "--epochs", $EPOCHS, "--batch", $BATCH, "--lr", $LEARNING_RATE, "--weight-decay", $WEIGHT_DECAY, "--compile-mode", $COMPILE_MODE, "--infer-precision", $INFER_PRECISION, "--onnx-every", $ONNX_EVERY, "--device", $PYTHON_DEVICE)
+        if ($SYMMETRY) { $py_args += "--symmetry" }
+        if ($CHANNELS_LAST) { $py_args += "--channels-last" }
+        if ($FUSED_ADAMW) { $py_args += "--fused-adamw" }
 
-        # 2. Python train + ONNX export.
-        $t0 = Get-Date
-        $replayDir = Join-Path $ScriptDir "replay"
-        if (-not (Test-Path $replayDir)) { New-Item -ItemType Directory -Path $replayDir | Out-Null }
-        $cycleFile = Join-Path $replayDir ("selfplay_{0:D4}.bin" -f $cycle)
-        # Move the just-produced selfplay.bin into the replay buffer BEFORE
-        # training, so train.py sees it via --data-dir.
-        Move-Item -Force $DATA $cycleFile
-        # Trim to REPLAY_KEEP most-recent files.
-        $oldFiles = Get-ChildItem $replayDir -Filter "selfplay_*.bin" |
-            Sort-Object Name -Descending |
-            Select-Object -Skip $REPLAY_KEEP
-        foreach ($f in $oldFiles) { Remove-Item -Force $f.FullName }
-        $replayCount = (Get-ChildItem $replayDir -Filter "selfplay_*.bin").Count
-        Write-Host "[pipeline] ($cycle) saved to $cycleFile (replay buffer: $replayCount file(s))"
-        Write-Host "[pipeline] ($cycle) $PYTHON train.py --data-dir ../replay --out $MODEL --epochs $EPOCHS --batch $BATCH --device $PYTHON_DEVICE"
+        Write-Host "[pipeline] Mode: Zero-Disk Rust MCTS Pipe Streaming (100% RAM/VRAM, 0 files on disk)" -ForegroundColor Green
+        Write-Host "[pipeline] Executing: $PYTHON train.py --data - --out $MODEL --epochs $EPOCHS --batch $BATCH"
         Push-Location "src_python"
-        $symFlag = if ($SYMMETRY) { "--symmetry" } else { "" }
-        & $PYTHON "train.py" --data-dir "../replay" --out "../$MODEL" --epochs $EPOCHS --batch $BATCH --device $PYTHON_DEVICE $symFlag
+        & $PYTHON @py_args
         $rc = $LASTEXITCODE
         Pop-Location
         $t1 = Get-Date
-        if ($rc -ne 0) {
-            $secs = Format-Seconds $t0 $t1
-            Write-Host "[pipeline] ($cycle) train failed (rc=$rc) after $secs - keeping replay files for debug"
-            Start-Sleep -Seconds $SLEEP
-            continue
-        }
         $secs = Format-Seconds $t0 $t1
-        Write-Host "[pipeline] ($cycle) train done in $secs"
-        Write-Host "[pipeline] ($cycle) sleeping $SLEEP s before next cycle"
-        Start-Sleep -Seconds $SLEEP
+
+        if ($rc -eq 0) {
+            Write-Host "[pipeline] Continuous training complete in $secs." -ForegroundColor Green
+            
+            $EMA_MODEL = $MODEL.Replace(".pt", "_ema.pt")
+            if (Test-Path $EMA_MODEL) {
+                Write-Host ""
+                Write-Host "[pipeline] ===== Starting Evaluation (EMA vs Raw Checkpoint at Temp=0) =====" -ForegroundColor Cyan
+                Push-Location "src_python"
+                & $PYTHON "evaluate.py" --model1 "../$EMA_MODEL" --model2 "../$MODEL" --games 100 --device $PYTHON_DEVICE
+                Pop-Location
+            }
+        } else {
+            Write-Host "[pipeline] Training process exited with code $rc after $secs." -ForegroundColor Red
+        }
+    } finally {
+        Pop-Location
     }
-} finally {
-    Pop-Location
-}

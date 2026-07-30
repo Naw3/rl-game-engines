@@ -100,6 +100,8 @@ struct InferRequest {
 pub struct Eval {
     pub policy: [f32; 7],
     pub value: f32,
+    #[allow(dead_code)]
+    pub moves_left: f32,
 }
 
 impl Network {
@@ -277,8 +279,12 @@ fn run_dispatcher(mut session: Session, rx: Receiver<InferRequest>) {
         let value_view = outputs[1]
             .try_extract_array::<f32>()
             .expect("ort value extraction failed");
+        let moves_left_view = outputs[2]
+            .try_extract_array::<f32>()
+            .expect("ort moves_left extraction failed");
         let policy_data: Vec<f32> = policy_view.iter().copied().collect();
         let value_data: Vec<f32> = value_view.iter().copied().collect();
+        let moves_left_data: Vec<f32> = moves_left_view.iter().copied().collect();
 
         // Dispatch results back to each requester.
         for (i, req) in batch.into_iter().enumerate() {
@@ -293,6 +299,7 @@ fn run_dispatcher(mut session: Session, rx: Receiver<InferRequest>) {
             let eval = Eval {
                 policy,
                 value: value_data[i],
+                moves_left: moves_left_data[i],
             };
             let _ = req.reply.send(eval); // ignore if receiver already dropped
         }
@@ -391,7 +398,7 @@ fn null_eval(board: Board) -> Eval {
             }
         }
     }
-    Eval { policy, value: 0.0 }
+    Eval { policy, value: 0.0, moves_left: 21.0 }
 }
 
 // ---------------------------------------------------------------------------

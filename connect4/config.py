@@ -11,8 +11,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 @dataclass
 class NetworkConfig:
     """Neural Network Architecture (Connect4Net)"""
-    channels: int = 64
-    num_blocks: int = 3
+    d_model: int = 64
+    num_layers: int = 4
+    nhead: int = 4
     input_planes: int = 3
     board_rows: int = 6
     board_cols: int = 7
@@ -22,11 +23,11 @@ class NetworkConfig:
 @dataclass
 class MCTSConfig:
     """Rust MCTS Self-Play Search Parameters"""
-    games: int = 32
-    sims: int = 800
+    games: int = 128
+    sims: int = 200
     cpu_batch_size: int = os.cpu_count() or 8
     gpu_batch_size: int = 32
-    max_dispatcher_batch: int = 64
+    max_dispatcher_batch: int = 128
     c_puct: float = 1.5
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
@@ -39,7 +40,7 @@ class MCTSConfig:
 @dataclass
 class TrainConfig:
     """PyTorch Training Hyperparameters"""
-    epochs: int = 5
+    epochs: int = 200
     batch_size: int = 256
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
@@ -47,10 +48,13 @@ class TrainConfig:
     replay_keep: int = 10
     num_workers: int = 0
     log_every: int = 20
+    onnx_every: int = 0
+    use_ema: bool = True
+    ema_decay: float = 0.999
     symmetry: bool = True
     train_precision: str = "fp32"  # "fp32", "fp16", "bf16"
     infer_precision: str = "fp32"  # "fp32", "fp16", "int8"
-    compile_mode: str = "reduce-overhead"  # "none", "default", "reduce-overhead", "max-autotune"
+    compile_mode: str = "none"  # "none", "default", "reduce-overhead", "max-autotune"
     channels_last: bool = False
     fused_adamw: bool = False
     prefetch_queue: int = 2
@@ -60,7 +64,7 @@ class DatasetConfig:
     """Binary C4D1 File Format Contract"""
     magic: str = "C4D1"
     header_size: int = 16
-    sample_size: int = 56
+    sample_size: int = 60
     policy_size: int = 7
     onnx_opset: int = 18
     max_onnx_batch: int = 256
@@ -92,8 +96,11 @@ class GUIConfig:
 class PathConfig:
     """Project File Paths"""
     root: Path = PROJECT_ROOT
-    model_pt: Path = PROJECT_ROOT / "connect4_model.pt"
-    model_onnx: Path = PROJECT_ROOT / "connect4_model.onnx"
+    model_dir: Path = PROJECT_ROOT / "models"
+    model_pt: Path = PROJECT_ROOT / "models" / "connect4_model.pt"
+    model_ema_pt: Path = PROJECT_ROOT / "models" / "connect4_model_ema.pt"
+    model_onnx: Path = PROJECT_ROOT / "models" / "connect4_model.onnx"
+    model_ema_onnx: Path = PROJECT_ROOT / "models" / "connect4_model_ema.onnx"
     selfplay_bin: Path = PROJECT_ROOT / "selfplay.bin"
     replay_dir: Path = PROJECT_ROOT / "replay"
     bench_temp_dir: Path = PROJECT_ROOT / ".bench_temp"
@@ -155,18 +162,30 @@ def export_powershell_env() -> str:
         f'$env:CPU_BATCH_SIZE = "{CONFIG.mcts.cpu_batch_size}"',
         f'$env:GPU_BATCH_SIZE = "{CONFIG.mcts.gpu_batch_size}"',
         f'$env:MAX_DISPATCHER_BATCH = "{CONFIG.mcts.max_dispatcher_batch}"',
+        f'$env:C_PUCT = "{CONFIG.mcts.c_puct}"',
+        f'$env:DIRICHLET_ALPHA = "{CONFIG.mcts.dirichlet_alpha}"',
+        f'$env:DIRICHLET_EPSILON = "{CONFIG.mcts.dirichlet_epsilon}"',
+        f'$env:TEMPERATURE = "{CONFIG.mcts.temperature}"',
+        f'$env:SEED = "{CONFIG.mcts.seed}"',
         f'$env:EPOCHS = "{CONFIG.train.epochs}"',
         f'$env:TRAIN_BATCH_SIZE = "{CONFIG.train.batch_size}"',
+        f'$env:LEARNING_RATE = "{CONFIG.train.learning_rate}"',
+        f'$env:WEIGHT_DECAY = "{CONFIG.train.weight_decay}"',
         f'$env:REPLAY_KEEP = "{CONFIG.train.replay_keep}"',
         f'$env:NUM_WORKERS = "{CONFIG.train.num_workers}"',
         f'$env:LOG_EVERY = "{CONFIG.train.log_every}"',
+        f'$env:ONNX_EVERY = "{CONFIG.train.onnx_every}"',
         f'$env:MAX_GRAD_NORM = "{CONFIG.train.max_grad_norm}"',
         f'$env:SYMMETRY = "{1 if CONFIG.train.symmetry else 0}"',
+        f'$env:COMPILE_MODE = "{CONFIG.train.compile_mode}"',
+        f'$env:INFER_PRECISION = "{CONFIG.train.infer_precision}"',
+        f'$env:CHANNELS_LAST = "{1 if CONFIG.train.channels_last else 0}"',
+        f'$env:FUSED_ADAMW = "{1 if CONFIG.train.fused_adamw else 0}"',
         f'$env:ONNX_OPSET = "{CONFIG.dataset.onnx_opset}"',
         f'$env:RUST_DEVICE = "{CONFIG.device.rust_device}"',
         f'$env:PYTHON_DEVICE = "{CONFIG.device.python_device}"',
-        f'$env:MODEL = "{CONFIG.paths.model_pt.name}"',
-        f'$env:MODEL_ONNX = "{CONFIG.paths.model_onnx.name}"',
+        f'$env:MODEL = "{CONFIG.paths.model_pt.relative_to(PROJECT_ROOT)}"',
+        f'$env:MODEL_ONNX = "{CONFIG.paths.model_onnx.relative_to(PROJECT_ROOT)}"',
         f'$env:DATA = "{CONFIG.paths.selfplay_bin.name}"',
         
         # Bench configs (isolated)

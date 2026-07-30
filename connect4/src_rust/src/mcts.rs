@@ -191,7 +191,7 @@ struct PathEntry {
 /// avoid reallocating the tree between calls. The `Network` is shared
 /// across all MCTS instances (typically one per rayon worker game).
 pub struct MCTS {
-    config: MCTSConfig,
+    pub config: MCTSConfig,
     /// Flat arena of nodes. Index 0 is reserved as a sentinel; the
     /// actual root is pushed by `run`.
     tree: Vec<Node>,
@@ -199,6 +199,8 @@ pub struct MCTS {
     network: Arc<Network>,
     /// Pre-allocated buffers for paths to avoid allocation in `select`
     scratch_paths: Vec<Vec<PathEntry>>,
+    /// Index of the current root node in the tree. None if tree needs clearing.
+    pub root_idx: Option<usize>,
 }
 
 impl MCTS {
@@ -212,7 +214,25 @@ impl MCTS {
             tree: Vec::with_capacity(8192),
             network,
             scratch_paths: (0..cfg.batch_size).map(|_| Vec::with_capacity(64)).collect(),
+            root_idx: None,
         }
+    }
+
+    /// Advance the root to the child node corresponding to `action`.
+    /// This retains the subtree for the selected move, skipping reallocation.
+    pub fn advance(&mut self, action: usize) {
+        if let Some(idx) = self.root_idx {
+            let child = self.tree[idx].children[action];
+            if child != u32::MAX {
+                self.root_idx = Some(child as usize);
+            } else {
+                self.root_idx = None;
+            }
+        }
+    }
+
+    pub fn set_simulations(&mut self, sims: usize) {
+        self.config.simulations = sims;
     }
 
     /// Run `config.simulations` simulations from `root` and return:
@@ -237,31 +257,44 @@ impl MCTS {
     ) -> (Vec<f32>, Vec<f32>) {
         let batch_size = batch_size.max(1);
 
-        // Clear the tree arena. We keep the allocation (capacity grows).
-        self.tree.clear();
-        let root_idx = self.tree.len();
-        self.tree.push(Node::new(root.own, root.opp));
-
         let legal = root.legal_moves();
         let n_legal = (0..7).filter(|c| legal & (1 << c) != 0).count();
 
-        // Get the network's policy for the root. Used as the prior that
-        // Dirichlet noise is mixed into. (If the network is null, the
-        // `evaluate` call returns a uniform policy + value 0.)
-        let root_eval = self.network.evaluate(root);
-
-        // Inject Dirichlet noise at the root (mix with the network prior).
-        // Skip if dirichlet_epsilon is 0 (e.g. --no-noise flag) — in that
-        // case the network's policy is used as-is.
-        if n_legal > 0 && self.config.dirichlet_epsilon > 0.0 {
-            self.add_root_dirichlet(root_idx, legal, n_legal, &root_eval.policy, rng);
+        let root_idx = if let Some(idx) = self.root_idx {
+            // Already have a root from advance(). Sanity check the board state.
+            debug_assert_eq!(self.tree[idx].own, root.own);
+            debug_assert_eq!(self.tree[idx].opp, root.opp);
+            idx
         } else {
+            // No valid root: clear tree and start fresh.
+            self.tree.clear();
+            let idx = self.tree.len();
+            self.tree.push(Node::new(root.own, root.opp));
+            self.root_idx = Some(idx);
+            idx
+        };
+
+        // If the root is NOT expanded, evaluate it with the network to get priors.
+        if !self.tree[root_idx].is_expanded {
+            let root_eval = self.network.evaluate(root);
             self.set_root_priors(root_idx, legal, n_legal, &root_eval.policy);
+        }
+
+        // Inject Dirichlet noise at the root. We do this for EVERY move, even if
+        // the node was already expanded (e.g. from tree reuse).
+        if n_legal > 0 && self.config.dirichlet_epsilon > 0.0 {
+            self.add_root_dirichlet(root_idx, legal, n_legal, rng);
         }
 
         // Batched simulation loop. We process `batch_size` selections per
         // round, then flush them through a single network call.
-        let total_sims = self.config.simulations;
+        // Aggressive Cache: Subtract already computed visits from the target.
+        let existing_visits = self.tree[root_idx].n.iter().sum::<u32>() as usize;
+        let total_sims = if existing_visits >= self.config.simulations {
+            0
+        } else {
+            self.config.simulations - existing_visits
+        };
         let mut sims_done = 0usize;
         while sims_done < total_sims {
             let this_batch = batch_size.min(total_sims - sims_done);
@@ -379,6 +412,12 @@ impl MCTS {
                     // so the player to move at the child has lost.
                     self.tree[child_idx].is_terminal = Some(-1.0);
                     self.tree[child_idx].is_expanded = true;
+                    
+                    // Maximum Backpropagation (Minimax Hybrid):
+                    // Since the current player found a move that wins immediately,
+                    // the current node is a guaranteed WIN.
+                    self.tree[current].is_terminal = Some(1.0);
+                    
                     path.push(PathEntry { node_idx: child_idx, action: usize::MAX });
                     return Some(-1.0);
                 }
@@ -436,6 +475,17 @@ impl MCTS {
         let node = &self.tree[node_idx];
         let total_n: u32 = node.n.iter().sum();
         let sqrt_total = (total_n as f32).sqrt();
+        
+        // Dynamic FPU: use parent's average Q-value for unvisited nodes
+        // (with a small penalty) to avoid exploring bad branches just because they are unvisited.
+        let parent_q = if total_n > 0 {
+            let total_w: f32 = node.w.iter().sum();
+            total_w / total_n as f32
+        } else {
+            0.0
+        };
+        let fpu = parent_q - 0.1; // Small penalty to encourage depth
+
         let mut best_a = 0;
         let mut best_score = f32::NEG_INFINITY;
         for c in 0..7 {
@@ -445,7 +495,7 @@ impl MCTS {
             let q = if node.n[c] > 0 {
                 node.w[c] / node.n[c] as f32
             } else {
-                0.0 // unvisited child, neutral Q
+                fpu // Dynamic FPU instead of 0.0
             };
             let u = self.config.c_puct * node.p[c] * sqrt_total / (1.0 + node.n[c] as f32);
             let score = q + u;
@@ -542,18 +592,12 @@ impl MCTS {
         root_idx: usize,
         legal: u8,
         n_legal: usize,
-        network_policy: &[f32; 7],
         rng: &mut R,
     ) {
         let alpha = vec![self.config.dirichlet_alpha; n_legal];
         let dist = match Dirichlet::new(&alpha) {
             Ok(d) => d,
-            Err(_) => {
-                // alpha <= 0 (shouldn't happen with default 0.3) — fall
-                // back to plain network policy.
-                self.set_root_priors(root_idx, legal, n_legal, network_policy);
-                return;
-            }
+            Err(_) => return, // alpha <= 0 (shouldn't happen with default 0.3)
         };
         let eta = dist.sample(rng);
         let eps = self.config.dirichlet_epsilon;
@@ -561,7 +605,7 @@ impl MCTS {
         let mut i = 0;
         for c in 0..7 {
             if legal & (1 << c) != 0 {
-                let p_net = network_policy[c];
+                let p_net = self.tree[root_idx].p[c];
                 self.tree[root_idx].p[c] = (1.0 - eps) * p_net + eps * eta[i];
                 i += 1;
             } else {

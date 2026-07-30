@@ -60,8 +60,9 @@ try:
     from config import CONFIG
     _DEFAULT_PT              = str(CONFIG.paths.model_pt)
     _DEFAULT_ONNX            = str(CONFIG.paths.model_onnx)
-    _DEFAULT_CHANNELS        = CONFIG.network.channels
-    _DEFAULT_NUM_BLOCKS      = CONFIG.network.num_blocks
+    _DEFAULT_D_MODEL         = CONFIG.network.d_model
+    _DEFAULT_NUM_LAYERS      = CONFIG.network.num_layers
+    _DEFAULT_NHEAD           = getattr(CONFIG.network, "nhead", 4)
     _DEFAULT_SEED            = CONFIG.mcts.seed
     _DEFAULT_OPSET           = CONFIG.dataset.onnx_opset
     _DEFAULT_PLANES          = CONFIG.network.input_planes
@@ -71,10 +72,11 @@ try:
     _DEFAULT_INFER_PRECISION = CONFIG.train.infer_precision
 except Exception as err:
     print(f"[init] WARNING: Failed to load config.py ({err}); using fallbacks")
-    _DEFAULT_PT              = str(_PROJECT_ROOT / "connect4_model.pt")
-    _DEFAULT_ONNX            = str(_PROJECT_ROOT / "connect4_model.onnx")
-    _DEFAULT_CHANNELS        = 64
-    _DEFAULT_NUM_BLOCKS      = 3
+    _DEFAULT_PT              = str(_PROJECT_ROOT / "models" / "connect4_model.pt")
+    _DEFAULT_ONNX            = str(_PROJECT_ROOT / "models" / "connect4_model.onnx")
+    _DEFAULT_D_MODEL         = 64
+    _DEFAULT_NUM_LAYERS      = 4
+    _DEFAULT_NHEAD           = 4
     _DEFAULT_SEED            = 42
     _DEFAULT_OPSET           = 18
     _DEFAULT_PLANES          = 3
@@ -100,8 +102,9 @@ def main() -> int:
                    help="ONNX opset version")
     p.add_argument("--force", action="store_true",
                    help="Overwrite existing files")
-    p.add_argument("--channels", type=int, default=_DEFAULT_CHANNELS)
-    p.add_argument("--num-blocks", type=int, default=_DEFAULT_NUM_BLOCKS)
+    p.add_argument("--d-model", type=int, default=_DEFAULT_D_MODEL)
+    p.add_argument("--num-layers", type=int, default=_DEFAULT_NUM_LAYERS)
+    p.add_argument("--nhead", type=int, default=_DEFAULT_NHEAD)
     p.add_argument("--seed", type=int, default=_DEFAULT_SEED,
                    help="RNG seed for model initialization")
     p.add_argument(
@@ -124,9 +127,9 @@ def main() -> int:
 
     print(
         f"[init] creating random-init Connect4Net "
-        f"(channels={args.channels}, num_blocks={args.num_blocks})"
+        f"(d_model={args.d_model}, num_layers={args.num_layers}, nhead={args.nhead})"
     )
-    net = Connect4Net(channels=args.channels, num_blocks=args.num_blocks)
+    net = Connect4Net(d_model=args.d_model, num_layers=args.num_layers, nhead=args.nhead)
     print(f"[init] model: {net.num_parameters():,} parameters")
 
     print(f"[init] saving state_dict -> {args.out_pt}")

@@ -63,7 +63,7 @@ except Exception as err:
     N_COLS = 7
     MAGIC = b"C4D1"
     HEADER_SIZE = 16
-    SAMPLE_SIZE = 56
+    SAMPLE_SIZE = 60
     POLICY_SIZE = 7
 
 
@@ -178,6 +178,7 @@ class C4Dataset(Dataset):
         self._opp = np.frombuffer(reshaped[:, 8:16].tobytes(), dtype=np.uint64).copy()
         self._policy = np.frombuffer(reshaped[:, 24:52].tobytes(), dtype=np.float32).reshape(self.count, POLICY_SIZE).copy()
         self._value = np.frombuffer(reshaped[:, 52:56].tobytes(), dtype=np.float32).copy()
+        self._moves_left = np.frombuffer(reshaped[:, 56:60].tobytes(), dtype=np.float32).copy()
 
         # Pre-decode planes as (N, 3, 6, 7) float32. ~3 MB for 64 games.
         self._planes = decode_bitboard_batched(self._own, self._opp)
@@ -191,10 +192,11 @@ class C4Dataset(Dataset):
     def __len__(self) -> int:
         return self.count
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         planes = self._planes[idx]      # (3, 6, 7) numpy view
         policy = self._policy[idx]      # (7,)
         value = self._value[idx]        # ()
+        moves_left = self._moves_left[idx]
 
         if self.symmetry:
             # 50/50: with prob 0.5 apply horizontal flip.
@@ -208,6 +210,7 @@ class C4Dataset(Dataset):
             torch.from_numpy(planes),
             torch.from_numpy(policy),
             torch.tensor(value, dtype=torch.float32),
+            torch.tensor(moves_left, dtype=torch.float32),
         )
 
     def stats(self) -> dict:

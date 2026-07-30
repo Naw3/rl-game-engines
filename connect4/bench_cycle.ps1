@@ -148,7 +148,7 @@ try {
         if ($LASTEXITCODE -eq 0) {
             $dur = (Get-Date) - $tStart
             if (Test-Path $cpuData) {
-                $samples = (Get-Item $cpuData).Length / 56
+                $samples = (Get-Item $cpuData).Length / 60
                 $tp = $samples / $DURATION
                 
                 $games = 0
@@ -188,7 +188,7 @@ try {
             $dur = (Get-Date) - $tStart
             if (-not $implicitGpuForTrain) {
                 if (Test-Path $gpuData) {
-                    $samples = (Get-Item $gpuData).Length / 56
+                    $samples = (Get-Item $gpuData).Length / 60
                     $tp = $samples / $DURATION
                     
                     $games = 0

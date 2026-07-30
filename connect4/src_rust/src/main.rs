@@ -78,6 +78,7 @@ struct Sample {
     turn_mask: u64,
     policy: [f32; 7],
     value: f32,
+    moves_left: f32,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -196,6 +197,7 @@ fn main() -> ExitCode {
     let dirichlet_alpha: f32 = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.dirichlet_alpha).unwrap_or(mcts::DEFAULT_DIRICHLET_ALPHA);
     let mut dirichlet_eps: f32 = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.dirichlet_epsilon).unwrap_or(mcts::DEFAULT_DIRICHLET_EPSILON);
     let mut device: network::Device = network::Device::Auto;
+    let mut stream_mode: bool = false;
     let mut verbose: bool = false;
 
     // Tiny flag parser. Supports `--flag value` and `--flag=value`.
@@ -252,6 +254,7 @@ fn main() -> ExitCode {
             "--no-noise" => {
                 dirichlet_eps = 0.0;
             }
+            "--stream" => stream_mode = true,
             "--verbose" | "-v" => verbose = true,
             "--help" | "-h" => {
                 print_help();
@@ -489,6 +492,32 @@ fn main() -> ExitCode {
             })
     };
 
+    if stream_mode {
+        loop {
+            let samples: Vec<Sample> = (0..num_games)
+                .into_par_iter()
+                .enumerate()
+                .map(|(game_idx, _)| {
+                    let game_seed = seed
+                        .wrapping_add(game_idx as u64)
+                        .wrapping_mul(0x9E3779B97F4A7C15);
+                    let mut rng = StdRng::seed_from_u64(game_seed);
+                    let mut mcts = MCTS::new(config.clone(), Arc::clone(&network));
+                    play_game(&mut mcts, &mut rng, None)
+                })
+                .reduce(Vec::new, |mut a, mut b| {
+                    a.append(&mut b);
+                    a
+                });
+
+            if write_binary(&output, &samples, num_games).is_err() {
+                break;
+            }
+            seed = seed.wrapping_add(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+
     if verbose {
         if let Some(dur) = duration_secs {
             let bar_width = json_cfg.as_ref().and_then(|c| c.gui.as_ref()?.progress_bar_width).unwrap_or(20);
@@ -517,7 +546,7 @@ fn main() -> ExitCode {
         let _ = std::fs::write(stats_path, stats_content);
     }
 
-    match write_binary(&output, &samples) {
+    match write_binary(&output, &samples, num_games) {
         Ok(()) => {
             if verbose {
                 let bytes = 16 + 56 * samples.len();
@@ -570,7 +599,7 @@ fn print_help() {
     eprintln!("        --warmup <N>           Warmup iterations before timing (default 20)");
 }
 
-/// Default model path: `<project_root>/connect4_model.onnx`. The
+/// Default model path: `<project_root>/models/connect4_model.onnx`. The
 /// project root is the parent of `CARGO_MANIFEST_DIR` (i.e. the
 /// directory holding this crate's Cargo.toml, which is `src_rust/`).
 /// Works from any cwd.
@@ -578,6 +607,7 @@ fn default_model_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
+        .join("models")
         .join("connect4_model.onnx")
 }
 
@@ -774,6 +804,8 @@ fn play_game<R: Rng + ?Sized>(mcts: &mut MCTS, rng: &mut R, deadline: Option<Ins
     let mut board = Board::new();
     let mut samples: Vec<Sample> = Vec::with_capacity(42);
     let mut last_was_terminal: Option<MoveResult> = None;
+    let full_sims = mcts.config.simulations;
+    let cheap_sims = (full_sims / 10).max(32); // e.g. 800 -> 80, min 32
 
     loop {
         if let Some(d) = deadline {
@@ -781,6 +813,12 @@ fn play_game<R: Rng + ?Sized>(mcts: &mut MCTS, rng: &mut R, deadline: Option<Ins
                 return Vec::new();
             }
         }
+
+        // Playout Cap Randomization (PCR)
+        // ~25% of the time, use full search. Otherwise, use a cheap search.
+        let pcr_roll: f32 = rng.gen();
+        let target_sims = if pcr_roll < 0.25 { full_sims } else { cheap_sims };
+        mcts.set_simulations(target_sims);
 
         // Run network-guided MCTS to get the policy at this state.
         let (policy_vec, _q) = mcts.run(board, rng);
@@ -803,11 +841,16 @@ fn play_game<R: Rng + ?Sized>(mcts: &mut MCTS, rng: &mut R, deadline: Option<Ins
             turn_mask,
             policy,
             value: 0.0,
+            moves_left: 0.0,
         });
 
         // Apply. After `make_move`, `board` is the child's state (own/opp
         // swapped). The result tells us if the game is over.
         let result = board.make_move(action);
+        
+        // Advance the MCTS root down the chosen branch for tree reuse.
+        mcts.advance(action);
+        
         match result {
             MoveResult::Win | MoveResult::Draw => {
                 last_was_terminal = Some(result);
@@ -829,12 +872,14 @@ fn play_game<R: Rng + ?Sized>(mcts: &mut MCTS, rng: &mut R, deadline: Option<Ins
     // On a draw, all values are 0.
     let n = samples.len();
     if let Some(MoveResult::Draw) = last_was_terminal {
-        for s in samples.iter_mut() {
+        for (i, s) in samples.iter_mut().enumerate() {
             s.value = 0.0;
+            s.moves_left = (n - 1 - i) as f32;
         }
     } else {
         for (i, s) in samples.iter_mut().enumerate() {
             s.value = if (n - 1 - i) % 2 == 0 { 1.0 } else { -1.0 };
+            s.moves_left = (n - 1 - i) as f32;
         }
     }
 
@@ -890,15 +935,20 @@ fn format_duration(s: f64) -> String {
 /// C4D1 format magic bytes.
 const C4D1_MAGIC: &[u8; 4] = b"C4D1";
 
-/// Write the C4D1 binary file.
-fn write_binary(path: &str, samples: &[Sample]) -> std::io::Result<()> {
-    let f = File::create(path)?;
-    let mut w = BufWriter::with_capacity(1 << 20, f);
+/// Write the C4D1 binary file (or stdout if path == "-").
+fn write_binary(path: &str, samples: &[Sample], num_games: usize) -> std::io::Result<()> {
+    let writer: Box<dyn Write> = if path == "-" {
+        Box::new(BufWriter::with_capacity(1 << 20, std::io::stdout()))
+    } else {
+        Box::new(BufWriter::with_capacity(1 << 20, File::create(path)?))
+    };
+    let mut w = writer;
 
     // Header.
     w.write_all(C4D1_MAGIC)?;
     w.write_all(&(samples.len() as u32).to_le_bytes())?;
-    w.write_all(&[0u8; 8])?;
+    w.write_all(&(num_games as u32).to_le_bytes())?;
+    w.write_all(&[0u8; 4])?;
 
     // Samples.
     for s in samples {
@@ -909,6 +959,7 @@ fn write_binary(path: &str, samples: &[Sample]) -> std::io::Result<()> {
             w.write_all(&p.to_le_bytes())?;
         }
         w.write_all(&s.value.to_le_bytes())?;
+        w.write_all(&s.moves_left.to_le_bytes())?;
     }
     w.flush()?;
     Ok(())

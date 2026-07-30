@@ -55,67 +55,67 @@ if str(_ROOT) not in sys.path:
 
 try:
     from config import CONFIG
-    _DEFAULT_CHANNELS = CONFIG.network.channels
-    _DEFAULT_NUM_BLOCKS = CONFIG.network.num_blocks
+    _DEFAULT_D_MODEL = getattr(CONFIG.network, "d_model", 64)
+    _DEFAULT_NUM_LAYERS = getattr(CONFIG.network, "num_layers", 4)
+    _DEFAULT_NHEAD = getattr(CONFIG.network, "nhead", 4)
 except Exception:
-    _DEFAULT_CHANNELS = 64
-    _DEFAULT_NUM_BLOCKS = 3
-
-
-class ResBlock(nn.Module):
-    def __init__(self, channels: int):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(channels)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = F.relu(self.bn1(self.conv1(x)), inplace=True)
-        h = self.bn2(self.conv2(h))
-        return F.relu(h + x, inplace=True)
+    _DEFAULT_D_MODEL = 64
+    _DEFAULT_NUM_LAYERS = 4
+    _DEFAULT_NHEAD = 4
 
 
 # ---------------------------------------------------------------------------
-# Connect4Net
+# Connect4Net (Transformer)
 # ---------------------------------------------------------------------------
 
 class Connect4Net(nn.Module):
-    """AlphaZero-style policy + value network for Connect 4.
+    """AlphaZero-style policy + value + moves_left Transformer for Connect 4.
 
     Args:
-        channels:  width of the conv trunk (default 64).
-        num_blocks: number of residual blocks in the trunk (default 3).
+        d_model:   width of the transformer trunk (default 64).
+        num_layers: number of transformer layers (default 4).
+        nhead:     number of attention heads (default 4).
     """
 
-    def __init__(self, channels: int = 64, num_blocks: int = 3) -> None:
+    def __init__(self, d_model: int = 64, num_layers: int = 4, nhead: int = 4, **kwargs) -> None:
+        # **kwargs catches old arguments like channels/num_blocks to prevent crashes
         super().__init__()
-        self.channels = channels
-        self.num_blocks = num_blocks
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.nhead = nhead
 
-        # Lift 3 input planes -> `channels` feature maps.
-        self.input_conv = nn.Conv2d(3, channels, kernel_size=3, padding=1, bias=False)
-        self.input_bn = nn.BatchNorm2d(channels)
-
-        # Residual trunk.
-        self.blocks = nn.ModuleList(
-            [ResBlock(channels) for _ in range(num_blocks)]
+        # Flattened board: 6x7 = 42 squares. Each square starts with 3 features -> d_model
+        self.token_proj = nn.Linear(3, d_model)
+        
+        # Positional Embedding for the 42 squares
+        self.pos_emb = nn.Parameter(torch.randn(1, 42, d_model) * 0.02)
+        
+        # Transformer Trunk
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=d_model * 4, 
+            dropout=0.0, activation="gelu", batch_first=True, norm_first=True
         )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(d_model)
 
-        # Policy head: 1×1 conv to 2 channels -> flatten -> Linear -> log_softmax.
-        # 2 channels is the AlphaZero convention; it gives the head a tiny
-        # bit of expressivity before the linear projection.
-        self.policy_conv = nn.Conv2d(channels, 2, kernel_size=1, bias=False)
+        # Policy head: takes (B, d_model, 6, 7) -> 1x1 conv to 2 channels -> flatten -> Linear(2*6*7, 7)
+        self.policy_conv = nn.Conv2d(d_model, 2, kernel_size=1, bias=False)
         self.policy_bn = nn.BatchNorm2d(2)
         self.policy_fc = nn.Linear(2 * 6 * 7, 7)
 
-        # Value head: 1×1 conv to 1 channel -> flatten -> 64-d hidden -> 1.
-        self.value_conv = nn.Conv2d(channels, 1, kernel_size=1, bias=False)
+        # Value head
+        self.value_conv = nn.Conv2d(d_model, 1, kernel_size=1, bias=False)
         self.value_bn = nn.BatchNorm2d(1)
         self.value_fc1 = nn.Linear(1 * 6 * 7, 64)
         self.value_fc2 = nn.Linear(64, 1)
+        
+        # Moves Left head (Auxiliary)
+        self.moves_left_conv = nn.Conv2d(d_model, 1, kernel_size=1, bias=False)
+        self.moves_left_bn = nn.BatchNorm2d(1)
+        self.moves_left_fc1 = nn.Linear(1 * 6 * 7, 64)
+        self.moves_left_fc2 = nn.Linear(64, 1)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the network.
 
         Args:
@@ -123,25 +123,43 @@ class Connect4Net(nn.Module):
 
         Returns:
             log_p: (B, 7) log-probabilities over the 7 columns.
-            v:     (B,)   predicted value in [-1, +1] per sample.
+            v:     (B,)   predicted value in [-1, +1].
+            m:     (B,)   predicted moves left.
         """
-        # Trunk.
-        h = F.relu(self.input_bn(self.input_conv(x)), inplace=True)
-        for block in self.blocks:
-            h = block(h)
-
-        # Policy head.
-        p = F.relu(self.policy_bn(self.policy_conv(h)), inplace=True)
+        B = x.size(0)
+        
+        # Flatten spatial dims to sequence of 42 tokens: (B, 3, 6, 7) -> (B, 3, 42) -> (B, 42, 3)
+        tokens = x.view(B, 3, 42).permute(0, 2, 1)
+        
+        # Project tokens and add positional embedding
+        h = self.token_proj(tokens) + self.pos_emb # (B, 42, d_model)
+        
+        # Transformer layers
+        h = self.transformer(h)
+        h = self.norm(h)
+        
+        # Reshape back to spatial tensor: (B, 42, d_model) -> (B, d_model, 42) -> (B, d_model, 6, 7)
+        h_spatial = h.permute(0, 2, 1).view(B, self.d_model, 6, 7).contiguous()
+        
+        # Policy head
+        p = F.relu(self.policy_bn(self.policy_conv(h_spatial)), inplace=True)
         p = p.flatten(start_dim=1)
         log_p = F.log_softmax(self.policy_fc(p), dim=1)
 
-        # Value head.
-        v = F.relu(self.value_bn(self.value_conv(h)), inplace=True)
+        # Value head
+        v = F.relu(self.value_bn(self.value_conv(h_spatial)), inplace=True)
         v = v.flatten(start_dim=1)
         v = F.relu(self.value_fc1(v), inplace=True)
         v = torch.tanh(self.value_fc2(v)).squeeze(1)
+        
+        # Moves Left head
+        m = F.relu(self.moves_left_bn(self.moves_left_conv(h_spatial)), inplace=True)
+        m = m.flatten(start_dim=1)
+        m = F.relu(self.moves_left_fc1(m), inplace=True)
+        # We use ReLU at the very end to ensure moves left is >= 0
+        m = F.relu(self.moves_left_fc2(m)).squeeze(1)
 
-        return log_p, v
+        return log_p, v, m
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -149,10 +167,15 @@ class Connect4Net(nn.Module):
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self.state_dict(), path)
+        tmp_path = path.with_suffix(".pt.tmp")
+        torch.save(self.state_dict(), tmp_path)
+        tmp_path.replace(path)
 
     @classmethod
-    def load(cls, path: str | Path, channels: int = _DEFAULT_CHANNELS, num_blocks: int = _DEFAULT_NUM_BLOCKS) -> Connect4Net:
-        net = cls(channels=channels, num_blocks=num_blocks)
+    def load(cls, path: str | Path, **kwargs) -> Connect4Net:
+        d_model = kwargs.get("d_model", _DEFAULT_D_MODEL)
+        num_layers = kwargs.get("num_layers", _DEFAULT_NUM_LAYERS)
+        nhead = kwargs.get("nhead", _DEFAULT_NHEAD)
+        net = cls(d_model=d_model, num_layers=num_layers, nhead=nhead)
         net.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
         return net

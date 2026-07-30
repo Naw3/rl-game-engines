@@ -5,9 +5,10 @@ Both scripts need to export a Connect4Net to ONNX with identical settings.
 This module centralises the export so neither script duplicates the logic.
 
 Output contract (consumed by Rust network.rs via ORT):
-    input  "input"  shape (batch, 3, 6, 7)  f32
-    output "policy" shape (batch, 7)        f32  (log-probabilities)
-    output "value"  shape (batch,)          f32  (in [-1, 1] via tanh)
+    input  "input"      shape (batch, 3, 6, 7)  f32
+    output "policy"     shape (batch, 7)        f32  (log-probabilities)
+    output "value"      shape (batch,)          f32  (in [-1, 1] via tanh)
+    output "moves_left" shape (batch,)          f32
 
 The Rust side softmaxes the policy (since the model head outputs
 log-softmax). The model is moved to CPU before export.
@@ -110,10 +111,12 @@ def export_onnx(
             "Choose one of: fp32, fp16, int8."
         )
 
+    Path(onnx_path).parent.mkdir(parents=True, exist_ok=True)
+
     # Always export on CPU — ORT reads the file, not CUDA tensors.
     if next(model.parameters()).device.type == "cuda":
         from model import Connect4Net  # local import to avoid circular dependency
-        model_cpu = Connect4Net(channels=model.channels, num_blocks=model.num_blocks)
+        model_cpu = Connect4Net(d_model=model.d_model, num_layers=model.num_layers, nhead=model.nhead)
         model_cpu.load_state_dict(model.state_dict())
     else:
         model_cpu = model
@@ -121,10 +124,10 @@ def export_onnx(
     if infer_precision == "fp16":
         model_cpu = model_cpu.half()
         dummy = torch.randn(
-            1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS, dtype=torch.float16
+            2, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS, dtype=torch.float16
         )
     else:
-        dummy = torch.randn(1, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS)
+        dummy = torch.randn(2, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS)
 
     model_cpu.eval()
 
@@ -132,6 +135,7 @@ def export_onnx(
         "input":  {0: "batch_size"},
         "policy": {0: "batch_size"},
         "value":  {0: "batch_size"},
+        "moves_left": {0: "batch_size"},
     }
 
     with _SuppressOutput():
@@ -140,7 +144,7 @@ def export_onnx(
             (dummy,),
             str(onnx_path),
             input_names=["input"],
-            output_names=["policy", "value"],
+            output_names=["policy", "value", "moves_left"],
             dynamic_axes=dynamic_axes,
             opset_version=opset,
             do_constant_folding=True,
