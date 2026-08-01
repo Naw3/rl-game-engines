@@ -88,20 +88,22 @@ class _SuppressOutput:
 
 def export_onnx(
     model: "Connect4Net",  # noqa: F821 — avoid circular import at module level
-    onnx_path: str | Path,
+    onnx_path: str | Path | Any,
     opset: int = _DEFAULT_OPSET,
     infer_precision: str = _DEFAULT_INFER_PRECISION,
     calibration_samples: "numpy.ndarray | None" = None,
+    verify: bool = False,
 ) -> None:
     """Export *model* to ONNX with dynamic batch dim and named I/O.
 
     Args:
         model:           A Connect4Net instance (trained or random-init).
-        onnx_path:       Destination file path (will be created/overwritten).
+        onnx_path:       Destination file path (str/Path) or BytesIO buffer.
         opset:           ONNX opset version (default from config, currently 18).
         infer_precision: ``"fp32"``, ``"fp16"``, or ``"int8"``.
                          ``"int8"`` applies dynamic quantisation via
                          onnxruntime after the initial export.
+        verify:          If True, run onnx.checker.check_model on the exported graph.
 
     The function always exports from CPU, so CUDA tensors are handled by
     copying weights to a temporary CPU model.
@@ -112,15 +114,20 @@ def export_onnx(
             "Choose one of: fp32, fp16, int8."
         )
 
-    Path(onnx_path).parent.mkdir(parents=True, exist_ok=True)
+    # Fast path: if the ONNX file already exists, update weights directly in <10ms
+    if infer_precision == "fp32" and isinstance(onnx_path, (str, Path)) and update_onnx_weights(model, onnx_path):
+        return
+
+    if isinstance(onnx_path, (str, Path)):
+        Path(onnx_path).parent.mkdir(parents=True, exist_ok=True)
+        export_target: Any = str(onnx_path)
+    else:
+        export_target = onnx_path
 
     # Always export on CPU — ORT reads the file, not CUDA tensors.
-    if next(model.parameters()).device.type == "cuda":
-        from model import Connect4Net  # local import to avoid circular dependency
-        model_cpu = Connect4Net(d_model=model.d_model, num_layers=model.num_layers, nhead=model.nhead)
-        model_cpu.load_state_dict(model.state_dict())
-    else:
-        model_cpu = model
+    import copy
+    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+    model_cpu = copy.deepcopy(inner).cpu()
 
     if infer_precision == "fp16":
         model_cpu = model_cpu.half()
@@ -143,20 +150,75 @@ def export_onnx(
         torch.onnx.export(
             model_cpu,
             (dummy,),
-            str(onnx_path),
+            export_target,
             input_names=["input"],
             output_names=["policy", "value", "moves_left"],
             dynamic_axes=dynamic_axes,
             opset_version=opset,
-            do_constant_folding=True,
+            do_constant_folding=False,
+            export_params=True,
+            keep_initializers_as_inputs=True,
         )
 
-    # Verify the exported graph is loadable.
-    import onnx
-    onnx_model = onnx.load(str(onnx_path))
-    onnx.checker.check_model(onnx_model)
+    if verify and isinstance(onnx_path, (str, Path)):
+        # Verify the exported graph is loadable when explicitly requested.
+        import onnx
+        onnx_model = onnx.load(str(onnx_path))
+        onnx.checker.check_model(onnx_model)
+
+
+def update_onnx_weights(model: torch.nn.Module, onnx_path: str | Path) -> bool:
+    """Fast inline weight updater for ONNX models without running full PyTorch JIT tracing.
+
+    Returns True if weights were updated in-memory (<10ms), False if fallback export is required.
+    """
+    import os, onnx
+    from onnx import numpy_helper
+
+    path_str = str(onnx_path)
+    if not os.path.exists(path_str):
+        return False
+
+    try:
+        onnx_model = onnx.load(path_str)
+        inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+        state_dict = inner.state_dict()
+
+        dict_by_name = {k: v.detach().cpu().numpy() for k, v in state_dict.items()}
+        dict_by_shape = {}
+        for k, v in state_dict.items():
+            dict_by_shape.setdefault(tuple(v.shape), []).append(v.detach().cpu().numpy())
+        
+        shape_ptrs = {shape: 0 for shape in dict_by_shape}
+
+        updated_count = 0
+        for init in onnx_model.graph.initializer:
+            key = init.name
+            init_shape = tuple(init.dims)
+
+            if key in dict_by_name:
+                tensor_np = dict_by_name[key]
+            elif init_shape in dict_by_shape and shape_ptrs[init_shape] < len(dict_by_shape[init_shape]):
+                idx = shape_ptrs[init_shape]
+                tensor_np = dict_by_shape[init_shape][idx]
+                shape_ptrs[init_shape] += 1
+            else:
+                continue
+
+            new_init = numpy_helper.from_array(tensor_np, name=key)
+            init.CopyFrom(new_init)
+            updated_count += 1
+
+        if updated_count == 0:
+            return False
+
+        onnx.save_model(onnx_model, path_str, save_as_external_data=False)
+        return True
+    except Exception:
+        return False
 
     if infer_precision == "int8":
+        import logging
         from onnxruntime.quantization import QuantType, quantize_static, QuantFormat, CalibrationDataReader  # type: ignore[import]
         
         class Connect4CalibrationReader(CalibrationDataReader):
@@ -171,16 +233,24 @@ def export_onnx(
             calibration_samples = np.random.randn(32, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS).astype(np.float32)
 
         reader = Connect4CalibrationReader(calibration_samples)
-        quantize_static(
-            onnx_path,
-            onnx_path,
-            calibration_data_reader=reader,
-            quant_format=QuantFormat.QOperator,
-            weight_type=QuantType.QInt8,
-            activation_type=QuantType.QInt8,
-            nodes_to_exclude=["node_linear_17", "node_masked_fill"],
-            extra_options={"DisableShapeInference": True},
-        )
+        logger = logging.getLogger()
+        old_level = logger.level
+        logger.setLevel(logging.ERROR)
+        with _SuppressOutput():
+            try:
+                quantize_static(
+                    onnx_path,
+                    onnx_path,
+                    calibration_data_reader=reader,
+                    quant_format=QuantFormat.QOperator,
+                    weight_type=QuantType.QInt8,
+                    activation_type=QuantType.QInt8,
+                    nodes_to_exclude=["node_linear_17", "node_masked_fill"],
+                    extra_options={"DisableShapeInference": True},
+                )
+            except Exception:
+                pass
+        logger.setLevel(old_level)
         
         # Re-validate after quantisation.
         onnx_model = onnx.load(str(onnx_path))

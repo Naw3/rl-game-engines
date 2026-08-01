@@ -81,7 +81,9 @@ class Connect4Net(nn.Module):
         # **kwargs catches old arguments like channels/num_blocks to prevent crashes
         super().__init__()
         self.d_model = d_model
+        self.channels = d_model
         self.num_layers = num_layers
+        self.num_blocks = num_layers
         self.nhead = nhead
 
         # Flattened board: 6x7 = 42 squares. Each square starts with 3 features -> d_model

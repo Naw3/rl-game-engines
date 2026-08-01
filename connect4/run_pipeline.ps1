@@ -18,6 +18,11 @@ $ErrorActionPreference = "Continue"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Push-Location $ScriptDir
 
+# --- TensorRT Path Injection ---
+if (-not ($env:PATH -like "*C:\TensorRT10\TensorRT-10.16.1.11\lib*")) {
+    $env:PATH = "C:\TensorRT10\TensorRT-10.16.1.11\lib;" + $env:PATH
+}
+
 # --- Helpers ----------------------------------------------------------------
 function Format-Seconds([datetime]$t0, [datetime]$t1) {
     $elapsed = [math]::Round(($t1 - $t0).TotalSeconds, 1)

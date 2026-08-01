@@ -127,43 +127,40 @@ def decode_bitboard_batched(
 # ---------------------------------------------------------------------------
 
 class C4Dataset(Dataset):
-    """Memory-mapped reader for the C4D1 self-play binary file.
+    """PyTorch Dataset reading directly from the C4D1 binary format."""
 
-    The full file is loaded into a single uint8 numpy array of shape
-    (16 + 56 * N,). For a typical 64-game run this is ~1.5 MB — small
-    enough to fit comfortably in RAM but big enough that we'd rather
-    not reopen the file on every `__getitem__`. The dataset slices
-    into the in-memory buffer.
+    def __init__(self, data: str | Path | bytes, max_samples: int | None = None) -> None:
+        """Initialize the dataset from a file path or raw bytes.
 
-    For multi-million-sample runs you may want to mmap the file instead
-    of loading it. The interface would be identical; only the underlying
-    storage changes.
-    """
+        Args:
+            data: Path to the .bin file, or raw bytes of the file.
+            max_samples: If set, limit the dataset size.
+        """
+        if isinstance(data, bytes):
+            self.raw_data = np.frombuffer(data, dtype=np.uint8)
+        else:
+            path = Path(data)
+            if not path.is_file():
+                raise FileNotFoundError(f"Dataset not found: {path}")
+            self.raw_data = np.fromfile(path, dtype=np.uint8)
 
-    def __init__(self, path: str, max_samples: int | None = None) -> None:
-        self.path = path
-        with open(path, "rb") as f:
-            header = f.read(HEADER_SIZE)
-        if header[:4] != MAGIC:
+        header = self.raw_data[:HEADER_SIZE]
+        if header[:4].tobytes() != MAGIC:
             raise ValueError(
-                f"{path}: bad magic {header[:4]!r}, expected {MAGIC!r} "
+                f"bad magic {header[:4]!r}, expected {MAGIC!r} "
                 f"(was this file produced by `connect4-selfplay`?)"
             )
-        declared = int.from_bytes(header[4:8], "little")
-        # Sanity-check declared size matches file length.
-        import os
-        actual = (os.path.getsize(path) - HEADER_SIZE) // SAMPLE_SIZE
+        
+        declared = int.from_bytes(header[4:8].tobytes(), "little")
+        actual = (self.raw_data.size - HEADER_SIZE) // SAMPLE_SIZE
         if declared != actual:
             raise ValueError(
-                f"{path}: header says {declared} samples but file has {actual}"
+                f"header says {declared} samples but file has {actual}"
             )
         self.count = min(declared, max_samples) if max_samples else declared
 
         # Load the entire data section (skip the header) as a uint8 array.
-        # np.fromfile is fast for contiguous binary data.
-        self._raw = np.fromfile(
-            path, dtype=np.uint8, count=HEADER_SIZE + SAMPLE_SIZE * self.count
-        )[HEADER_SIZE:]
+        self._raw = self.raw_data[HEADER_SIZE : HEADER_SIZE + SAMPLE_SIZE * self.count]
 
         # Pre-decode all planes into one big array — way faster than
         # calling decode_bitboard on every __getitem__.
@@ -214,7 +211,7 @@ class C4Dataset(Dataset):
         )
 
     def stats(self) -> dict:
-        """Summary statistics for the dataset — useful in train.py for logging."""
+        # Summary statistics for the dataset
         n = self.count
         n_pos  = int((self._value > 0).sum())
         n_neg  = int((self._value < 0).sum())

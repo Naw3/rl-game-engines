@@ -71,6 +71,27 @@ def _check_win(bb: int) -> bool:
     return False
 
 
+def _flip_horizontal_u64(b: int) -> int:
+    """Reverse column order of a Connect4 bitboard."""
+    col0 = (b & 0x7F) << 42
+    col1 = (b & (0x7F << 7)) << 28
+    col2 = (b & (0x7F << 14)) << 14
+    col3 = b & (0x7F << 21)
+    col4 = (b & (0x7F << 28)) >> 14
+    col5 = (b & (0x7F << 35)) >> 28
+    col6 = (b & (0x7F << 42)) >> 42
+    return col0 | col1 | col2 | col3 | col4 | col5 | col6
+
+
+def _canonical_board(own: int, opp: int) -> tuple[int, int, bool]:
+    """Return (canonical_own, canonical_opp, is_flipped)."""
+    f_own = _flip_horizontal_u64(own)
+    f_opp = _flip_horizontal_u64(opp)
+    if (own, opp) <= (f_own, f_opp):
+        return own, opp, False
+    return f_own, f_opp, True
+
+
 def _legal_mask(own: int, opp: int) -> int:
     """Return 7-bit mask of legal columns (bit c set if column c is playable)."""
     occupied = own | opp
@@ -223,6 +244,7 @@ class SelfPlayWorker:
         self.games_played = 0
         self.samples_generated = 0
         self._thread: Optional[threading.Thread] = None
+        self.eval_cache: dict[tuple[int, int], tuple[np.ndarray, float]] = {}
 
     def sync_weights(self) -> None:
         """Copy latest training model weights to the self-play model."""
@@ -232,6 +254,7 @@ class SelfPlayWorker:
             else self.training_model
         )
         self.sp_model.load_state_dict(inner.state_dict())
+        self.eval_cache.clear()
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True, name="selfplay")
@@ -241,6 +264,48 @@ class SelfPlayWorker:
         self.stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=10)
+
+    def _evaluate_batch_cached(
+        self, own_opp_list: list[tuple[int, int]]
+    ) -> list[tuple[np.ndarray, float]]:
+        """Evaluate a batch of (own, opp) boards using eval_cache and symmetry."""
+        results: list[Optional[tuple[np.ndarray, float]]] = [None] * len(own_opp_list)
+        missing_indices: list[int] = []
+        missing_boards: list[tuple[int, int]] = []
+
+        for i, (own, opp) in enumerate(own_opp_list):
+            c_own, c_opp, is_flipped = _canonical_board(own, opp)
+            cached = self.eval_cache.get((c_own, c_opp))
+            if cached is not None:
+                policy, val = cached
+                if is_flipped:
+                    policy = policy[::-1]
+                results[i] = (policy, val)
+            else:
+                missing_indices.append(i)
+                missing_boards.append((own, opp))
+
+        if missing_boards:
+            batch_planes = np.stack(
+                [_board_to_planes(o, p) for o, p in missing_boards]
+            )
+            bt = torch.from_numpy(batch_planes).to(self.device)
+            lp, vs = self.sp_model(bt)
+            probs = lp.exp().cpu().numpy()
+            vals = vs.cpu().numpy().flatten()
+
+            if len(self.eval_cache) > 500_000:
+                self.eval_cache.clear()
+
+            for idx, (own, opp), policy, val in zip(
+                missing_indices, missing_boards, probs, vals
+            ):
+                c_own, c_opp, is_flipped = _canonical_board(own, opp)
+                stored_policy = policy[::-1] if is_flipped else policy
+                self.eval_cache[(c_own, c_opp)] = (stored_policy, float(val))
+                results[idx] = (policy, float(val))
+
+        return [r for r in results if r is not None]
 
     # ── Main loop ──────────────────────────────────────────────────────
 
@@ -259,16 +324,12 @@ class SelfPlayWorker:
                 # Build MCTS root for every active game.
                 roots = [_Node(owns[i], opps[i]) for i in range(n)]
 
-                # Batch-evaluate all roots in one forward pass.
-                root_batch = np.stack(
-                    [_board_to_planes(owns[i], opps[i]) for i in range(n)]
+                # Batch-evaluate all roots with cache.
+                root_evals = self._evaluate_batch_cached(
+                    [(owns[i], opps[i]) for i in range(n)]
                 )
-                root_tensor = torch.from_numpy(root_batch).to(self.device)
-                log_p, _ = self.sp_model(root_tensor)
-                root_probs = log_p.exp().cpu().numpy()
-
                 for i in range(n):
-                    self._expand_root(roots[i], root_probs[i])
+                    self._expand_root(roots[i], root_evals[i][0])
 
                 # ── Simulation loop ────────────────────────────────────
                 for _ in range(cfg.sims):
@@ -282,19 +343,14 @@ class SelfPlayWorker:
                             needs_eval.append((i, leaf, path))
 
                     if needs_eval:
-                        batch_planes = np.stack(
-                            [_board_to_planes(lf.own, lf.opp) for _, lf, _ in needs_eval]
+                        evals = self._evaluate_batch_cached(
+                            [(lf.own, lf.opp) for _, lf, _ in needs_eval]
                         )
-                        bt = torch.from_numpy(batch_planes).to(self.device)
-                        lp, vs = self.sp_model(bt)
-                        probs = lp.exp().cpu().numpy()
-                        vals = vs.cpu().numpy().flatten()
-
-                        for (idx, leaf, path), policy, value in zip(
-                            needs_eval, probs, vals
+                        for (idx, leaf, path), (policy, value) in zip(
+                            needs_eval, evals
                         ):
                             self._expand_leaf(leaf, policy)
-                            self._backup(path, float(value))
+                            self._backup(path, value)
 
                 # ── Make moves & collect finished games ─────────────────
                 for i in range(n):

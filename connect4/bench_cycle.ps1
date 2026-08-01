@@ -37,6 +37,14 @@ if (Test-Path $configScript) {
     }
 }
 
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+Push-Location $ScriptDir
+
+# --- TensorRT Path Injection ---
+if (-not ($env:PATH -like "*C:\TensorRT10\TensorRT-10.16.1.11\lib*")) {
+    $env:PATH = "C:\TensorRT10\TensorRT-10.16.1.11\lib;" + $env:PATH
+}
+
 # --- Parameters -------------------------------------------------------------
 $GAMES            = if ($env:BENCH_GAMES)            { [int]$env:BENCH_GAMES }            else { 64 }
 $SIMS             = if ($env:BENCH_SIMS)             { [int]$env:BENCH_SIMS }             else { 800 }

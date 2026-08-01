@@ -82,3 +82,19 @@ After break ...:
 
   Self-Play Speedup (CPU -> GPU) : 14.87x faster
 =================================================================
+
+=================================================================
+  BENCHMARK SUMMARY & PERFORMANCE REPORT (THROUGHPUT)
+=================================================================
+  [Stage 2 - Rust MCTS GPU  (batch=32)] :
+    - Generation Throughput : 151.9 samples/sec (in 60s)
+    - Games Played          : 507 games (8.4 games/sec)
+=================================================================
+
+=================================================================
+  BENCHMARK SUMMARY & PERFORMANCE REPORT (THROUGHPUT)
+=================================================================
+  [Stage 2 - Rust MCTS GPU  (batch=32)] :
+    - Generation Throughput : 168.8 samples/sec (in 60s)
+    - Games Played          : 564 games (9.4 games/sec)
+=================================================================

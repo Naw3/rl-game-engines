@@ -1,5 +1,5 @@
 // =============================================================================
-// main.rs — Network-guided self-play data generator for Connect 4.
+// main.rs — Network-guided self-play data generator for Connect 4 (Fast CUDA).
 //
 // This is the real AlphaZero self-play loop: the Rust MCTS is guided by
 // a neural network (loaded from an ONNX file produced by the Python
@@ -82,7 +82,6 @@ struct Sample {
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)]
 struct ConfigJson {
     mcts: Option<MctsJson>,
     gui: Option<GuiJson>,
@@ -117,7 +116,6 @@ struct PathsJson {
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)]
 struct DeviceJson {
     rust_device: Option<String>,
 }
@@ -196,7 +194,10 @@ fn main() -> ExitCode {
     let mut c_puct: f32 = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.c_puct).unwrap_or(mcts::DEFAULT_C_PUCT);
     let dirichlet_alpha: f32 = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.dirichlet_alpha).unwrap_or(mcts::DEFAULT_DIRICHLET_ALPHA);
     let mut dirichlet_eps: f32 = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.dirichlet_epsilon).unwrap_or(mcts::DEFAULT_DIRICHLET_EPSILON);
-    let mut device: network::Device = network::Device::Auto;
+    let mut device: network::Device = json_cfg.as_ref()
+        .and_then(|c| c.device.as_ref()?.rust_device.as_deref())
+        .and_then(|s| network::Device::from_str(s).ok())
+        .unwrap_or(network::Device::Auto);
     let mut stream_mode: bool = false;
     let mut verbose: bool = false;
 
@@ -418,7 +419,7 @@ fn main() -> ExitCode {
 
                         let dur_f64 = dur as f64;
                         let pct = ((elapsed / dur_f64) * 100.0).clamp(0.0, 100.0) as usize;
-                        let bar_width = json_cfg.as_ref().and_then(|c| c.gui.as_ref()?.progress_bar_width).unwrap_or(20);
+                        let bar_width: usize = json_cfg.as_ref().and_then(|c| c.gui.as_ref()?.progress_bar_width).unwrap_or(20);
                         let filled = ((elapsed / dur_f64) * bar_width as f64).clamp(0.0, bar_width as f64) as usize;
                         let empty = bar_width.saturating_sub(filled);
                         let bar = format!(
@@ -526,7 +527,16 @@ fn main() -> ExitCode {
                 if verbose {
                     eprintln!("[selfplay] Received ONNX model from Python via stdin, hot-reloading...");
                 }
-                match Network::load_from_memory(&model_bytes, device) {
+                let ipc_onnx_path = std::path::Path::new(&model_path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("connect4_model_ipc.onnx");
+                let load_res = if ipc_onnx_path.exists() {
+                    Network::load(&ipc_onnx_path, device)
+                } else {
+                    Network::load_from_memory(&model_bytes, device)
+                };
+                match load_res {
                     Ok(new_net) => {
                         network = Arc::new(new_net);
                     }

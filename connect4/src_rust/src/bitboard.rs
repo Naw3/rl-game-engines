@@ -193,6 +193,40 @@ impl Board {
     pub fn to_planes(&self) -> [u64; 3] {
         [self.own, self.opp, !0u64]
     }
+
+    /// Flip the board horizontally (mirror columns 0..6 -> 6..0).
+    #[inline]
+    pub fn flip_horizontal(&self) -> Board {
+        Board {
+            own: flip_horizontal_u64(self.own),
+            opp: flip_horizontal_u64(self.opp),
+        }
+    }
+
+    /// Return `(canonical_board, is_flipped)`.
+    /// `is_flipped` is true if the canonical board is the horizontal mirror.
+    #[inline(always)]
+    pub fn canonical(&self) -> (Board, bool) {
+        let flipped = self.flip_horizontal();
+        if (self.own, self.opp) <= (flipped.own, flipped.opp) {
+            (*self, false)
+        } else {
+            (flipped, true)
+        }
+    }
+}
+
+/// Reverse the column ordering of a Connect 4 bitboard.
+#[inline(always)]
+pub fn flip_horizontal_u64(b: u64) -> u64 {
+    let col0 = (b & 0x7F) << 42;
+    let col1 = (b & (0x7F << 7)) << 28;
+    let col2 = (b & (0x7F << 14)) << 14;
+    let col3 =  b & (0x7F << 21);
+    let col4 = (b & (0x7F << 28)) >> 14;
+    let col5 = (b & (0x7F << 35)) >> 28;
+    let col6 = (b & (0x7F << 42)) >> 42;
+    col0 | col1 | col2 | col3 | col4 | col5 | col6
 }
 
 impl Default for Board {

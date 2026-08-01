@@ -53,7 +53,7 @@ class TrainConfig:
     ema_decay: float = 0.999
     symmetry: bool = True
     train_precision: str = "fp32"  # "fp32", "fp16", "bf16"
-    infer_precision: str = "int8"  # "fp32", "fp16", "int8"
+    infer_precision: str = "fp32"  # "fp32", "fp16", "int8"
     compile_mode: str = "none"  # "none", "default", "reduce-overhead", "max-autotune"
     channels_last: bool = False
     fused_adamw: bool = False

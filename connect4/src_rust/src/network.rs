@@ -1,5 +1,5 @@
 // =============================================================================
-// network.rs — ONNX inference via ORT (CPU & GPU dispatcher).
+// network.rs — ONNX inference via ORT (CUDA dispatcher).
 //
 // Inference Architecture: Centralised Dispatcher
 // ---------------------------------------------------
@@ -19,13 +19,17 @@
 // =============================================================================
 
 use crate::bitboard::{col_mask, Board};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 use crossbeam_channel::{bounded, Receiver, Sender};
 
 // --- ort imports ----------------------------------------------------------
 use ort::execution_providers::CPUExecutionProvider;
 #[cfg(feature = "cuda")]
 use ort::execution_providers::CUDAExecutionProvider;
+#[cfg(feature = "tensorrt")]
+use ort::execution_providers::TensorRTExecutionProvider;
 use ort::session::builder::SessionBuilder;
 use ort::session::Session;
 use ort::value::Value;
@@ -35,6 +39,101 @@ use ort::value::Value;
 /// 64 is the natural ceiling. Larger = more GPU utilisation; smaller = lower
 /// latency per individual request.
 const MAX_DISPATCHER_BATCH: usize = 64;
+
+const NUM_CACHE_SHARDS: usize = 256;
+const MAX_ENTRIES_PER_SHARD: usize = 65536; // ~16M entries total
+
+use std::hash::{BuildHasherDefault, Hasher};
+
+#[derive(Default)]
+pub struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(5) ^ (b as u64);
+        }
+    }
+    #[inline(always)]
+    fn write_u128(&mut self, i: u128) {
+        let low = i as u64;
+        let high = (i >> 64) as u64;
+        self.0 = low ^ high.wrapping_mul(0x9E3779B97F4A7C15);
+    }
+}
+
+type FastHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
+
+/// Sharded, lock-free/rwlock evaluation cache with horizontal symmetry canonicalization.
+pub struct EvalCache {
+    shards: Vec<RwLock<FastHashMap<u128, Eval>>>,
+}
+
+impl EvalCache {
+    pub fn new() -> Self {
+        let mut shards = Vec::with_capacity(NUM_CACHE_SHARDS);
+        for _ in 0..NUM_CACHE_SHARDS {
+            shards.push(RwLock::new(FastHashMap::with_capacity_and_hasher(
+                4096,
+                BuildHasherDefault::default(),
+            )));
+        }
+        EvalCache { shards }
+    }
+
+    #[inline]
+    fn shard_idx(key: u128) -> usize {
+        (key as usize) % NUM_CACHE_SHARDS
+    }
+
+    pub fn get(&self, board: &Board) -> Option<Eval> {
+        let (canon, is_flipped) = board.canonical();
+        let key = ((canon.own as u128) << 64) | (canon.opp as u128);
+        let idx = Self::shard_idx(key);
+        let shard = self.shards[idx].read().ok()?;
+        let eval = shard.get(&key)?;
+        Some(unflip_eval(*eval, is_flipped))
+    }
+
+    pub fn insert(&self, board: Board, eval: Eval) {
+        let (canon, is_flipped) = board.canonical();
+        let key = ((canon.own as u128) << 64) | (canon.opp as u128);
+        let stored_eval = unflip_eval(eval, is_flipped);
+        let idx = Self::shard_idx(key);
+        if let Ok(mut shard) = self.shards[idx].write() {
+            if shard.len() >= MAX_ENTRIES_PER_SHARD {
+                shard.clear();
+            }
+            shard.insert(key, stored_eval);
+        }
+    }
+}
+
+#[inline]
+fn unflip_eval(eval: Eval, is_flipped: bool) -> Eval {
+    if !is_flipped {
+        eval
+    } else {
+        Eval {
+            policy: [
+                eval.policy[6],
+                eval.policy[5],
+                eval.policy[4],
+                eval.policy[3],
+                eval.policy[2],
+                eval.policy[1],
+                eval.policy[0],
+            ],
+            value: eval.value,
+            moves_left: eval.moves_left,
+        }
+    }
+}
 
 /// Inference device. `Auto` resolves at session load time based on
 /// whether the `cuda` feature was compiled in.
@@ -79,6 +178,7 @@ impl Device {
 pub struct Network {
     queue: Option<InferQueue>,
     device: Device,
+    cache: Arc<EvalCache>,
 }
 
 /// The sender half of the dispatcher's request queue. Cloned cheaply per thread.
@@ -100,7 +200,6 @@ struct InferRequest {
 pub struct Eval {
     pub policy: [f32; 7],
     pub value: f32,
-    #[allow(dead_code)]
     pub moves_left: f32,
 }
 
@@ -112,6 +211,7 @@ impl Network {
         Ok(Network {
             queue: Some(queue),
             device,
+            cache: Arc::new(EvalCache::new()),
         })
     }
 
@@ -122,6 +222,7 @@ impl Network {
         Ok(Network {
             queue: Some(queue),
             device,
+            cache: Arc::new(EvalCache::new()),
         })
     }
 
@@ -132,6 +233,7 @@ impl Network {
         Network {
             queue: None,
             device: Device::Cpu,
+            cache: Arc::new(EvalCache::new()),
         }
     }
 
@@ -147,10 +249,15 @@ impl Network {
 
     /// Evaluate a single position. Dispatches to the right backend.
     pub fn evaluate(&self, board: Board) -> Eval {
-        match self.queue.as_ref() {
+        if let Some(cached) = self.cache.get(&board) {
+            return cached;
+        }
+        let eval = match self.queue.as_ref() {
             Some(queue) => dispatcher_eval(queue, board),
             None => null_eval(board),
-        }
+        };
+        self.cache.insert(board, eval);
+        eval
     }
 
     /// Evaluate a batch of positions. On GPU, each board is submitted
@@ -161,10 +268,31 @@ impl Network {
         if boards.is_empty() {
             return Vec::new();
         }
-        match self.queue.as_ref() {
-            Some(queue) => dispatcher_batch_eval(queue, boards),
-            None => boards.iter().map(|&b| null_eval(b)).collect(),
+        let mut results = vec![None; boards.len()];
+        let mut missing_indices = Vec::new();
+        let mut missing_boards = Vec::new();
+
+        for (i, &b) in boards.iter().enumerate() {
+            if let Some(cached) = self.cache.get(&b) {
+                results[i] = Some(cached);
+            } else {
+                missing_indices.push(i);
+                missing_boards.push(b);
+            }
         }
+
+        if !missing_boards.is_empty() {
+            let evals = match self.queue.as_ref() {
+                Some(queue) => dispatcher_batch_eval(queue, &missing_boards),
+                None => missing_boards.iter().map(|&b| null_eval(b)).collect(),
+            };
+            for ((idx, &b), eval) in missing_indices.into_iter().zip(missing_boards.iter()).zip(evals.into_iter()) {
+                self.cache.insert(b, eval);
+                results[idx] = Some(eval);
+            }
+        }
+
+        results.into_iter().map(|opt| opt.expect("all evals populated")).collect()
     }
 }
 
@@ -176,7 +304,7 @@ impl Network {
 /// compiled in; CPU otherwise.
 pub(crate) fn load_ort(path: &Path, device: Device) -> Result<Session, Box<dyn std::error::Error>> {
     let mut builder = SessionBuilder::new()?
-        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?;
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level1)?;
 
     #[cfg(feature = "cuda")]
     {
@@ -201,31 +329,17 @@ pub(crate) fn load_ort(path: &Path, device: Device) -> Result<Session, Box<dyn s
     Ok(session)
 }
 
+#[cfg(feature = "tensorrt")]
+fn is_int8_onnx_bytes(bytes: &[u8]) -> bool {
+    bytes.windows(14).any(|w| w == b"QuantizeLinear" || w == b"DequantizeLinear")
+        || bytes.windows(7).any(|w| w == b"QLinear")
+}
+
 pub(crate) fn load_ort_from_memory(bytes: &[u8], device: Device) -> Result<Session, Box<dyn std::error::Error>> {
-    let mut builder = SessionBuilder::new()?
-        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?;
-
-    #[cfg(feature = "cuda")]
-    {
-        if device == Device::Gpu {
-            builder = builder.with_execution_providers([
-                CUDAExecutionProvider::default()
-                    .with_device_id(0)
-                    .build()
-                    .error_on_failure(),
-                CPUExecutionProvider::default().build(),
-            ])?;
-        }
-    }
-
-    if device == Device::Cpu {
-        builder = builder.with_execution_providers([
-            CPUExecutionProvider::default().build(),
-        ])?;
-    }
-
-    let session = builder.commit_from_memory(bytes)?;
-    Ok(session)
+    let temp_dir = std::env::temp_dir();
+    let temp_path = temp_dir.join("connect4_hotreload.onnx");
+    std::fs::write(&temp_path, bytes)?;
+    load_ort(&temp_path, device)
 }
 
 // ---------------------------------------------------------------------------
@@ -297,7 +411,12 @@ fn run_dispatcher(mut session: Session, rx: Receiver<InferRequest>) {
         let n = batch.len();
 
         // Build the (N, 3, 6, 7) input tensor.
-        let boards: Vec<Board> = batch.iter().map(|r| r.board).collect();
+        let mut boards: Vec<Board> = batch.iter().map(|r| r.board).collect();
+        // Pad the batch to EXACTLY MAX_DISPATCHER_BATCH for TensorRT
+        let pad_board = boards[0];
+        while boards.len() < MAX_DISPATCHER_BATCH {
+            boards.push(pad_board);
+        }
         let (shape, data) = boards_to_input(&boards);
         let input_val = match Value::from_array((shape, data)) {
             Ok(v) => v,

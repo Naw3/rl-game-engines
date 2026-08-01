@@ -209,14 +209,9 @@ def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET,
     log-softmax). The model is moved to CPU before export to avoid
     ONNX complaining about CUDA tensors.
     """
-    was_cuda = next(model.parameters()).device.type == "cuda"
-    if was_cuda:
-        model_cpu = Connect4Net(
-            channels=model.channels, num_blocks=model.num_blocks
-        ).cpu()
-        model_cpu.load_state_dict(model.state_dict())
-    else:
-        model_cpu = model
+    import copy
+    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+    model_cpu = copy.deepcopy(inner).cpu()
     if infer_precision not in {"fp32", "fp16", "int8"}:
         raise ValueError(f"Unsupported inference precision: {infer_precision}")
     if infer_precision == "fp16":
@@ -604,34 +599,35 @@ def main() -> None:
             print(f"[train] torch.compile failed: {e}; continuing uncompiled")
 
     # ---- Warmup -----------------------------------------------------------
-    print("[train] warming up model to trigger compilation...")
-    model.train()
-    
-    warmup_steps = 10
-    steps_done = 0
-    if len(ds) > 0:
-        while steps_done < warmup_steps:
-            for warmup_batch in loader:
-                wp, wtp, wtv, wtm = [x.to(args.device) for x in warmup_batch]
-                if args.channels_last:
-                    wp = wp.to(memory_format=torch.channels_last)
-                optimizer.zero_grad(set_to_none=True)
-                with autocast(enabled=use_amp, device_type="cuda" if use_amp else "cpu", dtype=torch.float16 if use_amp else None):
-                    w_log_p, w_v, w_m = model(wp)
-                    w_loss, _, _, _ = compute_loss(w_log_p, w_v, w_m, wtp, wtv, wtm)
-                scaler.scale(w_loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=_DEFAULT_MAX_GRAD_NORM)
-                scaler.step(optimizer)
-                scaler.update()
-                
-                if args.device == "cuda":
-                    torch.cuda.synchronize()
-                
-                steps_done += 1
-                if steps_done >= warmup_steps:
-                    break
-    print("[train] warmup complete.")
+    if args.compile_mode != "none":
+        print("[train] warming up model to trigger compilation...")
+        model.train()
+        
+        warmup_steps = 10
+        steps_done = 0
+        if len(ds) > 0:
+            while steps_done < warmup_steps:
+                for warmup_batch in loader:
+                    wp, wtp, wtv, wtm = [x.to(args.device) for x in warmup_batch]
+                    if args.channels_last:
+                        wp = wp.to(memory_format=torch.channels_last)
+                    optimizer.zero_grad(set_to_none=True)
+                    with autocast(enabled=use_amp, device_type="cuda" if use_amp else "cpu", dtype=torch.float16 if use_amp else None):
+                        w_log_p, w_v, w_m = model(wp)
+                        w_loss, _, _, _ = compute_loss(w_log_p, w_v, w_m, wtp, wtv, wtm)
+                    scaler.scale(w_loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=_DEFAULT_MAX_GRAD_NORM)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    
+                    if args.device == "cuda":
+                        torch.cuda.synchronize()
+                    
+                    steps_done += 1
+                    if steps_done >= warmup_steps:
+                        break
+        print("[train] warmup complete.")
 
     # ---- Train Loop -------------------------------------------------------
     best_loss = float("inf")
@@ -779,16 +775,18 @@ def main() -> None:
         t_export_start = time.time()
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
         
-        # Save raw PyTorch model
-        inner.save(args.out)
-
-        # Save EMA PyTorch model if active
-        if 'ema' in locals() and ema is not None:
-            import copy
-            ema_model = copy.deepcopy(inner)
-            ema.apply_shadow(ema_model)
-            ema_pt_path = args.out.replace(".pt", "_ema.pt")
-            ema_model.save(ema_pt_path)
+        # Save PyTorch models (.pt) to disk only when loss improves or training completes
+        is_best_epoch = (running["total"].item() / max(1, n_batches)) < best_loss
+        if is_best_epoch or (epoch == args.epochs - 1) or done:
+            inner.save(args.out)
+            if 'ema' in locals() and ema is not None:
+                import copy
+                ema_model = copy.deepcopy(inner)
+                ema.apply_shadow(ema_model)
+                ema_pt_path = args.out.replace(".pt", "_ema.pt")
+                ema_model.save(ema_pt_path)
+            else:
+                ema_model = None
         else:
             ema_model = None
 
@@ -799,25 +797,16 @@ def main() -> None:
         )
         if should_export_onnx:
             if sp_proc is not None and sp_proc.stdin is not None:
-                import tempfile, os
-                with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
-                    tmp_path = tmp.name
                 try:
-                    export_onnx(inner, tmp_path, opset=args.onnx_opset, infer_precision=args.infer_precision, calibration_samples=calibration_batch)
-                    with open(tmp_path, "rb") as f:
+                    ipc_path = args.out.replace(".pt", "_ipc.onnx")
+                    export_onnx(inner, ipc_path, opset=args.onnx_opset, infer_precision=args.infer_precision)
+                    with open(ipc_path, "rb") as f:
                         data = f.read()
-                    # Write length prefix (4 bytes, little-endian) and data to Rust's stdin
                     sp_proc.stdin.write(len(data).to_bytes(4, byteorder="little"))
                     sp_proc.stdin.write(data)
                     sp_proc.stdin.flush()
                 except Exception as e:
                     print(f"[train] WARNING: ONNX IPC export to Rust failed: {e}")
-                finally:
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
             else:
                 # Fallback to disk if not in stream mode
                 onnx_path = args.out.replace(".pt", ".onnx")
