@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -159,6 +160,55 @@ except Exception as err:
     _DEFAULT_CHANNELS_LAST = False
     _DEFAULT_FUSED_ADAMW = False
 
+
+_EPOCH_CHECKPOINT_RE = re.compile(
+    r"^(?P<base>.+?)_epoch(?P<epoch>\d+)(?P<ema>_ema)?$",
+    re.IGNORECASE,
+)
+
+
+def format_duration(seconds: float) -> str:
+    """Format short durations without losing sub-second timings."""
+    seconds = max(0.0, float(seconds))
+    if seconds < 1.0:
+        milliseconds = 0 if seconds == 0.0 else max(1, int(round(seconds * 1000.0)))
+        return f"{milliseconds}ms"
+    return f"{seconds:.2f}s"
+
+
+def checkpoint_epoch(checkpoint_path: str | Path) -> int:
+    """Read the cumulative epoch encoded in a checkpoint filename."""
+    match = _EPOCH_CHECKPOINT_RE.match(Path(checkpoint_path).stem)
+    return int(match.group("epoch")) if match else 0
+
+
+def checkpoint_path_for_epoch(checkpoint_path: str | Path, epoch: int) -> Path:
+    """Build a new checkpoint filename containing the cumulative epoch."""
+    path = Path(checkpoint_path)
+    match = _EPOCH_CHECKPOINT_RE.match(path.stem)
+    if match:
+        stem = f"{match.group('base')}_epoch{epoch}{match.group('ema') or ''}"
+    else:
+        stem = f"{path.stem}_epoch{epoch}"
+    return path.with_name(stem + path.suffix)
+
+
+def latest_epoch_checkpoint(checkpoint_path: str | Path) -> Path | None:
+    """Find the newest raw checkpoint beside a stable model path."""
+    path = Path(checkpoint_path)
+    base_stem = path.stem
+    current = _EPOCH_CHECKPOINT_RE.match(base_stem)
+    if current:
+        base_stem = current.group("base")
+
+    candidates: list[tuple[int, Path]] = []
+    for candidate in path.parent.glob(f"{base_stem}_epoch*.pt"):
+        match = _EPOCH_CHECKPOINT_RE.match(candidate.stem)
+        if match and match.group("base") == base_stem and not match.group("ema"):
+            candidates.append((int(match.group("epoch")), candidate))
+
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -170,6 +220,7 @@ except ImportError:  # PyTorch < 2.0
 
 from dataset import C4Dataset
 from model import Connect4Net
+from utils.onnx_export import export_onnx
 
 
 # ---------------------------------------------------------------------------
@@ -195,97 +246,6 @@ def compute_loss(
     return policy_loss + value_loss + moves_left_loss, policy_loss, value_loss, moves_left_loss
 
 
-def export_onnx(model: Connect4Net, onnx_path: str, opset: int = _DEFAULT_OPSET,
-                infer_precision: str = _DEFAULT_INFER_PRECISION,
-                calibration_samples: np.ndarray | None = None) -> None:
-    """Export the (already-trained) model to ONNX.
-
-    Output contract — the Rust side (network.rs) reads by name:
-        input  "input"  shape (batch, 3, 6, 7)  f32
-        output "policy" shape (batch, 7)        f32  (log-probabilities)
-        output "value"  shape (batch,)          f32  (in [-1, 1] via tanh)
-
-    The Rust side softmaxes the policy (since the model head outputs
-    log-softmax). The model is moved to CPU before export to avoid
-    ONNX complaining about CUDA tensors.
-    """
-    import copy
-    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-    model_cpu = copy.deepcopy(inner).cpu()
-    if infer_precision not in {"fp32", "fp16", "int8"}:
-        raise ValueError(f"Unsupported inference precision: {infer_precision}")
-    if infer_precision == "fp16":
-        model_cpu = model_cpu.half()
-        dummy = torch.randn(2, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS, dtype=torch.float16)
-    else:
-        dummy = torch.randn(2, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS)
-    model_cpu.eval()
-
-    dynamic_axes = {
-        "input": {0: "batch_size"},
-        "policy": {0: "batch_size"},
-        "value": {0: "batch_size"},
-        "moves_left": {0: "batch_size"},
-    }
-    import os, sys
-    class SuppressOutput:
-        def __enter__(self):
-            self._stdout, self._stderr = sys.stdout, sys.stderr
-            sys.stdout = sys.stderr = open(os.devnull, 'w', encoding='utf-8')
-            try:
-                self.fd = os.open(os.devnull, os.O_WRONLY)
-                self.save_out = os.dup(1)
-                self.save_err = os.dup(2)
-                os.dup2(self.fd, 1)
-                os.dup2(self.fd, 2)
-            except Exception: pass
-        def __exit__(self, *args):
-            sys.stdout.close()
-            sys.stdout, sys.stderr = self._stdout, self._stderr
-            try:
-                os.dup2(self.save_out, 1)
-                os.dup2(self.save_err, 2)
-                os.close(self.fd); os.close(self.save_out); os.close(self.save_err)
-            except Exception: pass
-
-    with SuppressOutput():
-        torch.onnx.export(
-        model_cpu,
-        (dummy,),
-        onnx_path,
-        input_names=["input"],
-        output_names=["policy", "value", "moves_left"],
-        dynamic_axes=dynamic_axes,
-        opset_version=opset,
-        do_constant_folding=True,
-    )
-    # Verify the exported graph is loadable and the outputs are correct.
-    import onnx
-    onnx_model = onnx.load(onnx_path)
-    onnx.checker.check_model(onnx_model)
-    if infer_precision == "int8":
-        from onnxruntime.quantization import QuantType, quantize_static, QuantFormat, CalibrationDataReader
-        
-        class Connect4CalibrationReader(CalibrationDataReader):
-            def __init__(self, samples_np):
-                self.enum_data = iter([{"input": samples_np}])
-            def get_next(self):
-                return next(self.enum_data, None)
-
-        if calibration_samples is None:
-            # Fallback to random calibration data if none provided
-            import numpy as np
-            calibration_samples = np.random.randn(32, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS).astype(np.float32)
-            
-        reader = Connect4CalibrationReader(calibration_samples)
-        quantize_static(onnx_path, onnx_path, calibration_data_reader=reader,
-                        quant_format=QuantFormat.QOperator,
-                        weight_type=QuantType.QInt8,
-                        activation_type=QuantType.QInt8,
-                        nodes_to_exclude=["node_linear_17", "node_masked_fill"],
-                        extra_options={"DisableShapeInference": True})
-        onnx_model = onnx.load(onnx_path)
-        onnx.checker.check_model(onnx_model)
 
 
 class _ReplayDataset(torch.utils.data.Dataset):
@@ -320,7 +280,8 @@ class CudaPrefetcher:
         self.loader = iter(loader)
         self.device = device
         self.channels_last = channels_last
-        self.stream = torch.cuda.Stream(device=device)
+        self.use_cuda = device.type == "cuda"
+        self.stream = torch.cuda.Stream(device=device) if self.use_cuda else None
         self.next_batch = None
         self.preload()
 
@@ -331,6 +292,18 @@ class CudaPrefetcher:
             self.next_batch = None
             return
             
+        if not self.use_cuda:
+            planes = self.next_batch[0].to(self.device, non_blocking=True)
+            if self.channels_last:
+                planes = planes.to(memory_format=torch.channels_last)
+            self.next_batch = (
+                planes,
+                self.next_batch[1].to(self.device, non_blocking=True),
+                self.next_batch[2].to(self.device, non_blocking=True),
+                self.next_batch[3].to(self.device, non_blocking=True),
+            )
+            return
+
         with torch.cuda.stream(self.stream):
             planes = self.next_batch[0].to(self.device, non_blocking=True)
             if self.channels_last:
@@ -343,6 +316,12 @@ class CudaPrefetcher:
             )
 
     def next(self):
+        if not self.use_cuda:
+            batch = self.next_batch
+            if batch is not None:
+                self.preload()
+            return batch
+
         torch.cuda.current_stream().wait_stream(self.stream)
         batch = self.next_batch
         if batch is not None:
@@ -432,14 +411,26 @@ def main() -> None:
     # ---- Model ------------------------------------------------------------
     model = Connect4Net().to(args.device)
     out_path = Path(args.out)
-    if out_path.exists():
-        print(f"[train] Loading existing weights from {out_path} to resume training...")
+    resume_path = out_path
+    if checkpoint_epoch(out_path) == 0:
+        resume_path = latest_epoch_checkpoint(out_path) or out_path
+    start_epoch = checkpoint_epoch(resume_path) if resume_path.exists() else 0
+    if resume_path.exists():
+        if resume_path != out_path:
+            print(f"[train] Auto-selected newest checkpoint {resume_path.name} for resume.")
+        print(f"[train] Loading existing weights from {resume_path} to resume training...")
         try:
-            state_dict = torch.load(out_path, map_location=args.device, weights_only=True)
+            state_dict = torch.load(resume_path, map_location=args.device, weights_only=True)
             model.load_state_dict(state_dict)
             print("[train] Successfully restored model weights!")
+            if start_epoch > 0:
+                print(
+                    f"[train] Resuming from epoch {start_epoch}; "
+                    f"this run targets epoch {start_epoch + args.epochs}."
+                )
         except Exception as e:
-            print(f"[train] WARNING: Could not load existing weights from {out_path} ({e}); starting with fresh weights")
+            print(f"[train] WARNING: Could not load existing weights from {resume_path} ({e}); starting with fresh weights")
+            start_epoch = 0
 
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -511,7 +502,7 @@ def main() -> None:
         # Disk-based dataset loading
         def load_dynamic_dataset(data_dir, data_file, max_samples, symmetry, num_workers_cfg, consume=False):
             if data_dir:
-                from dataset import C4Dataset, decode_bitboard_batched
+                from dataset import decode_bitboard_batched
                 import os, glob
                 bin_files = sorted(glob.glob(os.path.join(data_dir, "*.bin")))
                 if not bin_files:
@@ -599,7 +590,7 @@ def main() -> None:
             print(f"[train] torch.compile failed: {e}; continuing uncompiled")
 
     # ---- Warmup -----------------------------------------------------------
-    if args.compile_mode != "none":
+    if not args.no_compile and args.compile_mode != "none":
         print("[train] warming up model to trigger compilation...")
         model.train()
         
@@ -613,7 +604,7 @@ def main() -> None:
                         wp = wp.to(memory_format=torch.channels_last)
                     optimizer.zero_grad(set_to_none=True)
                     with autocast(enabled=use_amp, device_type="cuda" if use_amp else "cpu", dtype=torch.float16 if use_amp else None):
-                        w_log_p, w_v, w_m = model(wp)
+                        w_log_p, w_v, w_m, _w_c = model(wp)
                         w_loss, _, _, _ = compute_loss(w_log_p, w_v, w_m, wtp, wtv, wtm)
                     scaler.scale(w_loss).backward()
                     scaler.unscale_(optimizer)
@@ -636,6 +627,7 @@ def main() -> None:
     epoch = 0
     done = False
     _prev = None
+    ema_model = None
 
     import signal
     def handle_sigint(sig, frame):
@@ -674,7 +666,7 @@ def main() -> None:
         t_data = time.time() - t_data_start
 
         if _prev is not None:
-            (p_se, p_ee, p_ns, p_avg_tot, p_avg_pol, p_avg_val, p_avg_mvl, p_lr, p_v, p_estr, p_bl, p_tdata, p_texport, p_ttot) = _prev
+            (p_se, p_ee, p_ns, p_avg_tot, p_avg_pol, p_avg_val, p_avg_mvl, p_lr, p_v, p_estr, p_bl, p_tdata, p_texport, p_ttot, p_tfwd, p_tbwd, p_topt) = _prev
             if args.device == "cuda":
                 gpu_ms = p_se.elapsed_time(p_ee)
                 p_train_sec = gpu_ms / 1000.0
@@ -685,7 +677,11 @@ def main() -> None:
             total_time_so_far = time.time() - global_start_t
             n_g = getattr(ds, "n_games", 128)
             print(
-                f"[train] {p_estr} done in {p_ttot:.2f}s (train={p_train_sec:.2f}s, data={p_tdata:.2f}s, ema/export={p_texport:.2f}s, other={p_tother:.2f}s | tot={total_time_so_far:.1f}s) "
+                f"[train] {p_estr} done in {format_duration(p_ttot)} "
+                f"(train={format_duration(p_train_sec)} "
+                f"(bwd={format_duration(p_tbwd)}, fwd={format_duration(p_tfwd)}, opt={format_duration(p_topt)}), "
+                f"data={format_duration(p_tdata)}, ema/export={format_duration(p_texport)}, "
+                f"other={format_duration(p_tother)} | tot={format_duration(total_time_so_far)}) "
                 f"({p_sps:.0f} samples/s) | loss={p_avg_tot:.4f} "
                 f"(policy={p_avg_pol:.4f}, value={p_avg_val:.4f}, mvl={p_avg_mvl:.4f}) lr={p_lr:.2e} | "
                 f"samples={len(ds):,} | games={n_g:,}"
@@ -705,6 +701,9 @@ def main() -> None:
         running = {"total": 0.0, "policy": 0.0, "value": 0.0, "moves_left": 0.0}
         n_batches = 0
         samples_this_epoch = 0
+        fwd_sec_epoch = 0.0
+        bwd_sec_epoch = 0.0
+        opt_sec_epoch = 0.0
         prefetcher = CudaPrefetcher(loader, torch.device(args.device), channels_last=args.channels_last)
 
         batch_idx = 0
@@ -725,13 +724,21 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
 
+            t_f0 = time.perf_counter()
             with autocast(enabled=use_amp, device_type="cuda" if use_amp else "cpu", dtype=torch.float16 if use_amp else None):
-                log_p, v, m = model(planes)
+                log_p, v, m, _c = model(planes)
                 loss, policy_loss, value_loss, moves_left_loss = compute_loss(
                     log_p, v, m, target_policy, target_value, target_moves_left
                 )
+            if args.device == "cuda": torch.cuda.synchronize()
+            fwd_sec_epoch += (time.perf_counter() - t_f0)
 
+            t_b0 = time.perf_counter()
             scaler.scale(loss).backward()
+            if args.device == "cuda": torch.cuda.synchronize()
+            bwd_sec_epoch += (time.perf_counter() - t_b0)
+
+            t_o0 = time.perf_counter()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=_DEFAULT_MAX_GRAD_NORM)
             scaler.step(optimizer)
@@ -739,6 +746,8 @@ def main() -> None:
             if ema is not None:
                 ema.update(model)
             scheduler.step()
+            if args.device == "cuda": torch.cuda.synchronize()
+            opt_sec_epoch += (time.perf_counter() - t_o0)
 
             running["total"] += loss.detach()
             running["policy"] += policy_loss.detach()
@@ -751,13 +760,18 @@ def main() -> None:
             if (batch_idx + 1) % args.log_every == 0:
                 avg = {k: (v.item() if isinstance(v, torch.Tensor) else v) / n_batches for k, v in running.items()}
                 lr = scheduler.get_last_lr()[0]
-                epoch_str = f"epoch {epoch+1}/{args.epochs}"
+                global_epoch = start_epoch + epoch + 1
+                epoch_str = (
+                    f"epoch {global_epoch}/{start_epoch + args.epochs}"
+                    if args.duration is None
+                    else f"epoch {global_epoch}"
+                )
                 print(
                     f"[train] {epoch_str}  "
                     f"batch {batch_idx+1}/{len(loader)}  "
                     f"loss={avg['total']:.4f}  policy={avg['policy']:.4f}  "
                     f"value={avg['value']:.4f}  mvl={avg['moves_left']:.4f}  lr={lr:.2e}  "
-                    f"({(time.time()-t0):.1f}s)"
+                    f"({format_duration(time.time() - t0)})"
                 )
                 running = {"total": 0.0, "policy": 0.0, "value": 0.0, "moves_left": 0.0}
                 n_batches = 0
@@ -833,10 +847,15 @@ def main() -> None:
         avg_mvl = running["moves_left"].item() / max(1, n_batches) if isinstance(running["moves_left"], torch.Tensor) else 0.0
         lr = scheduler.get_last_lr()[0]
 
-        epoch_str = f"epoch {epoch+1:2d}/{args.epochs}"
+        global_epoch = start_epoch + epoch + 1
+        epoch_str = (
+            f"epoch {global_epoch:2d}/{start_epoch + args.epochs}"
+            if args.duration is None
+            else f"epoch {global_epoch:2d}"
+        )
         _prev = (epoch_start_evt, epoch_end_evt, samples_this_epoch,
                  avg_tot, avg_pol, avg_val, avg_mvl, lr, v_item, epoch_str, n_batches > 0,
-                 t_data, t_export, t_epoch_total)
+                 t_data, t_export, t_epoch_total, fwd_sec_epoch, bwd_sec_epoch, opt_sec_epoch)
 
         if done or (args.duration is None and epoch >= args.epochs - 1):
             done = True
@@ -845,7 +864,7 @@ def main() -> None:
 
     # Print the last epoch (sync after training is done, no pipeline to preserve)
     if _prev is not None:
-        (p_se, p_ee, p_ns, p_avg_tot, p_avg_pol, p_avg_val, p_avg_mvl, p_lr, p_v, p_estr, p_bl, p_tdata, p_texport, p_ttot) = _prev
+        (p_se, p_ee, p_ns, p_avg_tot, p_avg_pol, p_avg_val, p_avg_mvl, p_lr, p_v, p_estr, p_bl, p_tdata, p_texport, p_ttot, p_tfwd, p_tbwd, p_topt) = _prev
         if args.device == "cuda":
             p_se.synchronize()
             gpu_ms = p_se.elapsed_time(p_ee)
@@ -856,7 +875,11 @@ def main() -> None:
         p_tother = max(0.0, p_ttot - p_train_sec - p_tdata - p_texport)
         total_time_so_far = time.time() - global_start_t
         print(
-            f"[train] {p_estr} done in {p_ttot:.2f}s (train={p_train_sec:.2f}s, data={p_tdata:.2f}s, ema/export={p_texport:.2f}s, other={p_tother:.2f}s | tot={total_time_so_far:.1f}s) "
+            f"[train] {p_estr} done in {format_duration(p_ttot)} "
+            f"(train={format_duration(p_train_sec)} "
+            f"(bwd={format_duration(p_tbwd)}, fwd={format_duration(p_tfwd)}, opt={format_duration(p_topt)}), "
+            f"data={format_duration(p_tdata)}, ema/export={format_duration(p_texport)}, "
+            f"other={format_duration(p_tother)} | tot={format_duration(total_time_so_far)}) "
             f"({p_sps:.0f} samples/s) | loss={p_avg_tot:.4f} "
             f"(policy={p_avg_pol:.4f}, value={p_avg_val:.4f}, mvl={p_avg_mvl:.4f}) lr={p_lr:.2e} | "
             f"sample val={p_v:+.3f}"
@@ -874,7 +897,21 @@ def main() -> None:
     # Save the model ONCE at the very end
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
     inner.save(args.out)
+    final_epoch = start_epoch + epoch
     print(f"[train] saved final model (loss={best_loss:.4f}) to {args.out}")
+
+    # Keep the pipeline's stable output path, and also create a cumulative
+    # checkpoint so a resumed run can continue with the correct epoch number.
+    if final_epoch > start_epoch:
+        epoch_checkpoint = checkpoint_path_for_epoch(args.out, final_epoch)
+        if epoch_checkpoint.resolve() != out_path.resolve():
+            inner.save(epoch_checkpoint)
+            print(f"[train] saved cumulative checkpoint (epoch {final_epoch}) to {epoch_checkpoint}")
+            if ema_model is not None:
+                ema_checkpoint = epoch_checkpoint.with_name(
+                    f"{epoch_checkpoint.stem}_ema{epoch_checkpoint.suffix}"
+                )
+                ema_model.save(ema_checkpoint)
 
     metrics_file = __import__("pathlib").Path(args.out).parent / "train_metrics.txt"
     try:

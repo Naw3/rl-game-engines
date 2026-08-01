@@ -2,8 +2,8 @@
 gui.py — Play Connect 4 against Connect4Net in a Pygame window.
 
 The human plays "Red" (drops first). The AI plays "Yellow" using the
-trained model's policy head argmax (with a legality mask). The value
-head is shown as a small bar at the top of the window.
+batched MCTS agent from inference.py. The selected model is resolved from
+best_model.json when the default ``auto`` path is used.
 
 Controls
 --------
@@ -29,15 +29,10 @@ usually appears around 1k–2k training samples (a few self-play games).
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 
-import numpy as np
 import pygame
-import torch
-
-from model import Connect4Net
 
 
 # --- Visual constants ------------------------------------------------------
@@ -123,38 +118,6 @@ def has_win(bitboard: int) -> bool:
     return False
 
 
-# --- Network inference ----------------------------------------------------
-
-def board_to_planes(own: int, opp: int) -> np.ndarray:
-    """Canonical: own = current player to move, opp = the other."""
-    planes = np.zeros((3, 6, 7), dtype=np.float32)
-    for r in range(6):
-        for c in range(7):
-            bit = 1 << (c * 7 + r)
-            if own & bit:
-                planes[0, r, c] = 1.0  # own
-            if opp & bit:
-                planes[1, r, c] = 1.0  # opp
-            planes[2, r, c] = 1.0      # turn mask is all 1s
-    return planes
-
-
-def ai_select(model: Connect4Net, own: int, opp: int, device: torch.device) -> int:
-    """Pick the column with the highest policy probability, masking illegal moves."""
-    planes = board_to_planes(own, opp)
-    x = torch.from_numpy(planes).unsqueeze(0).to(device)
-    with torch.no_grad():
-        log_p, v, _ = model(x)
-    p = torch.exp(log_p[0]).cpu().numpy()
-    # Mask illegal columns.
-    occ = own | opp
-    for c in range(7):
-        # A column is full if row 5 (bit c*7 + 5) is occupied
-        if (occ & (1 << (c * 7 + 5))) != 0:
-            p[c] = 0.0
-    return int(np.argmax(p))
-
-
 # --- Game state -----------------------------------------------------------
 
 class Game:
@@ -200,38 +163,50 @@ class Game:
 
 # --- Drawing --------------------------------------------------------------
 
-def draw_board(screen: pygame.Surface, game: Game) -> None:
+def draw_board(screen: pygame.Surface, game: Game, ai_thinking: bool = False, thinking_text: str = "") -> None:
     screen.fill(COLORS["bg"])
-    # Value bar at the top.
-    bar_h = 24
-    pygame.draw.rect(screen, COLORS["board"], (0, 0, WINDOW_W, bar_h))
-    label = pygame.font.SysFont("consolas", 18).render(
-        f"Turn: {'RED (you)' if game.turn == 0 else 'YELLOW (AI)'}",
-        True, COLORS["text"]
-    )
-    screen.blit(label, (10, 3))
-    if game.winner is None:
-        status = ""
-    elif game.winner == 2:
-        status = "  —  DRAW"
-    else:
-        status = f"  —  {'RED' if game.winner == 0 else 'YELLOW'} WINS"
-    s = pygame.font.SysFont("consolas", 18).render(status, True, COLORS["text"])
-    screen.blit(s, (WINDOW_W // 2, 3))
-    
-    if game.winner is not None:
-        # Draw Play Again button
-        btn_rect = pygame.Rect(WINDOW_W // 2 + 150, 0, 140, 24)
-        pygame.draw.rect(screen, (80, 80, 100), btn_rect, border_radius=5)
-        btn_s = pygame.font.SysFont("consolas", 18).render("PLAY AGAIN", True, (255, 255, 255))
-        screen.blit(btn_s, (WINDOW_W // 2 + 160, 3))
 
-    # Board background.
+    # Header / Bar at the top.
+    bar_h = 36
+    pygame.draw.rect(screen, (30, 32, 48), (0, 0, WINDOW_W, bar_h))
+
+    font_main = pygame.font.SysFont("segoeui", 18, bold=True)
+    font_sub = pygame.font.SysFont("consolas", 16)
+
+    if ai_thinking:
+        turn_str = "AI is thinking..." if not thinking_text else f"AI is thinking... ({thinking_text})"
+        turn_color = COLORS["yellow"]
+    else:
+        turn_str = "Your Turn (RED)" if game.turn == 0 else "AI Turn (YELLOW)"
+        turn_color = COLORS["red"] if game.turn == 0 else COLORS["yellow"]
+
+    label = font_main.render(turn_str, True, turn_color)
+    screen.blit(label, (16, 6))
+
+    if game.winner is not None:
+        if game.winner == 2:
+            status = "DRAW GAME!"
+            status_color = (200, 200, 200)
+        else:
+            winner_name = "YOU WIN! (RED)" if game.winner == 0 else "AI WINS! (YELLOW)"
+            status_color = COLORS["red"] if game.winner == 0 else COLORS["yellow"]
+            status = winner_name
+
+        s = font_main.render(status, True, status_color)
+        screen.blit(s, (WINDOW_W // 2 - 60, 6))
+
+        # Draw Play Again button
+        btn_rect = pygame.Rect(WINDOW_W - 150, 4, 130, 28)
+        pygame.draw.rect(screen, (60, 140, 230), btn_rect, border_radius=6)
+        btn_s = font_sub.render("PLAY AGAIN", True, (255, 255, 255))
+        screen.blit(btn_s, (WINDOW_W - 140, 8))
+
+    # Board background with rounded corners
     board_rect = pygame.Rect(
         20, BOARD_TOP,
         CELL_W * 7, CELL_H * 6
     )
-    pygame.draw.rect(screen, COLORS["board"], board_rect)
+    pygame.draw.rect(screen, COLORS["board"], board_rect, border_radius=12)
 
     # Pieces.
     anim_col = -1
@@ -259,12 +234,10 @@ def draw_board(screen: pygame.Surface, game: Game) -> None:
     if game.anim is not None:
         col, target_row, color, frame = game.anim
         cx = 20 + col * CELL_W + CELL_W // 2
-        # Interpolate y from above the board to the target cell.
         target_y = BOARD_TOP + (5 - target_row) * CELL_H + CELL_H // 2
         start_y = BOARD_TOP - CELL_H
         t = frame / ANIM_FRAMES
-        # Ease-out for a nicer feel.
-        t = 1 - (1 - t) ** 2
+        t = 1 - (1 - t) ** 2  # Ease-out
         cy = int(start_y + t * (target_y - start_y))
         pygame.draw.circle(screen, color, (cx, cy), PIECE_R)
 
@@ -273,24 +246,28 @@ def draw_board(screen: pygame.Surface, game: Game) -> None:
 
 # --- Main loop ------------------------------------------------------------
 
-def run(model_path: str | None, device_str: str) -> None:
+from src_python.inference import Connect4Agent, format_duration
+
+
+def run(model_path: str | None, device_str: str, backend: str) -> None:
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
-    pygame.display.set_caption("Connect 4 — vs Connect4Net")
+    pygame.display.set_caption("Connect 4 — vs Connect4Net (MCTS Agent)")
     clock = pygame.time.Clock()
 
-    # Load the model.
-    device = torch.device(device_str)
-    net = Connect4Net().to(device).eval()
-    if model_path and os.path.exists(model_path):
-        net.load(model_path, map_location=device)
-        print(f"[gui] loaded model from {model_path}")
-    else:
-        print(f"[gui] no model found at {model_path!r} — using random weights")
+    # Load search parameters from InferConfig
+    max_think_time = getattr(CONFIG.infer, "max_think_time", 1.0)
+    agent = Connect4Agent(
+        model_path or _DEFAULT_GUI_MODEL,
+        device=device_str,
+        backend=backend,
+    )
+    stop_mode = "confidence stop" if agent.has_confidence_head else "time fallback"
 
     game = Game()
     ai_thinking = False
     ai_think_start = 0.0
+    thinking_info = ""
 
     running = True
     while running:
@@ -300,19 +277,20 @@ def run(model_path: str | None, device_str: str) -> None:
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
                 game = Game()
                 ai_thinking = False
+                thinking_info = ""
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
                 
                 # Check Play Again button click
                 if game.winner is not None:
-                    if WINDOW_W // 2 + 120 <= mx <= WINDOW_W // 2 + 260 and 0 <= my <= 24:
+                    if WINDOW_W - 150 <= mx <= WINDOW_W - 20 and 4 <= my <= 32:
                         game = Game()
                         ai_thinking = False
+                        thinking_info = ""
                         continue
                 
                 # Check column click
                 if game.winner is None and game.turn == 0 and game.anim is None:
-                    # Is it inside the board area?
                     if 20 <= mx <= 20 + CELL_W * 7 and BOARD_TOP <= my <= BOARD_TOP + CELL_H * 6:
                         col = (mx - 20) // CELL_W
                         row = game.drop(col)
@@ -329,21 +307,30 @@ def run(model_path: str | None, device_str: str) -> None:
                 if game.winner is None and game.turn == 1:
                     ai_thinking = True
                     ai_think_start = time.time()
+                    thinking_info = f"up to {max_think_time:.1f}s ({stop_mode})"
             else:
                 game.anim = (col, target_row, color, frame)
 
+        # Draw frame during thinking
+        draw_board(screen, game, ai_thinking=ai_thinking, thinking_text=thinking_info)
+
         # AI turn.
         if ai_thinking and game.anim is None:
-            # Always show the "thinking" state for at least one frame.
-            if time.time() - ai_think_start > 0.15:
-                with torch.no_grad():
-                    col = ai_select(net, game.yellow, game.red, device)
-                if find_row(game.yellow, col) is not None:
-                    game.turn = 1
-                    row = game.drop(col)
-                    if row is not None:
-                        game.anim = (col, row, COLORS["yellow"], 0)
-                ai_thinking = False
+            col, sims_done, elapsed = agent.select_action(
+                game.yellow, game.red, max_think_time=max_think_time, temperature=0.0
+            )
+            if sims_done == 0:
+                thinking_info = f"model eval in {format_duration(elapsed)}"
+            else:
+                thinking_info = f"{sims_done:,} sims in {format_duration(elapsed)}"
+            if find_row(game.yellow, col) is not None:
+                game.turn = 1
+                row = game.drop(col)
+                if row is not None:
+                    game.anim = (col, row, COLORS["yellow"], 0)
+            ai_thinking = False
+
+        clock.tick(FPS)
 
         draw_board(screen, game)
         clock.tick(FPS)
@@ -357,20 +344,30 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 try:
     from config import CONFIG
-    _DEFAULT_GUI_MODEL = str(CONFIG.paths.model_pt)
+    _DEFAULT_GUI_MODEL = "auto"
     _DEFAULT_GUI_DEVICE = CONFIG.device.python_device
 except Exception:
-    _DEFAULT_GUI_MODEL = str(_PROJECT_ROOT / "models" / "connect4_model.pt")
-    _DEFAULT_GUI_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    _DEFAULT_GUI_MODEL = "auto"
+    _DEFAULT_GUI_DEVICE = "auto"
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Play Connect 4 vs Connect4Net")
-    p.add_argument("--model", default=_DEFAULT_GUI_MODEL, help="path to .pt state_dict")
+    p.add_argument(
+        "--model",
+        default=_DEFAULT_GUI_MODEL,
+        help="path to a .pt/.onnx model, or auto to use best_model.json",
+    )
     p.add_argument("--device", default=_DEFAULT_GUI_DEVICE)
+    p.add_argument(
+        "--backend",
+        choices=["auto", "onnx", "tensorrt", "torch"],
+        default="auto",
+        help="inference backend (auto: TensorRT/ONNX CUDA/PyTorch fallback)",
+    )
     args = p.parse_args()
     try:
-        run(args.model, args.device)
+        run(args.model, args.device, args.backend)
     except KeyboardInterrupt:
         pygame.quit()
         sys.exit(0)

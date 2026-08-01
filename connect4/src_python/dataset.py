@@ -8,12 +8,13 @@ Header (16 bytes):
     4 bytes  : u32 LE  sample count N
     8 bytes  : reserved, zero
 
-Sample (56 bytes), N times:
+Sample (60 bytes), N times:
     8 bytes  : u64 LE  own bitboard       (current player's pieces)
     8 bytes  : u64 LE  opponent bitboard  (the other player's pieces)
     8 bytes  : u64 LE  turn mask          (all 1s — constant bias)
     28 bytes : 7 × f32 LE  MCTS policy pi
     4 bytes  : f32 LE    game outcome z ∈ {-1, 0, +1}
+    4 bytes  : f32 LE    remaining moves auxiliary target
 
 The bitboard layout is column-major with a guard bit at the top of each
 column — see `bitboard.rs` in the Rust side for the full encoding. The
@@ -152,7 +153,13 @@ class C4Dataset(Dataset):
             )
         
         declared = int.from_bytes(header[4:8].tobytes(), "little")
-        actual = (self.raw_data.size - HEADER_SIZE) // SAMPLE_SIZE
+        body_size = self.raw_data.size - HEADER_SIZE
+        if body_size != declared * SAMPLE_SIZE:
+            raise ValueError(
+                f"file body has {body_size} bytes; expected {declared * SAMPLE_SIZE}"
+            )
+        self.sample_size = SAMPLE_SIZE
+        actual = body_size // self.sample_size
         if declared != actual:
             raise ValueError(
                 f"header says {declared} samples but file has {actual}"
@@ -160,17 +167,17 @@ class C4Dataset(Dataset):
         self.count = min(declared, max_samples) if max_samples else declared
 
         # Load the entire data section (skip the header) as a uint8 array.
-        self._raw = self.raw_data[HEADER_SIZE : HEADER_SIZE + SAMPLE_SIZE * self.count]
+        self._raw = self.raw_data[HEADER_SIZE : HEADER_SIZE + self.sample_size * self.count]
 
         # Pre-decode all planes into one big array — way faster than
         # calling decode_bitboard on every __getitem__.
-        # Shape after reshape: (count, 56) bytes, then split:
+        # Shape after reshape: (count, sample_size) bytes, then split:
         #   own:   bytes 0..8   (uint64)
         #   opp:   bytes 8..16  (uint64)
         #   _turn: bytes 16..24 (unused)
         #   pi:    bytes 24..52 (7 × f32)
         #   z:     bytes 52..56 (1 × f32)
-        reshaped = self._raw.reshape(self.count, SAMPLE_SIZE)
+        reshaped = self._raw.reshape(self.count, self.sample_size)
         self._own = np.frombuffer(reshaped[:, 0:8].tobytes(), dtype=np.uint64).copy()
         self._opp = np.frombuffer(reshaped[:, 8:16].tobytes(), dtype=np.uint64).copy()
         self._policy = np.frombuffer(reshaped[:, 24:52].tobytes(), dtype=np.float32).reshape(self.count, POLICY_SIZE).copy()
@@ -237,7 +244,7 @@ if __name__ == "__main__":
     ds = C4Dataset(sys.argv[1])
     print(f"loaded {len(ds):,} samples from {sys.argv[1]}")
     print(f"stats: {ds.stats()}")
-    planes, policy, value = ds[0]
+    planes, policy, value, moves_left = ds[0]
     print(f"sample 0: planes {tuple(planes.shape)}  policy {policy.tolist()}  value {value.item():+.0f}")
     print(f"planes[0] (own):\n{planes[0].numpy()}")
     print(f"planes[1] (opp):\n{planes[1].numpy()}")

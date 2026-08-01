@@ -25,6 +25,11 @@ class MCTSConfig:
     """Rust MCTS Self-Play Search Parameters"""
     games: int = 128
     sims: int = 200
+    # Playout Cap Randomization (PCR): mix a smaller and a full search
+    # budget so the network learns from both cheap and deeply searched moves.
+    pcr_full_probability: float = 0.25
+    pcr_cheap_ratio: float = 0.1
+    pcr_min_sims: int = 32
     cpu_batch_size: int = os.cpu_count() or 8
     gpu_batch_size: int = 32
     max_dispatcher_batch: int = 128
@@ -46,6 +51,7 @@ class TrainConfig:
     weight_decay: float = 1e-4
     max_grad_norm: float = 5.0
     replay_keep: int = 10
+    max_buffer_epochs: int = 0  # 0 = no pre-generation buffer (on-demand per epoch)
     num_workers: int = 0
     log_every: int = 20
     onnx_every: int = 1
@@ -54,10 +60,11 @@ class TrainConfig:
     symmetry: bool = True
     train_precision: str = "fp32"  # "fp32", "fp16", "bf16"
     infer_precision: str = "fp32"  # "fp32", "fp16", "int8"
-    compile_mode: str = "none"  # "none", "default", "reduce-overhead", "max-autotune"
+    compile_mode: str = "reduce-overhead"  # "none", "default", "reduce-overhead", "max-autotune"
     channels_last: bool = False
     fused_adamw: bool = False
     prefetch_queue: int = 2
+    confidence_loss_weight: float = 0.1
 
 @dataclass
 class DatasetConfig:
@@ -124,12 +131,31 @@ class BenchConfig:
 
 
 @dataclass
+class InferConfig:
+    """Standalone AI Agent & GUI Inference Configuration"""
+    sims: int = 0                 # 0 = confidence stop + max_think_time fallback
+    max_think_time: float = 1.0   # Max search budget in seconds per move
+    batch_size: int = 32          # Fixed GPU leaf evaluation batch size
+    c_puct: float = 1.5           # PUCT exploration constant
+    temperature: float = 0.0      # Action selection temperature
+    max_think_time: float = 1.0   # Max search budget in seconds per move
+    batch_size: int = 32          # Fixed GPU leaf evaluation batch size
+    c_puct: float = 1.5           # PUCT exploration constant
+    temperature: float = 0.0      # Action selection temperature
+    device: str = "auto"          # Execution device ("cuda", "cpu", "auto")
+    confidence_stop_enabled: bool = True
+    confidence_threshold: float = 0.99
+    confidence_min_sims: int = 32
+
+
+@dataclass
 class PipelineConfig:
     network: NetworkConfig = field(default_factory=NetworkConfig)
     mcts: MCTSConfig = field(default_factory=MCTSConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     gui: GUIConfig = field(default_factory=GUIConfig)
+    infer: InferConfig = field(default_factory=InferConfig)
     paths: PathConfig = field(default_factory=PathConfig)
     device: DeviceConfig = field(default_factory=DeviceConfig)
     bench: BenchConfig = field(default_factory=BenchConfig)
@@ -147,6 +173,7 @@ def export_json() -> str:
         "train": asdict(CONFIG.train),
         "dataset": asdict(CONFIG.dataset),
         "gui": asdict(CONFIG.gui),
+        "infer": asdict(CONFIG.infer),
         "paths": {k: str(v) for k, v in asdict(CONFIG.paths).items()},
         "device": asdict(CONFIG.device),
         "bench": asdict(CONFIG.bench),
@@ -159,6 +186,9 @@ def export_powershell_env() -> str:
         # Pipeline configs
         f'$env:GAMES = "{CONFIG.mcts.games}"',
         f'$env:SIMS = "{CONFIG.mcts.sims}"',
+        f'$env:PCR_FULL_PROBABILITY = "{CONFIG.mcts.pcr_full_probability}"',
+        f'$env:PCR_CHEAP_RATIO = "{CONFIG.mcts.pcr_cheap_ratio}"',
+        f'$env:PCR_MIN_SIMS = "{CONFIG.mcts.pcr_min_sims}"',
         f'$env:CPU_BATCH_SIZE = "{CONFIG.mcts.cpu_batch_size}"',
         f'$env:GPU_BATCH_SIZE = "{CONFIG.mcts.gpu_batch_size}"',
         f'$env:MAX_DISPATCHER_BATCH = "{CONFIG.mcts.max_dispatcher_batch}"',
@@ -182,6 +212,9 @@ def export_powershell_env() -> str:
         f'$env:CHANNELS_LAST = "{1 if CONFIG.train.channels_last else 0}"',
         f'$env:FUSED_ADAMW = "{1 if CONFIG.train.fused_adamw else 0}"',
         f'$env:ONNX_OPSET = "{CONFIG.dataset.onnx_opset}"',
+        f'$env:MAX_THINK_TIME = "{CONFIG.infer.max_think_time}"',
+        f'$env:CONFIDENCE_THRESHOLD = "{CONFIG.infer.confidence_threshold}"',
+        f'$env:CONFIDENCE_STOP_ENABLED = "{1 if CONFIG.infer.confidence_stop_enabled else 0}"',
         f'$env:RUST_DEVICE = "{CONFIG.device.rust_device}"',
         f'$env:PYTHON_DEVICE = "{CONFIG.device.python_device}"',
         f'$env:MODEL = "{CONFIG.paths.model_pt.relative_to(PROJECT_ROOT)}"',

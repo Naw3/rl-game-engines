@@ -106,6 +106,13 @@ use std::sync::Arc;
 pub const DEFAULT_C_PUCT: f32 = 1.5;
 /// Default number of simulations per move during self-play data generation.
 pub const DEFAULT_SIMS: usize = 800;
+/// Fraction of self-play moves that use the full PCR search budget.
+pub const DEFAULT_PCR_FULL_PROBABILITY: f32 = 0.25;
+/// Cheap PCR budget as a fraction of the full budget (before the minimum).
+pub const DEFAULT_PCR_CHEAP_RATIO: f32 = 0.1;
+/// Minimum number of simulations for the cheap PCR branch.
+pub const DEFAULT_PCR_MIN_SIMS: usize = 32;
+/// Default batch size for NN inference. 1 = sequential (legacy). 32 is a
 /// Default batch size for NN inference. 1 = sequential (legacy). 32 is a
 /// reasonable default for both CPU ORT and GPU ORT (huge
 /// speedup). CLI flag `--batch-size` overrides.
@@ -118,6 +125,9 @@ pub const DEFAULT_DIRICHLET_EPSILON: f32 = 0.25;
 #[derive(Debug, Clone, Copy)]
 pub struct MCTSConfig {
     pub simulations: usize,
+    pub pcr_full_probability: f32,
+    pub pcr_cheap_ratio: f32,
+    pub pcr_min_sims: usize,
     pub batch_size: usize,
     pub c_puct: f32,
     pub dirichlet_alpha: f32,
@@ -125,22 +135,31 @@ pub struct MCTSConfig {
     /// Temperature for the final move sampling. 1.0 = visit-count softmax.
     /// Near zero = argmax (greedy, used during evaluation / GUI play).
     pub temperature: f32,
+    pub confidence_stop_enabled: bool,
+    pub confidence_threshold: f32,
+    pub confidence_min_sims: usize,
+    pub max_think_time_ms: u64,
 }
 
 impl Default for MCTSConfig {
     fn default() -> Self {
         MCTSConfig {
             simulations: DEFAULT_SIMS,
+            pcr_full_probability: DEFAULT_PCR_FULL_PROBABILITY,
+            pcr_cheap_ratio: DEFAULT_PCR_CHEAP_RATIO,
+            pcr_min_sims: DEFAULT_PCR_MIN_SIMS,
             batch_size: DEFAULT_BATCH_SIZE,
             c_puct: DEFAULT_C_PUCT,
             dirichlet_alpha: DEFAULT_DIRICHLET_ALPHA,
             dirichlet_epsilon: DEFAULT_DIRICHLET_EPSILON,
             temperature: 1.0,
+            confidence_stop_enabled: true,
+            confidence_threshold: 0.99,
+            confidence_min_sims: 32,
+            max_think_time_ms: 1000,
         }
     }
 }
-
-/// One node in the search tree.
 struct Node {
     own: u64,
     opp: u64,
@@ -218,15 +237,21 @@ impl MCTS {
         }
     }
 
-    /// Advance the root to the child node corresponding to `action`.
-    /// This retains the subtree for the selected move, skipping reallocation.
     pub fn advance(&mut self, action: usize) {
         if let Some(idx) = self.root_idx {
             let child = self.tree[idx].children[action];
             if child != u32::MAX {
                 self.root_idx = Some(child as usize);
             } else {
-                self.root_idx = None;
+                let mut child_board = Board {
+                    own: self.tree[idx].own,
+                    opp: self.tree[idx].opp,
+                };
+                child_board.make_move(action);
+                let new_idx = self.tree.len();
+                self.tree.push(Node::new(child_board.own, child_board.opp));
+                self.tree[idx].children[action] = new_idx as u32;
+                self.root_idx = Some(new_idx);
             }
         }
     }
@@ -235,20 +260,10 @@ impl MCTS {
         self.config.simulations = sims;
     }
 
-    /// Run `config.simulations` simulations from `root` and return:
-    ///   - `policy`: length-7 vector, softmax over visit counts raised to
-    ///                `1/temperature`, renormalized over legal moves.
-    ///   - `q_values`: length-7 vector, mean leaf value per action (Q(s, a))
-    ///                 from the perspective of the player to move at `root`.
-    ///                 `q_values[c] = 0.0` if the child was never visited.
-    ///
-    /// Internally calls `run_with_batch` with the config's batch_size.
     pub fn run<R: Rng + ?Sized>(&mut self, root: Board, rng: &mut R) -> (Vec<f32>, Vec<f32>) {
         self.run_with_batch(root, self.config.batch_size, rng)
     }
 
-    /// Run with an explicit batch_size override. Useful for tests and
-    /// benchmarking different batching strategies.
     pub fn run_with_batch<R: Rng + ?Sized>(
         &mut self,
         root: Board,
@@ -261,12 +276,10 @@ impl MCTS {
         let n_legal = (0..7).filter(|c| legal & (1 << c) != 0).count();
 
         let root_idx = if let Some(idx) = self.root_idx {
-            // Already have a root from advance(). Sanity check the board state.
             debug_assert_eq!(self.tree[idx].own, root.own);
             debug_assert_eq!(self.tree[idx].opp, root.opp);
             idx
         } else {
-            // No valid root: clear tree and start fresh.
             self.tree.clear();
             let idx = self.tree.len();
             self.tree.push(Node::new(root.own, root.opp));
@@ -274,22 +287,23 @@ impl MCTS {
             idx
         };
 
-        // If the root is NOT expanded, evaluate it with the network to get priors.
         if !self.tree[root_idx].is_expanded {
             let root_eval = self.network.evaluate(root);
             self.set_root_priors(root_idx, legal, n_legal, &root_eval.policy);
         }
 
-        // Inject Dirichlet noise at the root. We do this for EVERY move, even if
-        // the node was already expanded (e.g. from tree reuse).
-        if n_legal > 0 && self.config.dirichlet_epsilon > 0.0 {
+        let existing_visits = self.tree[root_idx].n.iter().sum::<u32>() as usize;
+
+        if n_legal > 0 && self.config.dirichlet_epsilon > 0.0 && existing_visits == 0 {
             self.add_root_dirichlet(root_idx, legal, n_legal, rng);
         }
 
-        // Batched simulation loop. We process `batch_size` selections per
-        // round, then flush them through a single network call.
-        // Aggressive Cache: Subtract already computed visits from the target.
-        let existing_visits = self.tree[root_idx].n.iter().sum::<u32>() as usize;
+        let start_time = if self.config.max_think_time_ms > 0 {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         let total_sims = if existing_visits >= self.config.simulations {
             0
         } else {
@@ -297,11 +311,14 @@ impl MCTS {
         };
         let mut sims_done = 0usize;
         while sims_done < total_sims {
+            if let Some(start) = start_time {
+                if start.elapsed().as_millis() as u64 >= self.config.max_think_time_ms {
+                    break;
+                }
+            }
+
             let this_batch = batch_size.min(total_sims - sims_done);
 
-            // Phase 1: select `this_batch` leaves with virtual loss.
-            // A pending entry is either a real (non-terminal) leaf to eval,
-            // or None if the selection hit a terminal (no NN call needed).
             let mut paths: Vec<Vec<PathEntry>> = Vec::with_capacity(this_batch);
             let mut leaf_boards: Vec<Board> = Vec::with_capacity(this_batch);
             let mut terminal_values: Vec<Option<f32>> = Vec::with_capacity(this_batch);
@@ -312,13 +329,10 @@ impl MCTS {
                 let terminal_value = self.select(root_idx, &mut path);
                 
                 if let Some(v) = terminal_value {
-                    // Terminal: back up immediately, don't queue.
                     self.backup(&path, v);
                     self.scratch_paths.push(path);
                     continue;
                 }
-                // Apply virtual loss along the path (skip the leaf's
-                // sentinel action entry).
                 for entry in &path {
                     if entry.action != usize::MAX {
                         self.tree[entry.node_idx].n[entry.action] += 1;
@@ -331,69 +345,62 @@ impl MCTS {
                 terminal_values.push(None);
             }
 
-            // Phase 2: batched network eval for non-terminal leaves.
             if !paths.is_empty() {
                 let evals: Vec<Eval> = self.network.evaluate_batch(&leaf_boards);
 
-                // Phase 3: undo virtual loss, expand leaf with real priors,
-                // back up real value.
                 for ((path, _), eval) in paths.into_iter().zip(terminal_values.iter()).zip(evals.iter()) {
-                    // Undo virtual loss.
                     for entry in path.iter() {
                         if entry.action != usize::MAX {
                             self.tree[entry.node_idx].n[entry.action] -= 1;
                         }
                     }
-                    // Expand the leaf (sets priors + marks expanded).
                     let leaf_idx = path.last().unwrap().node_idx;
                     self.expand_with_eval(leaf_idx, eval);
-                    // Backup real value.
                     self.backup(&path, eval.value);
                     self.scratch_paths.push(path);
                 }
             }
 
             sims_done += this_batch;
+
+            if self.config.confidence_stop_enabled && (existing_visits + sims_done) >= self.config.confidence_min_sims {
+                let total_n: u32 = self.tree[root_idx].n.iter().sum();
+                if total_n > 0 {
+                    let max_n = *self.tree[root_idx].n.iter().max().unwrap_or(&0) as f32;
+                    let visit_confidence = max_n / (total_n as f32);
+                    if visit_confidence >= self.config.confidence_threshold {
+                        break;
+                    }
+                }
+            }
         }
 
-        // Extract policy + q_values from root.
         self.extract_root_outputs(root_idx, legal, n_legal)
     }
 
-    /// Walk from `node_idx` down to a leaf (unexpanded node or terminal).
-    /// Mutates the given path (each step's node index + action taken) and returns:
-    ///   - `Some(value)` if the leaf is terminal (no NN eval needed), or
-    ///   - `None` if the leaf is a normal unexpanded node to evaluate.
     fn select(&mut self, node_idx: usize, path: &mut Vec<PathEntry>) -> Option<f32> {
         let mut current = node_idx;
 
         loop {
-            // Terminal: return cached value. The action entry for the leaf
-            // is a sentinel (usize::MAX) since there is no "action from a
-            // terminal that we expand into".
             if let Some(v) = self.tree[current].is_terminal {
                 path.push(PathEntry { node_idx: current, action: usize::MAX });
                 return Some(v);
             }
 
-            // Leaf (unexpanded): return for batched eval.
             if !self.tree[current].is_expanded {
                 path.push(PathEntry { node_idx: current, action: usize::MAX });
                 return None;
             }
 
-            // Internal: pick best PUCT child.
             let action = self.select_puct(current);
             path.push(PathEntry { node_idx: current, action });
 
-            // Apply move on a temporary board.
             let mut child_board = Board {
                 own: self.tree[current].own,
                 opp: self.tree[current].opp,
             };
             let result = child_board.make_move(action);
 
-            // Get or create the child node.
             let child = self.tree[current].children[action];
             let child_idx = if child != u32::MAX {
                 child as usize
@@ -404,20 +411,11 @@ impl MCTS {
                 new_idx
             };
 
-            // If the move ended the game, mark terminal and return.
             match result {
                 crate::bitboard::MoveResult::Win => {
-                    // The mover just won. The new position is from the
-                    // opponent's perspective (board was swapped by make_move),
-                    // so the player to move at the child has lost.
                     self.tree[child_idx].is_terminal = Some(-1.0);
                     self.tree[child_idx].is_expanded = true;
-                    
-                    // Maximum Backpropagation (Minimax Hybrid):
-                    // Since the current player found a move that wins immediately,
-                    // the current node is a guaranteed WIN.
                     self.tree[current].is_terminal = Some(1.0);
-                    
                     path.push(PathEntry { node_idx: child_idx, action: usize::MAX });
                     return Some(-1.0);
                 }
@@ -431,19 +429,16 @@ impl MCTS {
                     current = child_idx;
                 }
                 crate::bitboard::MoveResult::Illegal => {
-                    // Should never happen if priors are correct.
                     return Some(0.0);
                 }
             }
         }
     }
 
-    /// Expand a leaf with priors from a real network eval (no NN call here).
-    /// Sets priors, marks expanded. Idempotent on already-expanded nodes.
     fn expand_with_eval(&mut self, leaf_idx: usize, eval: &Eval) {
         let node = &mut self.tree[leaf_idx];
         if node.is_expanded {
-            return; // already expanded (shouldn't happen but safe)
+            return;
         }
         let occupied = node.own | node.opp;
         for c in 0..7 {
@@ -453,12 +448,7 @@ impl MCTS {
         node.is_expanded = true;
     }
 
-    /// Backup a value up the path. Value is from the LEAF's perspective;
-    /// each step up the tree flips the sign because the player to move
-    /// alternates. Skips the sentinel entries (action == usize::MAX).
     fn backup(&mut self, path: &[PathEntry], mut value: f32) {
-        // path[0] is the root (or earlier node), path[last] is the leaf.
-        // We want to update (n, w) at every entry that has a real action.
         for entry in path.iter() {
             if entry.action == usize::MAX {
                 continue;
@@ -466,36 +456,33 @@ impl MCTS {
             let node = &mut self.tree[entry.node_idx];
             node.n[entry.action] += 1;
             node.w[entry.action] += value;
-            value = -value; // flip for parent's perspective
+            value = -value;
         }
     }
 
-    /// PUCT child selection. Returns the action with the highest UCB.
     fn select_puct(&self, node_idx: usize) -> usize {
         let node = &self.tree[node_idx];
         let total_n: u32 = node.n.iter().sum();
         let sqrt_total = (total_n as f32).sqrt();
         
-        // Dynamic FPU: use parent's average Q-value for unvisited nodes
-        // (with a small penalty) to avoid exploring bad branches just because they are unvisited.
         let parent_q = if total_n > 0 {
             let total_w: f32 = node.w.iter().sum();
             total_w / total_n as f32
         } else {
             0.0
         };
-        let fpu = parent_q - 0.1; // Small penalty to encourage depth
+        let fpu = parent_q - 0.1;
 
         let mut best_a = 0;
         let mut best_score = f32::NEG_INFINITY;
         for c in 0..7 {
             if node.p[c] <= 0.0 {
-                continue; // illegal move
+                continue;
             }
             let q = if node.n[c] > 0 {
                 node.w[c] / node.n[c] as f32
             } else {
-                fpu // Dynamic FPU instead of 0.0
+                fpu
             };
             let u = self.config.c_puct * node.p[c] * sqrt_total / (1.0 + node.n[c] as f32);
             let score = q + u;
@@ -513,7 +500,6 @@ impl MCTS {
         }
     }
 
-    /// Extract policy + q_values from the root node after all simulations.
     fn extract_root_outputs(
         &self,
         root_idx: usize,
@@ -530,7 +516,6 @@ impl MCTS {
         }
 
         if self.config.temperature < 1e-3 {
-            // Greedy: one-hot on the most-visited legal action.
             let mut best_a = 0usize;
             let mut best_n = 0u32;
             for c in 0..7 {
@@ -549,7 +534,6 @@ impl MCTS {
                 }
             }
         } else {
-            // Visit-count softmax with temperature.
             let inv_t = 1.0 / self.config.temperature;
             let mut weighted = [0.0f32; 7];
             for c in 0..7 {
@@ -574,7 +558,6 @@ impl MCTS {
             }
         }
 
-        // Renormalize (in case some small numerical drift occurred).
         let sum: f32 = policy.iter().sum();
         if sum > 0.0 {
             for c in 0..7 {
@@ -585,8 +568,6 @@ impl MCTS {
         (policy.to_vec(), q_values.to_vec())
     }
 
-    /// Sample Dirichlet noise and mix it into the root's priors.
-    /// The result is `P'(a) = (1 - eps) * P_network(a) + eps * eta_a`.
     fn add_root_dirichlet<R: Rng + ?Sized>(
         &mut self,
         root_idx: usize,
@@ -597,7 +578,7 @@ impl MCTS {
         let alpha = vec![self.config.dirichlet_alpha; n_legal];
         let dist = match Dirichlet::new(&alpha) {
             Ok(d) => d,
-            Err(_) => return, // alpha <= 0 (shouldn't happen with default 0.3)
+            Err(_) => return,
         };
         let eta = dist.sample(rng);
         let eps = self.config.dirichlet_epsilon;
@@ -612,14 +593,9 @@ impl MCTS {
                 self.tree[root_idx].p[c] = 0.0;
             }
         }
-        // Mark root as expanded-via-noise so the first search uses the
-        // noised priors. The search will create child nodes on first
-        // selection, just as for any other expanded node.
         self.tree[root_idx].is_expanded = true;
     }
 
-    /// Set root priors to the network's policy (no Dirichlet mixing).
-    /// Used when `--no-noise` is passed or when n_legal == 0.
     fn set_root_priors(
         &mut self,
         root_idx: usize,
@@ -642,9 +618,7 @@ impl MCTS {
     }
 }
 
-// =============================================================================
-// Unit tests
-// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;

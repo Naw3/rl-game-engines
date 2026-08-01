@@ -75,14 +75,16 @@ pub const fn col_top_guard(c: usize) -> u64 {
 
 /// Returns the bit index of the lowest empty cell in column `c`, or `None`
 /// if the column is full. Uses the standard "carry" trick: with the guard
-/// bit pre-set, adding the bottom bit rolls a carry up through the occupied
-/// cells and lands on the first empty one.
+/// adding the bottom bit rolls a carry up through the occupied cells and lands
+/// on the first empty one. The guard is already represented by the mask; it
+/// must not be OR-ed into the addition or an empty column would return two
+/// bits instead of one.
 #[inline]
 pub fn next_empty_bit(occupied: u64, c: usize) -> Option<u64> {
     let mask = col_mask(c);
     let occ = occupied & mask;
-    let next = ((occ | col_top_guard(c)) + col_bottom(c)) & mask;
-    if next == 0 {
+    let next = (occ + col_bottom(c)) & mask;
+    if next == 0 || next == col_top_guard(c) {
         None
     } else {
         debug_assert_eq!(next.count_ones(), 1, "next_empty_bit must be a single bit");

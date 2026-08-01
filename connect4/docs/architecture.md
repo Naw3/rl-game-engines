@@ -223,16 +223,17 @@ Documented here and enforced at both ends.
 │ 0x43 0x34 0x44 0x31  ← magic "C4D1"                   │
 │ u32 LE  N            ← sample count                    │
 │ 8 bytes  reserved    ← must be 0                       │
-├────────────────── SAMPLE (56 bytes) × N ───────────────┤
+├────────────────── SAMPLE (60 bytes) × N ───────────────┤
 │ u64 LE  own          ← current-player bitboard         │
 │ u64 LE  opp          ← opponent bitboard               │
 │ u64 LE  turn_mask    ← all 1s (constant bias plane)    │
 │ 7 × f32 LE  π        ← MCTS policy                     │
 │ f32 LE  z            ← game outcome ∈ {-1, 0, +1}      │
+│ f32 LE  moves_left   ← remaining game moves             │
 └────────────────────────────────────────────────────────┘
 ```
 
-Total: `16 + 56 · N` bytes. The Python `dataset.py` reads this directly
+Total: `16 + 60 · N` bytes. The Python `dataset.py` reads this directly
 via `np.fromfile` + `np.frombuffer`.
 
 ### 3.2 Why these fields
@@ -244,6 +245,11 @@ via `np.fromfile` + `np.frombuffer`.
 | `turn_mask`| Plane 2 of the network input — written as all 1s. Acts as a constant bias feature.       |
 | `π`        | MCTS-improved target policy. 7 floats, sum to 1 over legal moves, 0 over illegal ones.   |
 | `z`        | Target value, from THIS sample's perspective. `+1` if the player to move here wins, etc. |
+| `moves_left` | Auxiliary target for the estimated remaining game length.                         |
+
+The confidence head is trained from `max(π)`, the concentration of the
+ordinary PCR self-play MCTS policy. At inference, it is combined with the
+current root visit concentration to decide whether the search can stop early.
 
 The bit positions within `own` / `opp` are exactly the column-major layout
 described in §1. The Rust side reconstructs the 3-plane tensor in

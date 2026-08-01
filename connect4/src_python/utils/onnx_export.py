@@ -9,6 +9,7 @@ Output contract (consumed by Rust network.rs via ORT):
     output "policy"     shape (batch, 7)        f32  (log-probabilities)
     output "value"      shape (batch,)          f32  (in [-1, 1] via tanh)
     output "moves_left" shape (batch,)          f32
+    output "confidence" shape (batch,)          f32  (confidence in [0, 1])
 
 The Rust side softmaxes the policy (since the model head outputs
 log-softmax). The model is moved to CPU before export.
@@ -144,6 +145,7 @@ def export_onnx(
         "policy": {0: "batch_size"},
         "value":  {0: "batch_size"},
         "moves_left": {0: "batch_size"},
+        "confidence": {0: "batch_size"},
     }
 
     with _SuppressOutput():
@@ -152,12 +154,15 @@ def export_onnx(
             (dummy,),
             export_target,
             input_names=["input"],
-            output_names=["policy", "value", "moves_left"],
+            output_names=["policy", "value", "moves_left", "confidence"],
             dynamic_axes=dynamic_axes,
             opset_version=opset,
             do_constant_folding=False,
             export_params=True,
-            keep_initializers_as_inputs=True,
+            # Keep weights as graph initializers, not runtime inputs.  The
+            # latter is valid ONNX but makes ONNX Runtime warn about every
+            # parameter and prevents constant-folding optimizations.
+            keep_initializers_as_inputs=False,
         )
 
     if verify and isinstance(onnx_path, (str, Path)):
@@ -165,6 +170,18 @@ def export_onnx(
         import onnx
         onnx_model = onnx.load(str(onnx_path))
         onnx.checker.check_model(onnx_model)
+
+
+def export_onnx_to_bytes(
+    model: torch.nn.Module,
+    opset: int = _DEFAULT_OPSET,
+    infer_precision: str = _DEFAULT_INFER_PRECISION,
+) -> bytes:
+    """Export Connect4Net directly to in-memory ONNX bytes without writing to disk."""
+    import io
+    buf = io.BytesIO()
+    export_onnx(model, buf, opset=opset, infer_precision=infer_precision, verify=False)
+    return buf.getvalue()
 
 
 def update_onnx_weights(model: torch.nn.Module, onnx_path: str | Path) -> bool:
@@ -181,33 +198,21 @@ def update_onnx_weights(model: torch.nn.Module, onnx_path: str | Path) -> bool:
 
     try:
         onnx_model = onnx.load(path_str)
+        if "confidence" not in {output.name for output in onnx_model.graph.output}:
+            return False
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
         state_dict = inner.state_dict()
 
         dict_by_name = {k: v.detach().cpu().numpy() for k, v in state_dict.items()}
-        dict_by_shape = {}
-        for k, v in state_dict.items():
-            dict_by_shape.setdefault(tuple(v.shape), []).append(v.detach().cpu().numpy())
-        
-        shape_ptrs = {shape: 0 for shape in dict_by_shape}
 
         updated_count = 0
         for init in onnx_model.graph.initializer:
             key = init.name
-            init_shape = tuple(init.dims)
-
             if key in dict_by_name:
                 tensor_np = dict_by_name[key]
-            elif init_shape in dict_by_shape and shape_ptrs[init_shape] < len(dict_by_shape[init_shape]):
-                idx = shape_ptrs[init_shape]
-                tensor_np = dict_by_shape[init_shape][idx]
-                shape_ptrs[init_shape] += 1
-            else:
-                continue
-
-            new_init = numpy_helper.from_array(tensor_np, name=key)
-            init.CopyFrom(new_init)
-            updated_count += 1
+                new_init = numpy_helper.from_array(tensor_np, name=key)
+                init.CopyFrom(new_init)
+                updated_count += 1
 
         if updated_count == 0:
             return False
@@ -216,6 +221,40 @@ def update_onnx_weights(model: torch.nn.Module, onnx_path: str | Path) -> bool:
         return True
     except Exception:
         return False
+
+
+def update_onnx_weights_bytes(model: torch.nn.Module, existing_bytes: bytes) -> bytes | None:
+    """Fast inline weight updater for ONNX model bytes directly in RAM without disk I/O.
+
+    Returns updated ONNX model bytes (<5ms), or None if fallback full export is required.
+    """
+    import onnx
+    from onnx import numpy_helper
+
+    try:
+        onnx_model = onnx.load_model_from_string(existing_bytes)
+        if "confidence" not in {output.name for output in onnx_model.graph.output}:
+            return None
+        inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+        state_dict = inner.state_dict()
+
+        dict_by_name = {k: v.detach().cpu().numpy() for k, v in state_dict.items()}
+
+        updated_count = 0
+        for init in onnx_model.graph.initializer:
+            key = init.name
+            if key in dict_by_name:
+                tensor_np = dict_by_name[key]
+                new_init = numpy_helper.from_array(tensor_np, name=key)
+                init.CopyFrom(new_init)
+                updated_count += 1
+
+        if updated_count == 0:
+            return None
+
+        return onnx_model.SerializeToString()
+    except Exception:
+        return None
 
     if infer_precision == "int8":
         import logging

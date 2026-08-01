@@ -290,7 +290,7 @@ class SelfPlayWorker:
                 [_board_to_planes(o, p) for o, p in missing_boards]
             )
             bt = torch.from_numpy(batch_planes).to(self.device)
-            lp, vs = self.sp_model(bt)
+            lp, vs, _moves_left, _confidence = self.sp_model(bt)
             probs = lp.exp().cpu().numpy()
             vals = vs.cpu().numpy().flatten()
 

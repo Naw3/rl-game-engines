@@ -18,10 +18,11 @@
 // uniform priors + value=0.
 // =============================================================================
 
-use crate::bitboard::{col_mask, Board};
+use crate::bitboard::{col_top_guard, Board};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use crossbeam_channel::{bounded, Receiver, Sender};
 
 // --- ort imports ----------------------------------------------------------
@@ -131,6 +132,7 @@ fn unflip_eval(eval: Eval, is_flipped: bool) -> Eval {
             ],
             value: eval.value,
             moves_left: eval.moves_left,
+            confidence: eval.confidence,
         }
     }
 }
@@ -177,8 +179,12 @@ impl Device {
 /// shared via `Arc` across all rayon worker threads.
 pub struct Network {
     queue: Option<InferQueue>,
+    pub cache: Arc<EvalCache>,
     device: Device,
-    cache: Arc<EvalCache>,
+    pub total_evals: AtomicU64,
+    pub cache_hits: AtomicU64,
+    pub gpu_time_ns: Arc<AtomicU64>,
+    pub wait_time_ns: Arc<AtomicU64>,
 }
 
 /// The sender half of the dispatcher's request queue. Cloned cheaply per thread.
@@ -201,28 +207,42 @@ pub struct Eval {
     pub policy: [f32; 7],
     pub value: f32,
     pub moves_left: f32,
+    /// Predicted confidence that the policy's best move is already clear.
+    pub confidence: f32,
 }
 
 impl Network {
     /// Load an ONNX model from disk using the backend implied by `device`.
     pub fn load<P: AsRef<Path>>(path: P, device: Device) -> Result<Self, Box<dyn std::error::Error>> {
         let device = device.resolve();
-        let queue = start_dispatcher(path.as_ref(), device)?;
+        let gpu_time_ns = Arc::new(AtomicU64::new(0));
+        let wait_time_ns = Arc::new(AtomicU64::new(0));
+        let queue = start_dispatcher(path.as_ref(), device, Arc::clone(&gpu_time_ns), Arc::clone(&wait_time_ns))?;
         Ok(Network {
             queue: Some(queue),
             device,
             cache: Arc::new(EvalCache::new()),
+            total_evals: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            gpu_time_ns,
+            wait_time_ns,
         })
     }
 
     /// Load an ONNX model from RAM bytes.
     pub fn load_from_memory(bytes: &[u8], device: Device) -> Result<Self, Box<dyn std::error::Error>> {
         let device = device.resolve();
-        let queue = start_dispatcher_from_memory(bytes, device)?;
+        let gpu_time_ns = Arc::new(AtomicU64::new(0));
+        let wait_time_ns = Arc::new(AtomicU64::new(0));
+        let queue = start_dispatcher_from_memory(bytes, device, Arc::clone(&gpu_time_ns), Arc::clone(&wait_time_ns))?;
         Ok(Network {
             queue: Some(queue),
             device,
             cache: Arc::new(EvalCache::new()),
+            total_evals: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            gpu_time_ns,
+            wait_time_ns,
         })
     }
 
@@ -234,6 +254,10 @@ impl Network {
             queue: None,
             device: Device::Cpu,
             cache: Arc::new(EvalCache::new()),
+            total_evals: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            gpu_time_ns: Arc::new(AtomicU64::new(0)),
+            wait_time_ns: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -260,25 +284,28 @@ impl Network {
         eval
     }
 
-    /// Evaluate a batch of positions. On GPU, each board is submitted
-    /// individually to the dispatcher — the dispatcher will merge them with
-    /// concurrent requests from other threads into a single large GPU batch.
-    /// On CPU, they are forwarded as a single batch directly.
+    /// Evaluate a batch of positions.
     pub fn evaluate_batch(&self, boards: &[Board]) -> Vec<Eval> {
         if boards.is_empty() {
             return Vec::new();
         }
+        self.total_evals.fetch_add(boards.len() as u64, Ordering::Relaxed);
         let mut results = vec![None; boards.len()];
         let mut missing_indices = Vec::new();
         let mut missing_boards = Vec::new();
 
+        let mut hits = 0u64;
         for (i, &b) in boards.iter().enumerate() {
             if let Some(cached) = self.cache.get(&b) {
                 results[i] = Some(cached);
+                hits += 1;
             } else {
                 missing_indices.push(i);
                 missing_boards.push(b);
             }
+        }
+        if hits > 0 {
+            self.cache_hits.fetch_add(hits, Ordering::Relaxed);
         }
 
         if !missing_boards.is_empty() {
@@ -286,6 +313,7 @@ impl Network {
                 Some(queue) => dispatcher_batch_eval(queue, &missing_boards),
                 None => missing_boards.iter().map(|&b| null_eval(b)).collect(),
             };
+
             for ((idx, &b), eval) in missing_indices.into_iter().zip(missing_boards.iter()).zip(evals.into_iter()) {
                 self.cache.insert(b, eval);
                 results[idx] = Some(eval);
@@ -351,34 +379,31 @@ pub(crate) fn load_ort_from_memory(bytes: &[u8], device: Device) -> Result<Sessi
 ///
 /// The dispatcher thread exits automatically when all senders are dropped
 /// (i.e., when the `Network` is dropped at end of self-play).
-fn start_dispatcher(path: &Path, device: Device) -> Result<InferQueue, Box<dyn std::error::Error>> {
-    // Bounded queue so backpressure prevents unbounded queuing.
-    // 256 slots: with 64 threads each queuing ~32 requests per sim batch,
-    // this gives enough headroom without unbounded memory growth.
+fn start_dispatcher(path: &Path, device: Device, gpu_time_ns: Arc<AtomicU64>, wait_time_ns: Arc<AtomicU64>) -> Result<InferQueue, Box<dyn std::error::Error>> {
     let (tx, rx): (Sender<InferRequest>, Receiver<InferRequest>) = bounded(256);
 
     let session = load_ort(path, device)?;
 
     std::thread::Builder::new()
         .name("ort-dispatcher".to_string())
-        .spawn(move || run_dispatcher(session, rx))?;
+        .spawn(move || run_dispatcher(session, rx, gpu_time_ns, wait_time_ns))?;
 
     Ok(tx)
 }
 
-fn start_dispatcher_from_memory(bytes: &[u8], device: Device) -> Result<InferQueue, Box<dyn std::error::Error>> {
+fn start_dispatcher_from_memory(bytes: &[u8], device: Device, gpu_time_ns: Arc<AtomicU64>, wait_time_ns: Arc<AtomicU64>) -> Result<InferQueue, Box<dyn std::error::Error>> {
     let (tx, rx) = bounded(256);
     let session = load_ort_from_memory(bytes, device)?;
     
     std::thread::Builder::new()
         .name("ort-dispatcher-ram".to_string())
-        .spawn(move || run_dispatcher(session, rx))?;
+        .spawn(move || run_dispatcher(session, rx, gpu_time_ns, wait_time_ns))?;
 
     Ok(tx)
 }
 
 /// The main loop of the GPU dispatcher thread.
-fn run_dispatcher(mut session: Session, rx: Receiver<InferRequest>) {
+fn run_dispatcher(mut session: Session, rx: Receiver<InferRequest>, gpu_time_ns: Arc<AtomicU64>, wait_time_ns: Arc<AtomicU64>) {
     loop {
         // Block until at least one request arrives.
         let first = match rx.recv() {
@@ -386,14 +411,11 @@ fn run_dispatcher(mut session: Session, rx: Receiver<InferRequest>) {
             Err(_) => return, // all senders dropped → clean shutdown
         };
 
-        // Drain as many additional requests as are immediately available,
-        // then wait up to 500 µs for stragglers before flushing.
-        // This "batching window" prevents degenerate batch-size-1 flushes
-        // when only a few MCTS games remain active at end-of-cycle.
         let mut batch: Vec<InferRequest> = Vec::with_capacity(MAX_DISPATCHER_BATCH);
         batch.push(first);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_micros(500);
+        let t_wait_start = std::time::Instant::now();
+        let deadline = t_wait_start + std::time::Duration::from_micros(100);
         loop {
             if batch.len() >= MAX_DISPATCHER_BATCH {
                 break;
@@ -407,6 +429,8 @@ fn run_dispatcher(mut session: Session, rx: Receiver<InferRequest>) {
                 Err(_) => break, // timeout or disconnected
             }
         }
+        let elapsed_wait = t_wait_start.elapsed().as_nanos() as u64;
+        wait_time_ns.fetch_add(elapsed_wait, Ordering::Relaxed);
 
         let n = batch.len();
 
@@ -430,7 +454,12 @@ fn run_dispatcher(mut session: Session, rx: Receiver<InferRequest>) {
         };
 
         // Single GPU forward pass — the key to saturating the GPU.
-        let outputs = match session.run(ort::inputs!["input" => input_val]) {
+        let t0 = std::time::Instant::now();
+        let run_res = session.run(ort::inputs!["input" => input_val]);
+        let elapsed_ns = t0.elapsed().as_nanos() as u64;
+        gpu_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+        let outputs = match run_res {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("[ort-dispatcher] inference error: {e}");
@@ -450,6 +479,16 @@ fn run_dispatcher(mut session: Session, rx: Receiver<InferRequest>) {
         let moves_left_view = outputs[2]
             .try_extract_array::<f32>()
             .expect("ort moves_left extraction failed");
+        let confidence_data: Vec<f32> = if outputs.len() > 3 {
+            outputs[3]
+                .try_extract_array::<f32>()
+                .expect("ort confidence extraction failed")
+                .iter()
+                .copied()
+                .collect()
+        } else {
+            vec![0.0; batch.len()]
+        };
         let policy_data: Vec<f32> = policy_view.iter().copied().collect();
         let value_data: Vec<f32> = value_view.iter().copied().collect();
         let moves_left_data: Vec<f32> = moves_left_view.iter().copied().collect();
@@ -463,8 +502,9 @@ fn run_dispatcher(mut session: Session, rx: Receiver<InferRequest>) {
             }
             let eval = Eval {
                 policy,
-                value: value_data[i],
-                moves_left: moves_left_data[i],
+            value: value_data[i],
+            moves_left: moves_left_data[i],
+            confidence: confidence_data[i],
             };
             let _ = req.reply.send(eval); // ignore if receiver already dropped
         }
@@ -549,21 +589,21 @@ fn null_eval(board: Board) -> Eval {
     let mut n_legal = 0u32;
     // Check legality and fill in one pass — col_mask computed once per column.
     for c in 0..7usize {
-        let mask = col_mask(c);
-        if (occupied & mask) != mask {
+        let top = col_top_guard(c) >> 1;
+        if (occupied & top) == 0 {
             n_legal += 1;
         }
     }
     if n_legal > 0 {
         let p = 1.0 / n_legal as f32;
         for c in 0..7usize {
-            let mask = col_mask(c);
-            if (occupied & mask) != mask {
+            let top = col_top_guard(c) >> 1;
+            if (occupied & top) == 0 {
                 policy[c] = p;
             }
         }
     }
-    Eval { policy, value: 0.0, moves_left: 21.0 }
+    Eval { policy, value: 0.0, moves_left: 21.0, confidence: 0.0 }
 }
 
 // ---------------------------------------------------------------------------

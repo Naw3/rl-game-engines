@@ -17,10 +17,11 @@
 //    and its own seeded RNG, but they ALL share the same
 //    `Arc<Network>` — the inference is the only synchronisation point
 //    and the ORT dispatcher serialises that internally.
-// 4. For each move, MCTS runs `simulations` PUCT-guided simulations,
-//    using the network's policy as the prior and the network's value
-//    as the leaf value. The visit-count distribution is the policy
-//    target for the training data.
+// 4. For each move, use Playout Cap Randomization (PCR): 25% of moves get
+//    the full PUCT budget and 75% get a cheaper budget. The network's policy
+//    is the prior and its value is the leaf value.
+//    The visit-count distribution is the policy target; its concentration
+//    trains the Python confidence head.
 // 5. After each game, walk the recorded (state, policy) pairs and
 //    assign a value `z ∈ {-1, 0, +1}` to each from the perspective
 //    of the player to move at that state.
@@ -34,14 +35,15 @@
 //     4 bytes : u32 LE  sample count N
 //     8 bytes : reserved, zero
 //
-//   Sample (56 bytes) — repeated N times:
+//   Sample (60 bytes) — repeated N times:
 //     8 bytes : u64 LE  own bitboard       (current player's pieces)
 //     8 bytes : u64 LE  opponent bitboard  (the other player's pieces)
 //     8 bytes : u64 LE  turn mask          (all 1s — constant bias plane)
 //     28 bytes: 7 × f32 LE  MCTS policy π
 //     4 bytes : f32 LE    game outcome z  (from THIS sample's perspective)
+//     4 bytes : f32 LE    remaining game moves (auxiliary target)
 //
-//   Total: 16 + 56·N bytes. The Python `dataset.py` reads this directly
+//   Total: 16 + 60·N bytes. The Python `dataset.py` reads this directly
 //   via `numpy.frombuffer`.
 // =============================================================================
 
@@ -66,7 +68,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// 56 bytes per sample. Manually serialized to keep the wire format tight.
+/// 60 bytes per sample. Manually serialized to keep the wire format tight.
 ///
 /// `policy` uses a fixed-size `[f32; 7]` array (known at compile time)
 /// to avoid heap allocation per game-move. The on-disk format writes exactly
@@ -93,6 +95,9 @@ struct ConfigJson {
 struct MctsJson {
     games: Option<usize>,
     sims: Option<usize>,
+    pcr_full_probability: Option<f32>,
+    pcr_cheap_ratio: Option<f32>,
+    pcr_min_sims: Option<usize>,
     cpu_batch_size: Option<usize>,
     gpu_batch_size: Option<usize>,
     _max_dispatcher_batch: Option<usize>,
@@ -119,6 +124,36 @@ struct PathsJson {
 #[derive(Debug, serde::Deserialize)]
 struct DeviceJson {
     rust_device: Option<String>,
+}
+
+/// Compute the cheap branch of the self-play Playout Cap Randomization.
+/// For the current defaults, 200 full simulations become 32 cheap ones.
+fn pcr_cheap_budget(full_sims: usize, ratio: f32, min_sims: usize) -> usize {
+    let full_sims = full_sims.max(1);
+    let ratio = if ratio.is_finite() { ratio.max(0.0) } else { 0.0 };
+    (((full_sims as f32) * ratio).round() as usize)
+        .max(min_sims)
+        .min(full_sims)
+}
+
+#[cfg(test)]
+mod pcr_tests {
+    use super::pcr_cheap_budget;
+
+    #[test]
+    fn current_training_budgets_are_200_and_32() {
+        assert_eq!(pcr_cheap_budget(200, 0.1, 32), 32);
+    }
+
+    #[test]
+    fn cheap_budget_scales_for_the_original_800_sim_default() {
+        assert_eq!(pcr_cheap_budget(800, 0.1, 32), 80);
+    }
+
+    #[test]
+    fn cheap_budget_never_exceeds_full_budget() {
+        assert_eq!(pcr_cheap_budget(8, 0.1, 32), 8);
+    }
 }
 
 fn load_config_from_python() -> Option<ConfigJson> {
@@ -187,6 +222,15 @@ fn main() -> ExitCode {
     let mut num_games: usize = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.games).unwrap_or(64);
     let mut duration_secs: Option<u64> = None;
     let mut simulations: usize = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.sims).unwrap_or(mcts::DEFAULT_SIMS);
+    let pcr_full_probability: f32 = json_cfg.as_ref()
+        .and_then(|c| c.mcts.as_ref()?.pcr_full_probability)
+        .unwrap_or(mcts::DEFAULT_PCR_FULL_PROBABILITY);
+    let pcr_cheap_ratio: f32 = json_cfg.as_ref()
+        .and_then(|c| c.mcts.as_ref()?.pcr_cheap_ratio)
+        .unwrap_or(mcts::DEFAULT_PCR_CHEAP_RATIO);
+    let pcr_min_sims: usize = json_cfg.as_ref()
+        .and_then(|c| c.mcts.as_ref()?.pcr_min_sims)
+        .unwrap_or(mcts::DEFAULT_PCR_MIN_SIMS);
     let mut batch_size_opt: Option<usize> = None;
     let mut seed: u64 = json_cfg.as_ref().and_then(|c| c.mcts.as_ref()?.seed).unwrap_or(0xC0FFEE_u64);
     let mut output: String = json_cfg.as_ref().and_then(|c| c.paths.as_ref()?.selfplay_bin.clone()).unwrap_or_else(|| "selfplay.bin".to_string());
@@ -200,6 +244,7 @@ fn main() -> ExitCode {
         .and_then(|s| network::Device::from_str(s).ok())
         .unwrap_or(network::Device::Auto);
     let mut stream_mode: bool = false;
+    let mut max_buffer_epochs: usize = 0;
     let mut verbose: bool = false;
 
     // Tiny flag parser. Supports `--flag value` and `--flag=value`.
@@ -255,6 +300,9 @@ fn main() -> ExitCode {
             }
             "--no-noise" => {
                 dirichlet_eps = 0.0;
+            }
+            "--max-buffer-epochs" => {
+                max_buffer_epochs = next(&mut i).parse().unwrap_or(0);
             }
             "--stream" => stream_mode = true,
             "--verbose" | "-v" => verbose = true,
@@ -320,23 +368,33 @@ fn main() -> ExitCode {
 
     let config = MCTSConfig {
         simulations,
+        pcr_full_probability,
+        pcr_cheap_ratio,
+        pcr_min_sims,
         batch_size,
         c_puct,
         dirichlet_alpha,
         dirichlet_epsilon: dirichlet_eps,
         temperature,
+        ..Default::default()
     };
 
     if verbose {
         if let Some(dur) = duration_secs {
             eprintln!(
-                "[selfplay] duration={}s sims={} batch_size={} seed=0x{:X} output={} tau={} eps={}",
-                dur, simulations, batch_size, seed, output, temperature, dirichlet_eps
+                "[selfplay] duration={}s sims={} PCR={:.0}% full / {:.0}% cheap ({} sims) batch_size={} seed=0x{:X} output={} tau={} eps={}",
+                dur, simulations, pcr_full_probability * 100.0,
+                (1.0 - pcr_full_probability) * 100.0,
+                pcr_cheap_budget(simulations, pcr_cheap_ratio, pcr_min_sims),
+                batch_size, seed, output, temperature, dirichlet_eps
             );
         } else {
             eprintln!(
-                "[selfplay] games={} sims={} batch_size={} seed=0x{:X} output={} tau={} eps={}",
-                num_games, simulations, batch_size, seed, output, temperature, dirichlet_eps
+                "[selfplay] games={} sims={} PCR={:.0}% full / {:.0}% cheap ({} sims) batch_size={} seed=0x{:X} output={} tau={} eps={}",
+                num_games, simulations, pcr_full_probability * 100.0,
+                (1.0 - pcr_full_probability) * 100.0,
+                pcr_cheap_budget(simulations, pcr_cheap_ratio, pcr_min_sims),
+                batch_size, seed, output, temperature, dirichlet_eps
             );
         }
         // Warn if --device gpu is requested but cuda feature wasn't compiled in.
@@ -367,7 +425,7 @@ fn main() -> ExitCode {
 
     let format_dur = |s: f64| format_duration(s);
 
-    if verbose {
+    if verbose && !stream_mode {
         let bar_width = json_cfg.as_ref().and_then(|c| c.gui.as_ref()?.progress_bar_width).unwrap_or(20);
         let bar = format!("[{}]", " ".repeat(bar_width));
         if duration_secs.is_some() {
@@ -384,7 +442,11 @@ fn main() -> ExitCode {
         let _ = std::io::stderr().flush();
     }
 
-    let samples: Vec<Sample> = if let Some(dur) = duration_secs {
+    // Stream mode has its own generation loop below. Do not generate a full
+    // batch here first: that batch would be discarded before streaming starts.
+    let samples: Vec<Sample> = if stream_mode {
+        Vec::new()
+    } else if let Some(dur) = duration_secs {
         let num_threads = rayon::current_num_threads();
         (0..num_threads)
             .into_par_iter()
@@ -413,26 +475,32 @@ fn main() -> ExitCode {
 
                     if verbose {
                         let elapsed = start.elapsed().as_secs_f64();
-                        let avg_plies = current_plies as f64 / completed as f64;
+                        let _avg_plies = current_plies as f64 / completed as f64;
                         let sec_per_game = elapsed / completed as f64;
-                        let time_str = format_dur(elapsed);
-                        let per_game_str = format!("{}/game", format_dur(sec_per_game));
+                        let _per_game_str = format!("{}/game", format_dur(sec_per_game));
 
                         let dur_f64 = dur as f64;
                         let pct = ((elapsed / dur_f64) * 100.0).clamp(0.0, 100.0) as usize;
-                        let bar_width: usize = json_cfg.as_ref().and_then(|c| c.gui.as_ref()?.progress_bar_width).unwrap_or(20);
-                        let filled = ((elapsed / dur_f64) * bar_width as f64).clamp(0.0, bar_width as f64) as usize;
-                        let empty = bar_width.saturating_sub(filled);
-                        let bar = format!(
-                            "[{}{}{}]",
-                            "=".repeat(filled),
-                            if filled < bar_width { ">" } else { "" },
-                            " ".repeat(if empty > 0 { empty - 1 } else { 0 })
-                        );
+                        let time_str = format_dur(elapsed);
+                        let gpu_secs = network.gpu_time_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
+                        let wait_secs = network.wait_time_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
+                        let cpu_secs = f64::max(elapsed - (gpu_secs + wait_secs), 0.0);
+                        let ms_per_game = if completed > 0 { (elapsed * 1000.0) / completed as f64 } else { 0.0 };
+                        let total_e = network.total_evals.load(Ordering::Relaxed);
+                        let hits_e = network.cache_hits.load(Ordering::Relaxed);
+                        let hit_rate = if total_e > 0 { (hits_e as f64 / total_e as f64) * 100.0 } else { 0.0 };
+
+                        let fmt_t = |sec: f64| {
+                            if sec < 1.0 {
+                                format!("{:.1}ms", sec * 1000.0)
+                            } else {
+                                format!("{:.2}s", sec)
+                            }
+                        };
 
                         eprint!(
-                            "\r\x1B[K[selfplay] {:3}% {} {:4} games | avg {:.1} moves | {} / {} | {}",
-                            pct, bar, completed, avg_plies, time_str, format_dur(dur_f64), per_game_str
+                            "\r\x1B[K[selfplay] {:3}% ({} / {}) | {:4} games | {:.1}ms/game | CPU: {} GPU: {} Wait: {} | Cache: {:.1}%",
+                            pct, time_str, format_dur(dur_f64), completed, ms_per_game, fmt_t(cpu_secs), fmt_t(gpu_secs), fmt_t(wait_secs), hit_rate
                         );
                         let _ = std::io::stderr().flush();
                     }
@@ -457,32 +525,35 @@ fn main() -> ExitCode {
                 let game_samples = play_game(&mut mcts, &mut rng, None);
 
                 let completed = completed_games.fetch_add(1, Ordering::SeqCst) + 1;
-                let current_plies = total_plies.fetch_add(game_samples.len(), Ordering::SeqCst) + game_samples.len();
+                let _current_plies = total_plies.fetch_add(game_samples.len(), Ordering::SeqCst) + game_samples.len();
 
                 if verbose {
                     let elapsed = start.elapsed().as_secs_f64();
-                    let avg_plies = current_plies as f64 / completed as f64;
                     let sec_per_game = elapsed / completed as f64;
                     let remaining_games = num_games.saturating_sub(completed);
                     let eta_sec = sec_per_game * remaining_games as f64;
-                    let time_str = format_dur(elapsed);
                     let eta_str = format_dur(eta_sec);
-                    let per_game_str = format!("{}/game", format_dur(sec_per_game));
 
                     let pct = (completed * 100) / num_games;
-                    let bar_width = json_cfg.as_ref().and_then(|c| c.gui.as_ref()?.progress_bar_width).unwrap_or(20);
-                    let filled = (completed * bar_width) / num_games;
-                    let empty = bar_width - filled;
-                    let bar = format!(
-                        "[{}{}{}]",
-                        "=".repeat(filled),
-                        if filled < bar_width { ">" } else { "" },
-                        " ".repeat(if empty > 0 { empty - 1 } else { 0 })
-                    );
+                    let gpu_secs = network.gpu_time_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
+                    let wait_secs = network.wait_time_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
+                    let cpu_secs = f64::max(elapsed - (gpu_secs + wait_secs), 0.0);
+                    let ms_per_game = if completed > 0 { (elapsed * 1000.0) / completed as f64 } else { 0.0 };
+                    let total_e = network.total_evals.load(Ordering::Relaxed);
+                    let hits_e = network.cache_hits.load(Ordering::Relaxed);
+                    let hit_rate = if total_e > 0 { (hits_e as f64 / total_e as f64) * 100.0 } else { 0.0 };
+
+                    let fmt_t = |sec: f64| {
+                        if sec < 1.0 {
+                            format!("{:.1}ms", sec * 1000.0)
+                        } else {
+                            format!("{:.2}s", sec)
+                        }
+                    };
 
                     eprint!(
-                        "\r\x1B[K[selfplay] {:3}% {} {:4}/{} | avg {:.1} moves | {} | {} | ETA: {}",
-                        pct, bar, completed, num_games, avg_plies, time_str, per_game_str, eta_str
+                        "\r\x1B[K[selfplay] {:3}% ({}/{}) | {:.1}ms/game | CPU: {} GPU: {} Wait: {} | Cache: {:.1}% | ETA: {}",
+                        pct, completed, num_games, ms_per_game, fmt_t(cpu_secs), fmt_t(gpu_secs), fmt_t(wait_secs), hit_rate, eta_str
                     );
                     let _ = std::io::stderr().flush();
                 }
@@ -516,6 +587,7 @@ fn main() -> ExitCode {
             }
         });
 
+        let mut produced_epochs = 0usize;
         loop {
             // --- HOT RELOAD ONNX MODEL FROM RAM ---
             // If multiple models arrived while we were generating, just grab the latest one.
@@ -528,23 +600,39 @@ fn main() -> ExitCode {
                 if verbose {
                     eprintln!("[selfplay] Received ONNX model from Python via stdin, hot-reloading...");
                 }
-                let ipc_onnx_path = std::path::Path::new(&model_path)
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join("connect4_model_ipc.onnx");
-                let load_res = if ipc_onnx_path.exists() {
-                    Network::load(&ipc_onnx_path, device)
-                } else {
-                    Network::load_from_memory(&model_bytes, device)
-                };
-                match load_res {
-                    Ok(new_net) => {
+                match Network::load_from_memory(&model_bytes, device) {
+                    Ok(mut new_net) => {
+                        // Persist evaluation cache across hot-reloads for high cache hit rates
+                        new_net.cache = Arc::clone(&network.cache);
                         network = Arc::new(new_net);
+                        produced_epochs = 0;
                     }
                     Err(e) => {
                         eprintln!("[selfplay] WARNING: failed to hot-reload ONNX from stdin: {}", e);
                     }
                 }
+            }
+
+            if max_buffer_epochs > 0 && produced_epochs >= max_buffer_epochs {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+
+            let generation_start = Instant::now();
+            if verbose {
+                eprintln!(
+                    "[selfplay] stream epoch {}: generating {} games (PCR {:.0}% full / {:.0}% cheap, {} / {} sims)...",
+                    produced_epochs + 1,
+                    num_games,
+                    config.pcr_full_probability * 100.0,
+                    (1.0 - config.pcr_full_probability) * 100.0,
+                    config.simulations,
+                    pcr_cheap_budget(
+                        config.simulations,
+                        config.pcr_cheap_ratio,
+                        config.pcr_min_sims,
+                    ),
+                );
             }
 
             let samples: Vec<Sample> = (0..num_games)
@@ -563,28 +651,56 @@ fn main() -> ExitCode {
                     a
                 });
 
+            if verbose {
+                eprintln!(
+                    "[selfplay] stream epoch {} ready in {} ({} samples)",
+                    produced_epochs + 1,
+                    format_dur(generation_start.elapsed().as_secs_f64()),
+                    samples.len(),
+                );
+            }
+
             if write_binary(&output, &samples, num_games).is_err() {
                 break;
             }
+            produced_epochs += 1;
             seed = seed.wrapping_add(1);
         }
         return ExitCode::SUCCESS;
     }
 
     if verbose {
-        if let Some(dur) = duration_secs {
-            let bar_width = json_cfg.as_ref().and_then(|c| c.gui.as_ref()?.progress_bar_width).unwrap_or(20);
-            let bar = format!("[{}]", "=".repeat(bar_width));
-            let elapsed = start.elapsed().as_secs_f64();
-            eprint!(
-                "\r\x1B[K[selfplay] 100% {}  time limit reached | {:.1}s / {}s",
-                bar, elapsed, dur
-            );
-        }
-        
-        eprintln!();
         let elapsed = start.elapsed().as_secs_f64();
         let final_games = completed_games.load(Ordering::SeqCst);
+        let gpu_secs = network.gpu_time_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
+        let wait_secs = network.wait_time_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
+        let cpu_secs = f64::max(elapsed - (gpu_secs + wait_secs), 0.0);
+        let ms_per_game = if final_games > 0 { (elapsed * 1000.0) / final_games as f64 } else { 0.0 };
+        let total_e = network.total_evals.load(Ordering::Relaxed);
+        let hits_e = network.cache_hits.load(Ordering::Relaxed);
+        let hit_rate = if total_e > 0 { (hits_e as f64 / total_e as f64) * 100.0 } else { 0.0 };
+
+        let fmt_t = |sec: f64| {
+            if sec < 1.0 {
+                format!("{:.1}ms", sec * 1000.0)
+            } else {
+                format!("{:.2}s", sec)
+            }
+        };
+
+        if let Some(dur) = duration_secs {
+            eprint!(
+                "\r\x1B[K[selfplay] 100% ({} / {}) | {:4} games | {:.1}ms/game | CPU: {} GPU: {} Wait: {} | Cache: {:.1}%\n",
+                format_dur(elapsed), format_dur(dur as f64), final_games, ms_per_game, fmt_t(cpu_secs), fmt_t(gpu_secs), fmt_t(wait_secs), hit_rate
+            );
+        } else {
+            eprint!(
+                "\r\x1B[K[selfplay] 100% ({}/{}) | {:.1}ms/game | CPU: {} GPU: {} Wait: {} | Cache: {:.1}%\n",
+                final_games, num_games, ms_per_game, fmt_t(cpu_secs), fmt_t(gpu_secs), fmt_t(wait_secs), hit_rate
+            );
+        }
+        let _ = std::io::stderr().flush();
+
         let throughput = final_games as f64 / elapsed;
         eprintln!(
             "[selfplay] {} games → {} samples in {:.2}s ({:.1} games/sec)",
@@ -602,7 +718,7 @@ fn main() -> ExitCode {
     match write_binary(&output, &samples, num_games) {
         Ok(()) => {
             if verbose {
-                let bytes = 16 + 56 * samples.len();
+                let bytes = 16 + 60 * samples.len();
                 eprintln!("[selfplay] wrote {} bytes to {}", bytes, output);
             }
             ExitCode::SUCCESS
@@ -857,8 +973,14 @@ fn play_game<R: Rng + ?Sized>(mcts: &mut MCTS, rng: &mut R, deadline: Option<Ins
     let mut board = Board::new();
     let mut samples: Vec<Sample> = Vec::with_capacity(42);
     let mut last_was_terminal: Option<MoveResult> = None;
-    let full_sims = mcts.config.simulations;
-    let cheap_sims = (full_sims / 10).max(32); // e.g. 800 -> 80, min 32
+    // Keep the configured full budget outside the move loop because
+    // set_simulations mutates the MCTS config for the current move.
+    let full_sims = mcts.config.simulations.max(1);
+    let cheap_sims = pcr_cheap_budget(
+        full_sims,
+        mcts.config.pcr_cheap_ratio,
+        mcts.config.pcr_min_sims,
+    );
 
     loop {
         if let Some(d) = deadline {
@@ -867,13 +989,15 @@ fn play_game<R: Rng + ?Sized>(mcts: &mut MCTS, rng: &mut R, deadline: Option<Ins
             }
         }
 
-        // Playout Cap Randomization (PCR)
-        // ~25% of the time, use full search. Otherwise, use a cheap search.
-        let pcr_roll: f32 = rng.gen();
-        let target_sims = if pcr_roll < 0.25 { full_sims } else { cheap_sims };
+        // Playout Cap Randomization (PCR): most moves use a cheap search,
+        // while a minority receive the full budget. The policy concentration
+        // becomes the confidence target in Python.
+        let target_sims = if rng.gen::<f32>() < mcts.config.pcr_full_probability {
+            full_sims
+        } else {
+            cheap_sims
+        };
         mcts.set_simulations(target_sims);
-
-        // Run network-guided MCTS to get the policy at this state.
         let (policy_vec, _q) = mcts.run(board, rng);
 
         // Convert the MCTS policy Vec<f32> (always length 7) to [f32; 7].
