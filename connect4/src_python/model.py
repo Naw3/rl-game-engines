@@ -201,6 +201,8 @@ class Connect4Net(nn.Module):
         nhead = kwargs.get("nhead", _DEFAULT_NHEAD)
         net = cls(d_model=d_model, num_layers=num_layers, nhead=nhead)
         state_dict = torch.load(path, map_location="cpu", weights_only=True)
+        if isinstance(state_dict, dict) and isinstance(state_dict.get("model_state_dict"), dict):
+            state_dict = state_dict["model_state_dict"]
         missing, _unexpected = net.load_state_dict(state_dict, strict=False)
         net.has_confidence_head = not any(
             name.startswith("confidence_") for name in missing

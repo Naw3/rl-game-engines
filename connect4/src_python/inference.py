@@ -216,6 +216,61 @@ def decode_confidence(confidence: float | None) -> float | None:
     return float(np.clip(confidence, 0.0, 1.0))
 
 
+def _resolve_inference_backend(
+    backend: str,
+    device: str | None,
+) -> tuple[str, torch.device, bool, str | None, str]:
+    """Resolve CLI/config names into an engine, device and provider policy."""
+    requested = (backend or "auto").strip().lower().replace("_", "-").replace(" ", "-")
+    configured = str(getattr(CONFIG.infer, "infer_backend", "auto")).strip().lower().replace("_", "-").replace(" ", "-")
+    if requested == "auto" and configured != "auto":
+        requested = configured
+
+    aliases = {"torch": "pytorch", "onnx": "onnx"}
+    requested = aliases.get(requested, requested)
+    allowed = {"auto", "pytorch", "pytorch-cuda", "pytorch-cpu", "onnx", "onnx-cuda", "tensorrt"}
+    if requested not in allowed:
+        raise ValueError(
+            f"Unsupported inference backend {backend!r}; choose auto, "
+            "pytorch-cuda, pytorch-cpu, onnx-cuda or tensorrt."
+        )
+
+    forced_device = None
+    require_gpu = False
+    required_provider = None
+    if requested == "pytorch-cuda":
+        engine = "torch"
+        forced_device = "cuda"
+        require_gpu = True
+    elif requested == "pytorch-cpu":
+        engine = "torch"
+        forced_device = "cpu"
+    elif requested == "pytorch":
+        engine = "torch"
+    elif requested == "onnx-cuda":
+        engine = "onnx"
+        forced_device = "cuda"
+        require_gpu = True
+        required_provider = "CUDAExecutionProvider"
+    elif requested == "tensorrt":
+        engine = "tensorrt"
+        forced_device = "cuda"
+        require_gpu = True
+        required_provider = "TensorrtExecutionProvider"
+    else:
+        engine = requested
+
+    resolved_device = forced_device or device or getattr(CONFIG.infer, "device", "auto")
+    if resolved_device == "auto":
+        resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+    resolved_device_obj = torch.device(resolved_device)
+    if require_gpu and resolved_device_obj.type != "cuda":
+        raise RuntimeError(f"Inference backend {requested} requires a CUDA device.")
+    if requested == "pytorch-cuda" and not torch.cuda.is_available():
+        raise RuntimeError("Inference backend pytorch-cuda requested, but CUDA is unavailable.")
+    return engine, resolved_device_obj, require_gpu, required_provider, requested
+
+
 class Connect4Agent:
     """Standalone MCTS agent with ONNX/TensorRT/CUDA and PyTorch fallbacks."""
 
@@ -225,18 +280,22 @@ class Connect4Agent:
         device: str | None = None,
         backend: str = "auto",
         verbose: bool = True,
+        early_stop: bool | None = None,
     ) -> None:
-        if backend not in {"auto", "onnx", "tensorrt", "torch"}:
-            raise ValueError(f"Unsupported inference backend: {backend}")
-        if device is None:
-            device = CONFIG.infer.device
-
-        if device == "auto":
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = torch.device(device)
+        (
+            backend,
+            self.device,
+            require_gpu,
+            required_provider,
+            self.infer_backend,
+        ) = _resolve_inference_backend(backend, device)
 
         self.verbose = verbose
+        self.early_stop_enabled = (
+            bool(early_stop)
+            if early_stop is not None
+            else bool(getattr(CONFIG.infer, "confidence_stop_enabled", True))
+        )
         self.model: Connect4Net | None = None
         self.ort_session = None
         self._ort_input_name: str | None = None
@@ -263,7 +322,8 @@ class Connect4Agent:
             loaded_onnx = self._try_load_onnx(
                 onnx_path,
                 backend=backend,
-                allow_cpu=(backend != "auto" or self.device.type != "cuda" or explicit_onnx),
+                allow_cpu=(not require_gpu and (backend != "auto" or self.device.type != "cuda" or explicit_onnx)),
+                required_provider=required_provider,
             )
         elif backend != "torch" and not explicit_onnx:
             _ensure_onnx_checkpoint(pt_path, onnx_path)
@@ -271,30 +331,44 @@ class Connect4Agent:
                 loaded_onnx = self._try_load_onnx(
                     onnx_path,
                     backend=backend,
-                    allow_cpu=(backend != "auto" or self.device.type != "cuda"),
+                    allow_cpu=(not require_gpu and (backend != "auto" or self.device.type != "cuda")),
+                    required_provider=required_provider,
                 )
 
         if not loaded_onnx:
+            if require_gpu:
+                raise RuntimeError(
+                    f"Could not load requested inference backend {self.infer_backend} "
+                    f"from {onnx_path}."
+                )
             if backend in {"onnx", "tensorrt"} and not pt_path.exists():
                 raise RuntimeError(f"Could not load requested {backend} backend from {onnx_path}")
             self._load_torch(pt_path)
 
-    def _try_load_onnx(self, path: Path, backend: str, allow_cpu: bool) -> bool:
+    def _try_load_onnx(
+        self,
+        path: Path,
+        backend: str,
+        allow_cpu: bool,
+        required_provider: str | None = None,
+    ) -> bool:
         try:
             _prepare_cuda_dll_paths()
             import onnxruntime as ort
 
             available = ort.get_available_providers()
-            if backend == "tensorrt":
+            if required_provider is not None:
+                preferred_providers = [required_provider]
+            elif backend == "tensorrt":
                 preferred_providers = ["TensorrtExecutionProvider"]
             else:
                 # CUDA is the reliable default; TensorRT remains available via
                 # --backend tensorrt or as a fallback when explicitly exposed.
                 preferred_providers = ["CUDAExecutionProvider", "TensorrtExecutionProvider"]
             gpu_providers = [provider for provider in preferred_providers if provider in available]
-            if backend == "tensorrt" and "TensorrtExecutionProvider" not in available:
+            if required_provider is not None and required_provider not in available:
                 raise RuntimeError(
-                    "TensorrtExecutionProvider is unavailable "
+                    f"{required_provider} is unavailable "
                     f"(available: {', '.join(available)})"
                 )
             if self.device.type == "cuda" and backend == "auto" and not gpu_providers and not allow_cpu:
@@ -324,9 +398,9 @@ class Connect4Agent:
                     "falling back to PyTorch CUDA"
                 )
                 return False
-            if backend == "tensorrt" and "TensorrtExecutionProvider" not in active_providers:
+            if required_provider is not None and required_provider not in active_providers:
                 raise RuntimeError(
-                    "TensorRT provider could not be activated "
+                    f"{required_provider} could not be activated "
                     f"(active: {', '.join(active_providers)})"
                 )
             self.ort_session = session
@@ -351,6 +425,8 @@ class Connect4Agent:
         if path.exists():
             try:
                 state_dict = torch.load(path, map_location=self.device, weights_only=True)
+                if isinstance(state_dict, dict) and isinstance(state_dict.get("model_state_dict"), dict):
+                    state_dict = state_dict["model_state_dict"]
                 missing, _unexpected = self.model.load_state_dict(state_dict, strict=False)
                 self.model.has_confidence_head = not any(
                     name.startswith("confidence_") for name in missing
@@ -462,6 +538,7 @@ class Connect4Agent:
         max_think_time: float | None = None,
         batch_size: int | None = None,
         c_puct: float | None = None,
+        early_stop: bool | None = None,
     ) -> tuple[np.ndarray, int, float]:
         """Run batched MCTS search using fixed InferConfig parameters from config.py."""
         if sims is None:
@@ -511,7 +588,7 @@ class Connect4Agent:
 
         confidence_stop_enabled = (
             sims == 0
-            and getattr(CONFIG.infer, "confidence_stop_enabled", True)
+            and (self.early_stop_enabled if early_stop is None else bool(early_stop))
             and root_confidence is not None
         )
         confidence_threshold = float(
@@ -685,6 +762,7 @@ class Connect4Agent:
         sims: int | None = None,
         max_think_time: float | None = None,
         temperature: float | None = None,
+        early_stop: bool | None = None,
     ) -> tuple[int, int, float]:
         """Select an action using time-budgeted parallel MCTS search with InferConfig defaults."""
         if sims is None:
@@ -699,7 +777,13 @@ class Connect4Agent:
             return 0, 0, 0.0
 
         if max_think_time > 0.0 or sims > 0:
-            probs, sims_done, elapsed = self.mcts_search(own, opp, sims=sims, max_think_time=max_think_time)
+            probs, sims_done, elapsed = self.mcts_search(
+                own,
+                opp,
+                sims=sims,
+                max_think_time=max_think_time,
+                early_stop=early_stop,
+            )
         else:
             probs, _value, _confidence = self.evaluate_position(own, opp)
             sims_done, elapsed = 1, 0.0

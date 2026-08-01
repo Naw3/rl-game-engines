@@ -57,6 +57,7 @@ CLI
 from __future__ import annotations
 
 import argparse
+import copy
 import random
 import re
 import sys
@@ -209,6 +210,60 @@ def latest_epoch_checkpoint(checkpoint_path: str | Path) -> Path | None:
 
     return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
+
+def load_training_checkpoint(
+    checkpoint_path: str | Path,
+    map_location: str | torch.device,
+) -> tuple[dict, dict | None]:
+    """Load a model checkpoint and optionally return its training state.
+
+    Stable ``connect4_model.pt`` files intentionally stay plain state dicts so
+    Rust/ONNX tooling can consume them.  Cumulative ``*_epochN.pt`` files may
+    additionally contain optimizer, scheduler, scaler and EMA state.
+    """
+    payload = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
+    if isinstance(payload, dict) and isinstance(payload.get("model_state_dict"), dict):
+        return payload["model_state_dict"], payload
+    return payload, None
+
+
+def _copy_to_cpu(value):
+    """Recursively copy tensors in a training state to CPU for portable saves."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: _copy_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_to_cpu(item) for item in value)
+    return value
+
+
+def save_training_checkpoint(
+    checkpoint_path: str | Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    ema: ExponentialMovingAverage | None,
+    scaler,
+    best_loss: float,
+) -> None:
+    """Save all state needed to continue training without resetting dynamics."""
+    path = Path(checkpoint_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "model_state_dict": _copy_to_cpu(model.state_dict()),
+        "optimizer_state_dict": _copy_to_cpu(optimizer.state_dict()),
+        "scheduler_state_dict": _copy_to_cpu(scheduler.state_dict()),
+        "ema_shadow": _copy_to_cpu(ema.shadow) if ema is not None else None,
+        "scaler_state_dict": _copy_to_cpu(scaler.state_dict()),
+        "best_loss": float(best_loss),
+    }
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(path)
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -220,7 +275,11 @@ except ImportError:  # PyTorch < 2.0
 
 from dataset import C4Dataset
 from model import Connect4Net
-from utils.onnx_export import export_onnx
+from utils.onnx_export import (
+    export_onnx,
+    export_onnx_to_bytes,
+    update_onnx_weights_bytes,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -415,14 +474,22 @@ def main() -> None:
     if checkpoint_epoch(out_path) == 0:
         resume_path = latest_epoch_checkpoint(out_path) or out_path
     start_epoch = checkpoint_epoch(resume_path) if resume_path.exists() else 0
+    resume_training_state = None
     if resume_path.exists():
         if resume_path != out_path:
             print(f"[train] Auto-selected newest checkpoint {resume_path.name} for resume.")
         print(f"[train] Loading existing weights from {resume_path} to resume training...")
         try:
-            state_dict = torch.load(resume_path, map_location=args.device, weights_only=True)
+            state_dict, resume_training_state = load_training_checkpoint(
+                resume_path, map_location=args.device
+            )
             model.load_state_dict(state_dict)
             print("[train] Successfully restored model weights!")
+            if resume_training_state is None and start_epoch > 0:
+                print(
+                    "[train] WARNING: This legacy epoch checkpoint contains weights only; "
+                    "optimizer/scheduler/EMA state cannot be restored."
+                )
             if start_epoch > 0:
                 print(
                     f"[train] Resuming from epoch {start_epoch}; "
@@ -431,6 +498,7 @@ def main() -> None:
         except Exception as e:
             print(f"[train] WARNING: Could not load existing weights from {resume_path} ({e}); starting with fresh weights")
             start_epoch = 0
+            resume_training_state = None
 
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -579,6 +647,30 @@ def main() -> None:
     if args.use_ema:
         print(f"[train] Exponential Moving Average (EMA) enabled (decay={args.ema_decay})")
 
+    resume_best_loss = float("inf")
+    if resume_training_state is not None:
+        try:
+            optimizer.load_state_dict(resume_training_state["optimizer_state_dict"])
+            scheduler.load_state_dict(resume_training_state["scheduler_state_dict"])
+            if ema is not None and resume_training_state.get("ema_shadow") is not None:
+                ema.shadow = {
+                    name: value.to(args.device)
+                    for name, value in resume_training_state["ema_shadow"].items()
+                }
+            scaler_state = resume_training_state.get("scaler_state_dict")
+            if scaler_state:
+                scaler.load_state_dict(scaler_state)
+            resume_best_loss = float(resume_training_state.get("best_loss", float("inf")))
+            print(
+                "[train] Restored optimizer, scheduler, EMA/scaler state "
+                f"(best_loss={resume_best_loss:.4f})."
+            )
+        except Exception as e:
+            print(
+                f"[train] WARNING: Could not restore full training state ({e}); "
+                "continuing with fresh optimizer state."
+            )
+
     if not args.no_compile and hasattr(torch, "compile"):
         try:
             import triton  # noqa: F401
@@ -589,10 +681,15 @@ def main() -> None:
         except Exception as e:
             print(f"[train] torch.compile failed: {e}; continuing uncompiled")
 
+    # Keep EMA parameter names aligned with the uncompiled model.  Compiled
+    # wrappers may expose them as ``_orig_mod.*`` instead.
+    inner_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+
     # ---- Warmup -----------------------------------------------------------
     if not args.no_compile and args.compile_mode != "none":
         print("[train] warming up model to trigger compilation...")
         model.train()
+        warmup_state = copy.deepcopy(inner_model.state_dict())
         
         warmup_steps = 10
         steps_done = 0
@@ -607,10 +704,8 @@ def main() -> None:
                         w_log_p, w_v, w_m, _w_c = model(wp)
                         w_loss, _, _, _ = compute_loss(w_log_p, w_v, w_m, wtp, wtv, wtm)
                     scaler.scale(w_loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=_DEFAULT_MAX_GRAD_NORM)
-                    scaler.step(optimizer)
-                    scaler.update()
+                    # Compile with a real backward pass, but do not consume
+                    # optimizer/scheduler steps or alter resumed weights.
                     
                     if args.device == "cuda":
                         torch.cuda.synchronize()
@@ -618,10 +713,29 @@ def main() -> None:
                     steps_done += 1
                     if steps_done >= warmup_steps:
                         break
+        inner_model.load_state_dict(warmup_state)
+        optimizer.zero_grad(set_to_none=True)
         print("[train] warmup complete.")
 
+    # Build the IPC graph once before the timed training loop.  Subsequent
+    # epochs only replace its initializers, avoiding a full ONNX export during
+    # epoch 1 (which is especially expensive with torch.export/ONNXScript).
+    ipc_onnx_template: bytes | None = None
+    if sp_proc is not None and not args.no_onnx:
+        try:
+            ipc_inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+            print("[train] preparing reusable ONNX IPC template before epoch 1...")
+            ipc_onnx_template = export_onnx_to_bytes(
+                ipc_inner,
+                opset=args.onnx_opset,
+                infer_precision=args.infer_precision,
+            )
+            print(f"[train] ONNX IPC template ready ({len(ipc_onnx_template):,} bytes).")
+        except Exception as e:
+            print(f"[train] WARNING: Could not prepare ONNX IPC template: {e}")
+
     # ---- Train Loop -------------------------------------------------------
-    best_loss = float("inf")
+    best_loss = resume_best_loss
     global_start_t = time.time()
     total_samples = 0
     epoch = 0
@@ -744,7 +858,10 @@ def main() -> None:
             scaler.step(optimizer)
             scaler.update()
             if ema is not None:
-                ema.update(model)
+                # Update against the uncompiled module so parameter names
+                # match the EMA shadow keys (compiled wrappers may add
+                # ``_orig_mod.`` to names).
+                ema.update(inner_model)
             scheduler.step()
             if args.device == "cuda": torch.cuda.synchronize()
             opt_sec_epoch += (time.perf_counter() - t_o0)
@@ -794,7 +911,6 @@ def main() -> None:
         if is_best_epoch or (epoch == args.epochs - 1) or done:
             inner.save(args.out)
             if 'ema' in locals() and ema is not None:
-                import copy
                 ema_model = copy.deepcopy(inner)
                 ema.apply_shadow(ema_model)
                 ema_pt_path = args.out.replace(".pt", "_ema.pt")
@@ -812,10 +928,20 @@ def main() -> None:
         if should_export_onnx:
             if sp_proc is not None and sp_proc.stdin is not None:
                 try:
-                    ipc_path = args.out.replace(".pt", "_ipc.onnx")
-                    export_onnx(inner, ipc_path, opset=args.onnx_opset, infer_precision=args.infer_precision)
-                    with open(ipc_path, "rb") as f:
-                        data = f.read()
+                    # Export directly to a self-contained in-memory ONNX
+                    # blob.  Path-based exports may create a companion
+                    # `.onnx.data` file, which cannot be transferred through
+                    # this one-buffer stdin protocol.
+                    data = None
+                    if ipc_onnx_template is not None and args.infer_precision == "fp32":
+                        data = update_onnx_weights_bytes(inner, ipc_onnx_template)
+                    if data is None:
+                        data = export_onnx_to_bytes(
+                            inner,
+                            opset=args.onnx_opset,
+                            infer_precision=args.infer_precision,
+                        )
+                    ipc_onnx_template = data
                     sp_proc.stdin.write(len(data).to_bytes(4, byteorder="little"))
                     sp_proc.stdin.write(data)
                     sp_proc.stdin.flush()
@@ -905,20 +1031,21 @@ def main() -> None:
     if final_epoch > start_epoch:
         epoch_checkpoint = checkpoint_path_for_epoch(args.out, final_epoch)
         if epoch_checkpoint.resolve() != out_path.resolve():
-            inner.save(epoch_checkpoint)
+            save_training_checkpoint(
+                epoch_checkpoint,
+                inner,
+                optimizer,
+                scheduler,
+                ema,
+                scaler,
+                best_loss,
+            )
             print(f"[train] saved cumulative checkpoint (epoch {final_epoch}) to {epoch_checkpoint}")
             if ema_model is not None:
                 ema_checkpoint = epoch_checkpoint.with_name(
                     f"{epoch_checkpoint.stem}_ema{epoch_checkpoint.suffix}"
                 )
                 ema_model.save(ema_checkpoint)
-
-    metrics_file = __import__("pathlib").Path(args.out).parent / "train_metrics.txt"
-    try:
-        with open(metrics_file, "w") as f:
-            f.write(str(overall_throughput))
-    except Exception as e:
-        print(f"[train] WARNING: Could not write metrics file: {e}")
 
     # ---- ONNX export (consumed by the Rust MCTS) ------------------------
     if not args.no_onnx:

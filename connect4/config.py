@@ -133,6 +133,7 @@ class BenchConfig:
 @dataclass
 class InferConfig:
     """Standalone AI Agent & GUI Inference Configuration"""
+    infer_backend: str = "auto"  # "pytorch-cuda", "pytorch-cpu", "onnx-cuda", "tensorrt", "auto"
     sims: int = 0                 # 0 = confidence stop + max_think_time fallback
     max_think_time: float = 1.0   # Max search budget in seconds per move
     batch_size: int = 32          # Fixed GPU leaf evaluation batch size
@@ -143,9 +144,18 @@ class InferConfig:
     c_puct: float = 1.5           # PUCT exploration constant
     temperature: float = 0.0      # Action selection temperature
     device: str = "auto"          # Execution device ("cuda", "cpu", "auto")
-    confidence_stop_enabled: bool = True
+    confidence_stop_enabled: bool = False
     confidence_threshold: float = 0.99
     confidence_min_sims: int = 32
+
+    def __post_init__(self) -> None:
+        self.infer_backend = self.infer_backend.strip().lower().replace("_", "-").replace(" ", "-")
+        allowed = {"auto", "pytorch-cuda", "pytorch-cpu", "onnx-cuda", "tensorrt"}
+        if self.infer_backend not in allowed:
+            raise ValueError(
+                f"Unsupported infer_backend={self.infer_backend!r}; "
+                f"choose one of {', '.join(sorted(allowed))}."
+            )
 
 
 @dataclass
@@ -213,6 +223,7 @@ def export_powershell_env() -> str:
         f'$env:FUSED_ADAMW = "{1 if CONFIG.train.fused_adamw else 0}"',
         f'$env:ONNX_OPSET = "{CONFIG.dataset.onnx_opset}"',
         f'$env:MAX_THINK_TIME = "{CONFIG.infer.max_think_time}"',
+        f'$env:INFER_BACKEND = "{CONFIG.infer.infer_backend}"',
         f'$env:CONFIDENCE_THRESHOLD = "{CONFIG.infer.confidence_threshold}"',
         f'$env:CONFIDENCE_STOP_ENABLED = "{1 if CONFIG.infer.confidence_stop_enabled else 0}"',
         f'$env:RUST_DEVICE = "{CONFIG.device.rust_device}"',

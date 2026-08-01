@@ -223,8 +223,18 @@ def main():
     parser.add_argument("--think-time", type=float, default=0.25, help="MCTS time budget per move in --mcts mode")
     parser.add_argument("--sims", type=int, default=0, help="MCTS simulation cap (0 = time budget only)")
     parser.add_argument(
-        "--backend", choices=["auto", "onnx", "tensorrt", "torch"], default="auto",
-        help="inference backend for --mcts mode",
+        "--backend",
+        choices=[
+            "auto",
+            "pytorch-cuda",
+            "pytorch-cpu",
+            "onnx-cuda",
+            "tensorrt",
+            "torch",
+            "onnx",
+        ],
+        default="auto",
+        help="inference backend for --mcts mode (auto uses config.py infer_backend)",
     )
     parser.add_argument("--selection-file", type=str, default=None, help="write the MCTS winner to this JSON file")
     args = parser.parse_args()
@@ -273,19 +283,11 @@ def main():
         return
 
     print(f"[evaluate] Loading models on {args.device}...")
-    m1 = Connect4Net()
-    m1.load_state_dict(
-        torch.load(args.model1, map_location="cpu", weights_only=True),
-        strict=False,
-    )
+    m1 = Connect4Net.load(args.model1)
     m1.to(args.device)
     m1.eval()
     
-    m2 = Connect4Net()
-    m2.load_state_dict(
-        torch.load(args.model2, map_location="cpu", weights_only=True),
-        strict=False,
-    )
+    m2 = Connect4Net.load(args.model2)
     m2.to(args.device)
     m2.eval()
     

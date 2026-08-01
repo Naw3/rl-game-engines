@@ -249,7 +249,21 @@ def draw_board(screen: pygame.Surface, game: Game, ai_thinking: bool = False, th
 from src_python.inference import Connect4Agent, format_duration
 
 
-def run(model_path: str | None, device_str: str, backend: str) -> None:
+def _parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
+def run(
+    model_path: str | None,
+    device_str: str,
+    backend: str,
+    early_stop: bool | None = None,
+) -> None:
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
     pygame.display.set_caption("Connect 4 — vs Connect4Net (MCTS Agent)")
@@ -261,8 +275,9 @@ def run(model_path: str | None, device_str: str, backend: str) -> None:
         model_path or _DEFAULT_GUI_MODEL,
         device=device_str,
         backend=backend,
+        early_stop=early_stop,
     )
-    stop_mode = "confidence stop" if agent.has_confidence_head else "time fallback"
+    stop_mode = "confidence early stop" if agent.early_stop_enabled else "fixed time"
 
     game = Game()
     ai_thinking = False
@@ -361,13 +376,28 @@ def main() -> None:
     p.add_argument("--device", default=_DEFAULT_GUI_DEVICE)
     p.add_argument(
         "--backend",
-        choices=["auto", "onnx", "tensorrt", "torch"],
+        choices=[
+            "auto",
+            "pytorch-cuda",
+            "pytorch-cpu",
+            "onnx-cuda",
+            "tensorrt",
+            "torch",
+            "onnx",
+        ],
         default="auto",
-        help="inference backend (auto: TensorRT/ONNX CUDA/PyTorch fallback)",
+        help="inference backend (auto uses config.py infer_backend)",
+    )
+    p.add_argument(
+        "--early-stop",
+        type=_parse_bool,
+        default=None,
+        metavar="true|false",
+        help="allow confidence-based early stopping (default: config.py setting)",
     )
     args = p.parse_args()
     try:
-        run(args.model, args.device, args.backend)
+        run(args.model, args.device, args.backend, args.early_stop)
     except KeyboardInterrupt:
         pygame.quit()
         sys.exit(0)
