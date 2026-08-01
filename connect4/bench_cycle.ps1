@@ -52,6 +52,7 @@ $EPOCHS           = if ($env:BENCH_EPOCHS)           { [int]$env:BENCH_EPOCHS } 
 $TRAIN_BATCH_SIZE = if ($env:BENCH_TRAIN_BATCH_SIZE) { [int]$env:BENCH_TRAIN_BATCH_SIZE } else { 256 }
 $CPU_BATCH_SIZE   = if ($env:BENCH_CPU_BATCH_SIZE)   { [int]$env:BENCH_CPU_BATCH_SIZE }   else { [int]$env:NUMBER_OF_PROCESSORS }
 $GPU_BATCH_SIZE   = if ($env:BENCH_GPU_BATCH_SIZE)   { [int]$env:BENCH_GPU_BATCH_SIZE }   else { 32 }
+$MAX_DISPATCHER   = if ($env:MAX_DISPATCHER_BATCH)   { [int]$env:MAX_DISPATCHER_BATCH }   else { 128 }
 $BENCH_SEED       = if ($env:BENCH_SEED)             { [int]$env:BENCH_SEED }             else { 42 }
 $CARGO            = if ($env:CARGO)                  { $env:CARGO }                       else { "cargo" }
 $DURATION         = if ($env:BENCH_DURATION)         { [int]$env:BENCH_DURATION }         else { 30 }
@@ -79,7 +80,7 @@ if ($cudaBin) { $env:PATH = "$cudaBin;$env:PATH" }
 Write-Host "=================================================================" -ForegroundColor Cyan
 Write-Host "  CONNECT4 PIPELINE BENCHMARK" -ForegroundColor Cyan
 Write-Host "=================================================================" -ForegroundColor Cyan
-Write-Host "[bench] Params: GAMES=$GAMES SIMS=$SIMS CPU_BATCH=$CPU_BATCH_SIZE GPU_BATCH=$GPU_BATCH_SIZE EPOCHS=$EPOCHS SEED=$BENCH_SEED"
+Write-Host "[bench] Params: GAMES=$GAMES SIMS=$SIMS CPU_BATCH=$CPU_BATCH_SIZE GPU_BATCH=$GPU_BATCH_SIZE MAX_DISPATCHER=$MAX_DISPATCHER EPOCHS=$EPOCHS SEED=$BENCH_SEED"
 Write-Host "[bench] Using Python: $PYTHON"
 Write-Host ""
 

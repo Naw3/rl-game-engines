@@ -98,3 +98,11 @@ After break ...:
     - Generation Throughput : 168.8 samples/sec (in 60s)
     - Games Played          : 564 games (9.4 games/sec)
 =================================================================
+
+=================================================================
+  BENCHMARK SUMMARY & PERFORMANCE REPORT (THROUGHPUT)
+=================================================================
+  [Stage 2 - Rust MCTS GPU  (batch=32)] :
+    - Generation Throughput : 175.5 samples/sec (in 60s)
+    - Games Played          : 567 games (9.4 games/sec)
+=================================================================

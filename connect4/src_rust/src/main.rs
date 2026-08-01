@@ -95,6 +95,7 @@ struct MctsJson {
     sims: Option<usize>,
     cpu_batch_size: Option<usize>,
     gpu_batch_size: Option<usize>,
+    _max_dispatcher_batch: Option<usize>,
     c_puct: Option<f32>,
     dirichlet_alpha: Option<f32>,
     dirichlet_epsilon: Option<f32>,
