@@ -1,43 +1,20 @@
 """
-model.py — Connect4Net: a compact Transformer with policy, value and
-confidence heads.
+model.py — Transformer Neural Network Architecture for Connect 4.
 
-Architecture
-------------
-Input: (B, 3, 6, 7) tensor. Three planes per cell:
+Inputs
+------
+Spatial tensor x of shape (B, 3, 6, 7):
+  - plane 0: own pieces (1.0 where present, 0.0 elsewhere)
+  - plane 1: opponent pieces (1.0 where present, 0.0 elsewhere)
+  - plane 2: turn indicator mask (all 1.0s)
 
-    plane 0 = "own" pieces (the current player to move)
-    plane 1 = "opponent" pieces
-    plane 2 = turn indicator (all 1s — a constant bias, signals that
-              the input is canonical to the side to move)
-
-Trunk: a 3×3 conv lifts the 3 input planes to `channels` feature maps,
-then `num_blocks` residual blocks. The residual block is the standard
-two-conv + skip from ResNet, with BatchNorm. For Connect 4 the board is
-so small that we don't need downsampling — the convs all use padding=1
-to preserve the 6×7 spatial size.
-
-Policy head: a 1×1 conv to 2 channels → flatten → Linear(2·6·7, 7) →
-log_softmax over the 7 columns. log-probabilities are returned (not raw
-logits) so the loss is a clean dot product with the MCTS target policy.
-
-Value head: a 1×1 conv to 1 channel → flatten → Linear(1·6·7, 64) →
-ReLU → Linear(64, 1) → tanh. Output is a scalar in [-1, +1] from the
-perspective of the player to move at the input state.
-
-Loss (computed in train.py, not here):
-
-    L = (z - v)^2 - sum_a pi_a * log p_a + confidence_loss
-
-The first term is the value MSE; the second is the cross-entropy between
-the MCTS-improved policy pi and the network's policy p. Both reductions
-are means over the batch. No L2 reg on the parameters — Adam with
-weight_decay=1e-4 in train.py is enough to keep things tame.
-
-Why this size?
---------------
-The network is intentionally small for Connect 4 while retaining enough
-capacity for policy, value and confidence calibration.
+Outputs
+-------
+  - log_p:     (B, 7) log-softmax policy distribution over the 7 columns.
+  - v:         (B,)   predicted value in [-1, +1].
+  - m:         (B,)   predicted moves left (non-negative float).
+  - c:         (B,)   predicted confidence in [0, 1].
+  - opp_log_p: (B, 7) predicted opponent counter-reply log-softmax.
 """
 
 from __future__ import annotations
@@ -69,7 +46,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 class Connect4Net(nn.Module):
-    """AlphaZero-style policy/value network with a learned confidence head.
+    """AlphaZero-style policy/value network with confidence and opponent reply heads.
 
     Args:
         d_model:   width of the transformer trunk (default 64).
@@ -78,7 +55,6 @@ class Connect4Net(nn.Module):
     """
 
     def __init__(self, d_model: int = 64, num_layers: int = 4, nhead: int = 4, **kwargs) -> None:
-        # **kwargs catches old arguments like channels/num_blocks to prevent crashes
         super().__init__()
         self.d_model = d_model
         self.channels = d_model
@@ -117,25 +93,31 @@ class Connect4Net(nn.Module):
         self.moves_left_fc1 = nn.Linear(1 * 6 * 7, 64)
         self.moves_left_fc2 = nn.Linear(64, 1)
 
-        # Predict how concentrated the normal PCR self-play MCTS target is.
-        # This is a learned confidence signal, not a tactical board rule.
+        # Confidence Head
         self.confidence_conv = nn.Conv2d(d_model, 1, kernel_size=1, bias=False)
         self.confidence_bn = nn.BatchNorm2d(1)
         self.confidence_fc1 = nn.Linear(1 * 6 * 7, 32)
         self.confidence_fc2 = nn.Linear(32, 1)
         self.has_confidence_head = True
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Opponent Reply Head (Auxiliary 1-step counter-reply projection)
+        self.opp_reply_conv = nn.Conv2d(d_model, 2, kernel_size=1, bias=False)
+        self.opp_reply_bn = nn.BatchNorm2d(2)
+        self.opp_reply_fc = nn.Linear(2 * 6 * 7, 7)
+        self.has_opp_reply_head = True
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the network.
 
         Args:
             x: (B, 3, 6, 7) input tensor (own / opponent / turn planes).
 
         Returns:
-            log_p: (B, 7) log-probabilities over the 7 columns.
-            v:     (B,)   predicted value in [-1, +1].
-            m:     (B,)   predicted moves left.
-            c:     (B,)   predicted confidence in the selected move, [0, 1].
+            log_p:     (B, 7) log-probabilities over the 7 columns.
+            v:         (B,)   predicted value in [-1, +1].
+            m:         (B,)   predicted moves left.
+            c:         (B,)   predicted confidence in the selected move, [0, 1].
+            opp_log_p: (B, 7) predicted opponent counter-reply log-probabilities.
         """
         B = x.size(0)
         
@@ -158,8 +140,6 @@ class Connect4Net(nn.Module):
         logits = self.policy_fc(p)
         
         # --- ACTION MASKING ---
-        # x[:, 0, 5, :] = own pieces at top row (r=5)
-        # x[:, 1, 5, :] = opp pieces at top row (r=5)
         top_row_occupied = (x[:, 0, 5, :] + x[:, 1, 5, :]) > 0.5
         logits = logits.masked_fill(top_row_occupied, -1e9)
         log_p = F.log_softmax(logits, dim=1)
@@ -174,15 +154,22 @@ class Connect4Net(nn.Module):
         m = F.relu(self.moves_left_bn(self.moves_left_conv(h_spatial)), inplace=True)
         m = m.flatten(start_dim=1)
         m = F.relu(self.moves_left_fc1(m), inplace=True)
-        # We use ReLU at the very end to ensure moves left is >= 0
         m = F.relu(self.moves_left_fc2(m)).squeeze(1)
 
+        # Confidence head
         c = F.relu(self.confidence_bn(self.confidence_conv(h_spatial)), inplace=True)
         c = c.flatten(start_dim=1)
         c = F.relu(self.confidence_fc1(c), inplace=True)
         c = torch.sigmoid(self.confidence_fc2(c)).squeeze(1)
 
-        return log_p, v, m, c
+        # Opponent Reply Auxiliary head
+        opp_p = F.relu(self.opp_reply_bn(self.opp_reply_conv(h_spatial)), inplace=True)
+        opp_p = opp_p.flatten(start_dim=1)
+        opp_logits = self.opp_reply_fc(opp_p)
+        opp_logits = opp_logits.masked_fill(top_row_occupied, -1e9)
+        opp_log_p = F.log_softmax(opp_logits, dim=1)
+
+        return log_p, v, m, c, opp_log_p
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -203,8 +190,5 @@ class Connect4Net(nn.Module):
         state_dict = torch.load(path, map_location="cpu", weights_only=True)
         if isinstance(state_dict, dict) and isinstance(state_dict.get("model_state_dict"), dict):
             state_dict = state_dict["model_state_dict"]
-        missing, _unexpected = net.load_state_dict(state_dict, strict=False)
-        net.has_confidence_head = not any(
-            name.startswith("confidence_") for name in missing
-        )
+        net.load_state_dict(state_dict, strict=True)
         return net

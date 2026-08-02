@@ -148,7 +148,7 @@ if (-not (Test-Path $MODEL_ONNX)) {
                 Write-Host ""
                 Write-Host "[pipeline] ===== Selecting Best Model with inference.py MCTS =====" -ForegroundColor Cyan
                 Push-Location "src_python"
-                & $PYTHON "evaluate.py" --model1 "../$EMA_MODEL" --model2 "../$MODEL" --games $EVAL_GAMES --think-time $EVAL_THINK_TIME --sims 0 --backend $INFER_BACKEND --selection-file "../$BEST_MODEL_FILE" --mcts --device $PYTHON_DEVICE
+                & $PYTHON "evaluate.py" --model1 "../$EMA_MODEL" --model2 "../$MODEL" --games $EVAL_GAMES --think-time 0 --sims 0 --backend $INFER_BACKEND --selection-file "../$BEST_MODEL_FILE" --mcts --device $PYTHON_DEVICE --seed 42
                 Pop-Location
             }
         } else {

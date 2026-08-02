@@ -45,8 +45,8 @@ class MCTSConfig:
 @dataclass
 class TrainConfig:
     """PyTorch Training Hyperparameters"""
-    epochs: int = 50
-    batch_size: int = 128
+    epochs: int = 200
+    batch_size: int = 256
     learning_rate: float = 1e-3
     learning_rate_min: float = 1e-5
     lr_warmup_epochs: int = 5
@@ -66,8 +66,9 @@ class TrainConfig:
     compile_mode: str = "reduce-overhead"  # "none", "default", "reduce-overhead", "max-autotune"
     channels_last: bool = False
     fused_adamw: bool = False
+    foreach_adamw: bool = True
     prefetch_queue: int = 2
-    confidence_loss_weight: float = 0.1
+    confidence_loss_weight: float = 0.2
 
 @dataclass
 class DatasetConfig:
@@ -139,11 +140,11 @@ class InferConfig:
     infer_backend: str = "auto"  # "pytorch-cuda", "pytorch-cpu", "onnx-cuda", "tensorrt", "auto"
     sims: int = 0                 # 0 = confidence stop + max_think_time fallback
     max_think_time: float = 1.0   # Max search budget in seconds per move
-    c_puct: float = 1.5           # PUCT exploration constant
+    c_puct: float = 1.0           # PUCT exploration constant (focused search in inference)
     temperature: float = 0.0      # Action selection temperature
     batch_size: int = 32          # Fixed GPU leaf evaluation batch size
     device: str = "auto"          # Execution device ("cuda", "cpu", "auto")
-    confidence_stop_enabled: bool = False
+    confidence_stop_enabled: bool = True
     confidence_threshold: float = 0.99
     confidence_min_sims: int = 0
 
@@ -223,6 +224,7 @@ def export_powershell_env() -> str:
         f'$env:INFER_PRECISION = "{CONFIG.train.infer_precision}"',
         f'$env:CHANNELS_LAST = "{1 if CONFIG.train.channels_last else 0}"',
         f'$env:FUSED_ADAMW = "{1 if CONFIG.train.fused_adamw else 0}"',
+        f'$env:FOREACH_ADAMW = "{1 if CONFIG.train.foreach_adamw else 0}"',
         f'$env:ONNX_OPSET = "{CONFIG.dataset.onnx_opset}"',
         f'$env:MAX_THINK_TIME = "{CONFIG.infer.max_think_time}"',
         f'$env:INFER_BACKEND = "{CONFIG.infer.infer_backend}"',

@@ -10,9 +10,7 @@ Output contract (consumed by Rust network.rs via ORT):
     output "value"      shape (batch,)          f32  (in [-1, 1] via tanh)
     output "moves_left" shape (batch,)          f32
     output "confidence" shape (batch,)          f32  (confidence in [0, 1])
-
-The Rust side softmaxes the policy (since the model head outputs
-log-softmax). The model is moved to CPU before export.
+    output "opp_reply"  shape (batch, 7)        f32  (opponent counter-reply)
 """
 
 from __future__ import annotations
@@ -22,7 +20,9 @@ import sys
 import logging
 import warnings
 from pathlib import Path
+from typing import Any
 
+import numpy
 import torch
 
 warnings.filterwarnings("ignore")
@@ -50,13 +50,6 @@ except Exception:
 
 
 class _SuppressOutput:
-    """Context manager that silences both Python-level and C-level stdout/stderr.
-
-    torch.onnx.export prints verbose logs even when the Python logging level is
-    set to ERROR. We redirect both the Python IO objects and the raw file
-    descriptors 1 and 2 to /dev/null to catch everything.
-    """
-
     def __enter__(self) -> "_SuppressOutput":
         self._py_stdout = sys.stdout
         self._py_stderr = sys.stderr
@@ -88,34 +81,19 @@ class _SuppressOutput:
 
 
 def export_onnx(
-    model: "Connect4Net",  # noqa: F821 — avoid circular import at module level
+    model: torch.nn.Module,
     onnx_path: str | Path | Any,
     opset: int = _DEFAULT_OPSET,
     infer_precision: str = _DEFAULT_INFER_PRECISION,
-    calibration_samples: "numpy.ndarray | None" = None,
+    calibration_samples: numpy.ndarray | None = None,
     verify: bool = False,
 ) -> None:
-    """Export *model* to ONNX with dynamic batch dim and named I/O.
-
-    Args:
-        model:           A Connect4Net instance (trained or random-init).
-        onnx_path:       Destination file path (str/Path) or BytesIO buffer.
-        opset:           ONNX opset version (default from config, currently 18).
-        infer_precision: ``"fp32"``, ``"fp16"``, or ``"int8"``.
-                         ``"int8"`` applies dynamic quantisation via
-                         onnxruntime after the initial export.
-        verify:          If True, run onnx.checker.check_model on the exported graph.
-
-    The function always exports from CPU, so CUDA tensors are handled by
-    copying weights to a temporary CPU model.
-    """
     if infer_precision not in {"fp32", "fp16", "int8"}:
         raise ValueError(
             f"Unsupported inference precision: {infer_precision!r}. "
             "Choose one of: fp32, fp16, int8."
         )
 
-    # Fast path: if the ONNX file already exists, update weights directly in <10ms
     if infer_precision == "fp32" and isinstance(onnx_path, (str, Path)) and update_onnx_weights(model, onnx_path):
         return
 
@@ -125,7 +103,6 @@ def export_onnx(
     else:
         export_target = onnx_path
 
-    # Always export on CPU — ORT reads the file, not CUDA tensors.
     import copy
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
     model_cpu = copy.deepcopy(inner).cpu()
@@ -146,6 +123,7 @@ def export_onnx(
         "value":  {0: "batch_size"},
         "moves_left": {0: "batch_size"},
         "confidence": {0: "batch_size"},
+        "opp_reply": {0: "batch_size"},
     }
 
     with _SuppressOutput():
@@ -154,19 +132,15 @@ def export_onnx(
             (dummy,),
             export_target,
             input_names=["input"],
-            output_names=["policy", "value", "moves_left", "confidence"],
+            output_names=["policy", "value", "moves_left", "confidence", "opp_reply"],
             dynamic_axes=dynamic_axes,
             opset_version=opset,
             do_constant_folding=False,
             export_params=True,
-            # Keep weights as graph initializers, not runtime inputs.  The
-            # latter is valid ONNX but makes ONNX Runtime warn about every
-            # parameter and prevents constant-folding optimizations.
             keep_initializers_as_inputs=False,
         )
 
     if verify and isinstance(onnx_path, (str, Path)):
-        # Verify the exported graph is loadable when explicitly requested.
         import onnx
         onnx_model = onnx.load(str(onnx_path))
         onnx.checker.check_model(onnx_model)
@@ -177,7 +151,6 @@ def export_onnx_to_bytes(
     opset: int = _DEFAULT_OPSET,
     infer_precision: str = _DEFAULT_INFER_PRECISION,
 ) -> bytes:
-    """Export Connect4Net directly to in-memory ONNX bytes without writing to disk."""
     import io
     buf = io.BytesIO()
     export_onnx(model, buf, opset=opset, infer_precision=infer_precision, verify=False)
@@ -185,10 +158,6 @@ def export_onnx_to_bytes(
 
 
 def update_onnx_weights(model: torch.nn.Module, onnx_path: str | Path) -> bool:
-    """Fast inline weight updater for ONNX models without running full PyTorch JIT tracing.
-
-    Returns True if weights were updated in-memory (<10ms), False if fallback export is required.
-    """
     import os, onnx
     from onnx import numpy_helper
 
@@ -198,7 +167,7 @@ def update_onnx_weights(model: torch.nn.Module, onnx_path: str | Path) -> bool:
 
     try:
         onnx_model = onnx.load(path_str)
-        if "confidence" not in {output.name for output in onnx_model.graph.output}:
+        if "opp_reply" not in {output.name for output in onnx_model.graph.output}:
             return False
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
         state_dict = inner.state_dict()
@@ -224,16 +193,12 @@ def update_onnx_weights(model: torch.nn.Module, onnx_path: str | Path) -> bool:
 
 
 def update_onnx_weights_bytes(model: torch.nn.Module, existing_bytes: bytes) -> bytes | None:
-    """Fast inline weight updater for ONNX model bytes directly in RAM without disk I/O.
-
-    Returns updated ONNX model bytes (<5ms), or None if fallback full export is required.
-    """
     import onnx
     from onnx import numpy_helper
 
     try:
         onnx_model = onnx.load_model_from_string(existing_bytes)
-        if "confidence" not in {output.name for output in onnx_model.graph.output}:
+        if "opp_reply" not in {output.name for output in onnx_model.graph.output}:
             return None
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
         state_dict = inner.state_dict()
@@ -255,42 +220,3 @@ def update_onnx_weights_bytes(model: torch.nn.Module, existing_bytes: bytes) -> 
         return onnx_model.SerializeToString()
     except Exception:
         return None
-
-    if infer_precision == "int8":
-        import logging
-        from onnxruntime.quantization import QuantType, quantize_static, QuantFormat, CalibrationDataReader  # type: ignore[import]
-        
-        class Connect4CalibrationReader(CalibrationDataReader):
-            def __init__(self, samples_np):
-                self.enum_data = iter([{"input": samples_np}])
-            def get_next(self):
-                return next(self.enum_data, None)
-
-        if calibration_samples is None:
-            # Fallback random calibration for init.py
-            import numpy as np
-            calibration_samples = np.random.randn(32, _DEFAULT_PLANES, _DEFAULT_ROWS, _DEFAULT_COLS).astype(np.float32)
-
-        reader = Connect4CalibrationReader(calibration_samples)
-        logger = logging.getLogger()
-        old_level = logger.level
-        logger.setLevel(logging.ERROR)
-        with _SuppressOutput():
-            try:
-                quantize_static(
-                    onnx_path,
-                    onnx_path,
-                    calibration_data_reader=reader,
-                    quant_format=QuantFormat.QOperator,
-                    weight_type=QuantType.QInt8,
-                    activation_type=QuantType.QInt8,
-                    nodes_to_exclude=["node_linear_17", "node_masked_fill"],
-                    extra_options={"DisableShapeInference": True},
-                )
-            except Exception:
-                pass
-        logger.setLevel(old_level)
-        
-        # Re-validate after quantisation.
-        onnx_model = onnx.load(str(onnx_path))
-        onnx.checker.check_model(onnx_model)

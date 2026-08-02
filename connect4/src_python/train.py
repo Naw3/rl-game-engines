@@ -129,6 +129,17 @@ try:
     _DEFAULT_PLANES = CONFIG.network.input_planes
     _DEFAULT_ROWS = CONFIG.network.board_rows
     _DEFAULT_COLS = CONFIG.network.board_cols
+    _DEFAULT_WD = CONFIG.train.weight_decay
+    _DEFAULT_SEED = CONFIG.mcts.seed
+    _DEFAULT_NUM_WORKERS = CONFIG.train.num_workers
+    _DEFAULT_LOG_EVERY = CONFIG.train.log_every
+    _DEFAULT_ONNX_EVERY = CONFIG.train.onnx_every
+    _DEFAULT_USE_EMA = CONFIG.train.use_ema
+    _DEFAULT_EMA_DECAY = CONFIG.train.ema_decay
+    _DEFAULT_OPSET = CONFIG.dataset.onnx_opset
+    _DEFAULT_PLANES = CONFIG.network.input_planes
+    _DEFAULT_ROWS = CONFIG.network.board_rows
+    _DEFAULT_COLS = CONFIG.network.board_cols
     _DEFAULT_MAX_ONNX_BATCH = CONFIG.dataset.max_onnx_batch
     _DEFAULT_MAX_GRAD_NORM = CONFIG.train.max_grad_norm
     _DEFAULT_SYMMETRY = CONFIG.train.symmetry
@@ -138,6 +149,7 @@ try:
     _DEFAULT_INFER_PRECISION = CONFIG.train.infer_precision
     _DEFAULT_CHANNELS_LAST = CONFIG.train.channels_last
     _DEFAULT_FUSED_ADAMW = CONFIG.train.fused_adamw
+    _DEFAULT_FOREACH_ADAMW = getattr(CONFIG.train, "foreach_adamw", False)
 except Exception as err:
     print(f"[train] WARNING: Failed to load config.py ({err}); using fallbacks")
     _DEFAULT_DATA = "selfplay.bin"
@@ -169,6 +181,7 @@ except Exception as err:
     _DEFAULT_INFER_PRECISION = "fp32"
     _DEFAULT_CHANNELS_LAST = False
     _DEFAULT_FUSED_ADAMW = False
+    _DEFAULT_FOREACH_ADAMW = False
 
 
 _EPOCH_CHECKPOINT_RE = re.compile(
@@ -303,29 +316,32 @@ def compute_loss(
     target_value: torch.Tensor,
     target_moves_left: torch.Tensor,
     predicted_confidence: torch.Tensor | None = None,
-    confidence_loss_weight: float = 0.0,
+    confidence_loss_weight: float = 0.2,
+    opp_log_p: torch.Tensor | None = None,
+    opp_reply_loss_weight: float = 0.2,
+    value_loss_weight: float = 1.5,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Returns (total_loss, policy_loss, value_loss, moves_left_loss).
-
-    The confidence target is the concentration of the MCTS visit policy.  It
-    is trained even when confidence-based early stopping is disabled, so the
-    inference log remains useful in fixed-time mode too.
-    """
-    # Policy: cross-entropy with soft targets. target_policy is (B, 7),
-    # log_p is (B, 7) of log-probabilities. Sum over columns, mean over batch.
+    """Returns (total_loss, policy_loss, value_loss, moves_left_loss)."""
     policy_loss = -(target_policy * log_p).sum(dim=1).mean()
-    # Value: standard MSE.
-    value_loss = F.mse_loss(v, target_value)
+    # Value: standard MSE scaled up by 1.5 so gradients match policy loss magnitude.
+    raw_value_loss = F.mse_loss(v, target_value)
+    value_loss = raw_value_loss * value_loss_weight
     # Moves left: standard MSE, scaled down to prevent dominating the gradients.
     moves_left_loss = F.mse_loss(m, target_moves_left) * 0.02
+
     confidence_loss = torch.zeros_like(policy_loss)
     if predicted_confidence is not None and confidence_loss_weight > 0.0:
-        # MCTS policies are normalized distributions, so their maximum visit
-        # probability is a direct, stable concentration/confidence target.
-        confidence_target = target_policy.detach().amax(dim=1).clamp(0.0, 1.0)
-        confidence_loss = F.mse_loss(predicted_confidence, confidence_target)
-        confidence_loss = confidence_loss * confidence_loss_weight
-    total_loss = policy_loss + value_loss + moves_left_loss + confidence_loss
+        # Outcome-Calibrated Confidence Target:
+        # Scale MCTS visit concentration by outcome z_norm in [0, 1].
+        z_norm = (target_value.detach() + 1.0) / 2.0
+        confidence_target = (target_policy.detach().amax(dim=1) * z_norm).clamp(0.0, 1.0)
+        confidence_loss = F.mse_loss(predicted_confidence, confidence_target) * confidence_loss_weight
+
+    opp_reply_loss = torch.zeros_like(policy_loss)
+    if opp_log_p is not None and opp_reply_loss_weight > 0.0:
+        opp_reply_loss = -(target_policy.detach() * opp_log_p).sum(dim=1).mean() * opp_reply_loss_weight
+
+    total_loss = policy_loss + value_loss + moves_left_loss + confidence_loss + opp_reply_loss
     return total_loss, policy_loss, value_loss, moves_left_loss
 
 
@@ -644,18 +660,21 @@ def main() -> None:
     p.add_argument("--ema-decay", type=float, default=_DEFAULT_EMA_DECAY, help="EMA decay rate (default: 0.999)")
     p.add_argument("--replay-keep", type=int, default=getattr(CONFIG.train, "replay_keep", 10),
                    help="number of recent streaming self-play generations kept in RAM")
-    p.add_argument("--channels-last", action="store_true", default=_DEFAULT_CHANNELS_LAST, help="use channels_last memory format")
-    p.add_argument("--fused-adamw", action="store_true", default=_DEFAULT_FUSED_ADAMW, help="use fused AdamW optimizer")
     p.add_argument("--symmetry", action="store_true", default=_DEFAULT_SYMMETRY,
                    help="enable horizontal-flip augmentation (doubles effective dataset size)")
     p.add_argument("--num-workers", type=int, default=None,
                    help="DataLoader workers (default: 2 for single file, 0 for replay "
                         "because the replay dataset is defined in main() and can't be pickled).")
+    p.add_argument("--channels-last", action="store_true", default=_DEFAULT_CHANNELS_LAST, help="use channels_last memory format")
+    p.add_argument("--fused-adamw", action="store_true", default=_DEFAULT_FUSED_ADAMW, help="use fused AdamW optimizer")
+    p.add_argument("--foreach-adamw", action="store_true", default=_DEFAULT_FOREACH_ADAMW, help="use foreach AdamW optimizer")
     p.add_argument("--seed", type=int, default=_DEFAULT_SEED, help="RNG seed for training")
     args = p.parse_args()
 
     import numpy as np
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
 
@@ -882,10 +901,10 @@ def main() -> None:
             if ds is None or len(ds) == 0:
                 time.sleep(0.2)
 
-    # ---- Optimizer / Scheduler / EMA / Compile -----------------------------
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=args.fused_adamw
-    )
+    adamw_kwargs = {"lr": args.lr, "weight_decay": args.weight_decay}
+    if args.fused_adamw:
+        adamw_kwargs["fused"] = True
+    optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
     # Replay is sampled into an epoch-sized dataset, so the scheduler must be
     # based on the actual loader length, not on the size of the RAM window.
     estimated_steps_per_epoch = max(1, len(loader))
@@ -982,7 +1001,9 @@ def main() -> None:
                         wp = wp.to(memory_format=torch.channels_last)
                     optimizer.zero_grad(set_to_none=True)
                     with autocast(enabled=use_amp, device_type="cuda" if use_amp else "cpu", dtype=torch.float16 if use_amp else None):
-                        w_log_p, w_v, w_m, _w_c = model(wp)
+                        w_out = model(wp)
+                        w_log_p, w_v, w_m, _w_c = w_out[0], w_out[1], w_out[2], w_out[3]
+                        w_opp_p = w_out[4] if len(w_out) > 4 else None
                         w_loss, _, _, _ = compute_loss(
                             w_log_p,
                             w_v,
@@ -992,6 +1013,8 @@ def main() -> None:
                             wtm,
                             _w_c,
                             args.confidence_loss_weight,
+                            w_opp_p,
+                            0.2,
                         )
                     scaler.scale(w_loss).backward()
                     # Compile with a real backward pass, but do not consume
@@ -1136,7 +1159,9 @@ def main() -> None:
 
             t_f0 = time.perf_counter()
             with autocast(enabled=use_amp, device_type="cuda" if use_amp else "cpu", dtype=torch.float16 if use_amp else None):
-                log_p, v, m, _c = model(planes)
+                out = model(planes)
+                log_p, v, m, _c = out[0], out[1], out[2], out[3]
+                opp_log_p = out[4] if len(out) > 4 else None
                 loss, policy_loss, value_loss, moves_left_loss = compute_loss(
                     log_p,
                     v,
@@ -1146,13 +1171,13 @@ def main() -> None:
                     target_moves_left,
                     _c,
                     args.confidence_loss_weight,
+                    opp_log_p,
+                    0.2,
                 )
-            if args.device == "cuda": torch.cuda.synchronize()
             fwd_sec_epoch += (time.perf_counter() - t_f0)
 
             t_b0 = time.perf_counter()
             scaler.scale(loss).backward()
-            if args.device == "cuda": torch.cuda.synchronize()
             bwd_sec_epoch += (time.perf_counter() - t_b0)
 
             t_o0 = time.perf_counter()
@@ -1166,7 +1191,6 @@ def main() -> None:
                 # ``_orig_mod.`` to names).
                 ema.update(inner_model)
             scheduler.step()
-            if args.device == "cuda": torch.cuda.synchronize()
             opt_sec_epoch += (time.perf_counter() - t_o0)
 
             running["total"] += loss.detach()
@@ -1312,19 +1336,8 @@ def main() -> None:
         p_tother = max(0.0, p_ttot - p_train_sec - p_tdata - p_texport)
         total_time_so_far = time.time() - global_start_t
         n_g = getattr(ds, "n_games", 0)
-        print(
-            f"[train] {p_estr} done in {format_duration(p_ttot)} "
-            f"(train={format_duration(p_train_sec)} "
-            f"(bwd={format_duration(p_tbwd)}, fwd={format_duration(p_tfwd)}, opt={format_duration(p_topt)}), "
-            f"data={format_duration(p_tdata)}, ema/export={format_duration(p_texport)}, "
-            f"other={format_duration(p_tother)} | tot={format_duration(total_time_so_far)}) "
-            f"({p_sps:.0f} samples/s) | loss={p_avg_tot:.4f} "
-            f"(policy={p_avg_pol:.4f}, value={p_avg_val:.4f}, mvl={p_avg_mvl:.4f}) lr={p_lr:.2e} | "
-            f"samples={len(ds):,} | games={n_g:,} | sample val={p_v:+.3f}"
-        )
         if p_bl and p_avg_tot < best_loss:
             best_loss = p_avg_tot
-
 
     if args.device == "cuda":
         torch.cuda.synchronize()
@@ -1332,45 +1345,63 @@ def main() -> None:
     overall_throughput = total_samples / max(0.001, total_time)
     print(f"[train] overall throughput: {overall_throughput:.1f} samples/s")
 
-    # Save the model ONCE at the very end
-    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-    inner.save(args.out)
-    final_epoch = start_epoch + epoch
-    print(f"[train] saved final model (loss={best_loss:.4f}) to {args.out}")
-
-    # Keep the pipeline's stable output path, and also create a cumulative
-    # checkpoint so a resumed run can continue with the correct epoch number.
-    if final_epoch > start_epoch:
-        epoch_checkpoint = checkpoint_path_for_epoch(args.out, final_epoch)
-        if epoch_checkpoint.resolve() != out_path.resolve():
-            save_training_checkpoint(
-                epoch_checkpoint,
-                inner,
-                optimizer,
-                scheduler,
-                ema,
-                scaler,
-                best_loss,
-            )
-            print(f"[train] saved cumulative checkpoint (epoch {final_epoch}) to {epoch_checkpoint}")
-            if ema_model is not None:
-                ema_checkpoint = epoch_checkpoint.with_name(
-                    f"{epoch_checkpoint.stem}_ema{epoch_checkpoint.suffix}"
-                )
-                ema_model.save(ema_checkpoint)
-
-    # ---- ONNX export (consumed by the Rust MCTS) ------------------------
-    if not args.no_onnx:
-        onnx_path = args.out.replace(".pt", ".onnx")
-        print(f"[train] exporting ONNX -> {onnx_path} (opset {args.onnx_opset}, precision: {args.infer_precision})")
-        # Use the un-compiled underlying model.
+    # Save the model ONCE at the very end ONLY if at least 1 epoch completed
+    if epoch > 0:
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-        try:
-            export_onnx(inner, onnx_path, opset=args.onnx_opset, infer_precision=args.infer_precision)
-            print(f"[train] ONNX export OK. Next self-play cycle will use it.")
-        except Exception as e:
-            print(f"[train] WARNING: ONNX export failed: {e}")
-            print(f"[train] Rust MCTS will fall back to null network on the next cycle.")
+        save_training_checkpoint(
+            args.out,
+            inner,
+            optimizer,
+            scheduler,
+            ema,
+            scaler,
+            best_loss,
+        )
+        final_epoch = start_epoch + epoch
+        print(f"[train] saved final model (loss={best_loss:.4f}) to {args.out}")
+
+        # Keep the pipeline's stable output path, and also create a cumulative
+        # checkpoint so a resumed run can continue with the correct epoch number.
+        if final_epoch > start_epoch:
+            epoch_checkpoint = checkpoint_path_for_epoch(args.out, final_epoch)
+            if epoch_checkpoint.resolve() != out_path.resolve():
+                save_training_checkpoint(
+                    epoch_checkpoint,
+                    inner,
+                    optimizer,
+                    scheduler,
+                    ema,
+                    scaler,
+                    best_loss,
+                )
+                print(f"[train] saved cumulative checkpoint (epoch {final_epoch}) to {epoch_checkpoint}")
+                if ema_model is not None:
+                    ema_checkpoint = epoch_checkpoint.with_name(
+                        f"{epoch_checkpoint.stem}_ema{epoch_checkpoint.suffix}"
+                    )
+                    save_training_checkpoint(
+                        ema_checkpoint,
+                        ema_model,
+                        optimizer,
+                        scheduler,
+                        ema,
+                        scaler,
+                        best_loss,
+                    )
+
+        # ---- ONNX export (consumed by the Rust MCTS) ------------------------
+        if not args.no_onnx:
+            onnx_path = args.out.replace(".pt", ".onnx")
+            print(f"[train] exporting ONNX -> {onnx_path} (opset {args.onnx_opset}, precision: {args.infer_precision})")
+            inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+            try:
+                export_onnx(inner, onnx_path, opset=args.onnx_opset, infer_precision=args.infer_precision)
+                print(f"[train] ONNX export OK. Next self-play cycle will use it.")
+            except Exception as e:
+                print(f"[train] WARNING: ONNX export failed: {e}")
+                print(f"[train] Rust MCTS will fall back to null network on the next cycle.")
+    else:
+        print("[train] Training stopped before completing any epoch; model weights and checkpoints unchanged.")
 
     if sp_proc is not None:
         try:

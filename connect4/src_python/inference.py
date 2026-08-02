@@ -201,6 +201,24 @@ def _check_win_bitboard(bitboard: int) -> bool:
     return False
 
 
+def reflect_bitboard(b: int) -> int:
+    """Reflect a 6x7 Connect 4 bitboard horizontally."""
+    res = 0
+    for c in range(COLS):
+        col_bits = (b >> (c * 7)) & 0x7F
+        res |= (col_bits << ((COLS - 1 - c) * 7))
+    return res
+
+
+def canonicalize_position(own: int, opp: int) -> tuple[tuple[int, int], bool]:
+    """Return ((canonical_own, canonical_opp), is_flipped)."""
+    own_r = reflect_bitboard(own)
+    opp_r = reflect_bitboard(opp)
+    if (own, opp) <= (own_r, opp_r):
+        return (own, opp), False
+    return (own_r, opp_r), True
+
+
 def format_duration(seconds: float) -> str:
     """Show sub-second timings in milliseconds instead of rounding to 0s."""
     seconds = max(0.0, float(seconds))
@@ -308,6 +326,7 @@ class Connect4Agent:
         self.eval_cache: dict[tuple[int, int], tuple[np.ndarray, float, float | None]] = {}
         self.cache_hits: int = 0
         self.cache_misses: int = 0
+        self.tree_root = None
 
         path = resolve_best_model(model_path)
         explicit_path = model_path is not None and str(model_path).lower() not in {"", "auto"}
@@ -445,10 +464,11 @@ class Connect4Agent:
             )
 
     def reset_cache(self) -> None:
-        """Clear evaluation cache between games."""
+        """Clear evaluation cache and MCTS tree between games."""
         self.eval_cache.clear()
         self.cache_hits = 0
         self.cache_misses = 0
+        self.tree_root = None
 
     def evaluate_batch(
         self, positions: list[tuple[int, int]]
@@ -460,17 +480,22 @@ class Connect4Agent:
         results: list[tuple[np.ndarray, float, float | None] | None] = [None] * len(positions)
         uncached_indices: list[int] = []
         uncached_planes: list[np.ndarray] = []
+        uncached_flips: list[bool] = []
+        uncached_keys: list[tuple[int, int]] = []
 
         for idx, (own, opp) in enumerate(positions):
-            cache_key = (own, opp)
+            cache_key, is_flipped = canonicalize_position(own, opp)
             if cache_key in self.eval_cache:
                 self.cache_hits += 1
-                p, v, b = self.eval_cache[cache_key]
-                results[idx] = (p.copy(), v, b)
+                p_canon, v, b = self.eval_cache[cache_key]
+                p = p_canon[::-1].copy() if is_flipped else p_canon.copy()
+                results[idx] = (p, v, b)
             else:
                 self.cache_misses += 1
                 uncached_indices.append(idx)
-                uncached_planes.append(board_to_planes(own, opp))
+                uncached_flips.append(is_flipped)
+                uncached_keys.append(cache_key)
+                uncached_planes.append(board_to_planes(cache_key[0], cache_key[1]))
 
         if uncached_planes:
             batch_np = np.stack(uncached_planes).astype(self._ort_input_dtype, copy=False)
@@ -495,14 +520,10 @@ class Connect4Agent:
             else:
                 batch_tensor = torch.from_numpy(batch_np).to(self.device)
                 with torch.inference_mode():
-                    log_ps, vs, _moves_left, confidence = self.model(batch_tensor)
+                    log_ps, vs, _moves_left, confidence, _opp_reply = self.model(batch_tensor)
                 policies = torch.exp(log_ps).cpu().numpy()
                 values = vs.squeeze(-1).cpu().numpy()
-                confidences = (
-                    confidence.cpu().numpy()
-                    if self.has_confidence_head
-                    else None
-                )
+                confidences = confidence.cpu().numpy()
 
             for b_i, orig_i in enumerate(uncached_indices):
                 p = policies[b_i]
@@ -512,8 +533,10 @@ class Connect4Agent:
                     if confidences is not None
                     else None
                 )
-                own_pos, opp_pos = positions[orig_i]
-                legal_mask = get_legal_actions_mask(own_pos, opp_pos)
+                canon_own, canon_opp = uncached_keys[b_i]
+                is_flipped = uncached_flips[b_i]
+
+                legal_mask = get_legal_actions_mask(canon_own, canon_opp)
                 p[~legal_mask] = 0.0
                 sum_p = p.sum()
                 if sum_p > 0:
@@ -521,8 +544,9 @@ class Connect4Agent:
                 else:
                     p[legal_mask] = 1.0 / max(1, legal_mask.sum())
 
-                self.eval_cache[(own_pos, opp_pos)] = (p, v, confidence)
-                results[orig_i] = (p, v, confidence)
+                self.eval_cache[(canon_own, canon_opp)] = (p.copy(), v, confidence)
+                p_out = p[::-1].copy() if is_flipped else p.copy()
+                results[orig_i] = (p_out, v, confidence)
 
         return [r for r in results if r is not None]
 
@@ -574,16 +598,35 @@ class Connect4Agent:
                 self.children: dict[int, _MCTSNode] = {}
                 self.lock = threading.Lock()
 
+        def _find_matching_node(node: _MCTSNode, target_own: int, target_opp: int, depth: int = 2) -> _MCTSNode | None:
+            if (node.own == target_own and node.opp == target_opp) or (node.own == target_opp and node.opp == target_own):
+                return node
+            if depth <= 0:
+                return None
+            for child in node.children.values():
+                res = _find_matching_node(child, target_own, target_opp, depth - 1)
+                if res is not None:
+                    return res
+            return None
+
         # Include root evaluation in the reported move time and in the time
         # budget. The previous code started the clock after this evaluation,
         # which made the displayed duration less representative of the move.
         move_start = time.perf_counter()
         deadline = move_start + max(0.0, float(max_think_time))
 
-        # Evaluate root
         root_policy, _, root_confidence = self.evaluate_position(own, opp)
-        root = _MCTSNode(own, opp, root_policy)
-        root_eval_elapsed = time.perf_counter() - move_start
+        reused_root = _find_matching_node(self.tree_root, own, opp) if self.tree_root is not None else None
+
+        if reused_root is not None:
+            root = reused_root
+            reused_sims = int(root.N.sum())
+            root_eval_elapsed = 0.0
+        else:
+            root = _MCTSNode(own, opp, root_policy)
+            reused_sims = 0
+            root_eval_elapsed = time.perf_counter() - move_start
+
         sim_count = 0
 
         confidence_stop_enabled = (
@@ -595,7 +638,7 @@ class Connect4Agent:
             np.clip(getattr(CONFIG.infer, "confidence_threshold", 0.99), 0.0, 1.0)
         )
         confidence_min_sims = max(
-            1, int(getattr(CONFIG.infer, "confidence_min_sims", 32))
+            0, int(getattr(CONFIG.infer, "confidence_min_sims", 0))
         )
         confidence_stop = False
         visit_confidence = 0.0
@@ -699,22 +742,10 @@ class Connect4Agent:
                             path_node.W[path_a] += v
                             v = -v
 
-            # Confidence stop check: evaluate search convergence (visit distribution)
-            # combined with model confidence head output (if available).
-            if confidence_stop_enabled and sim_count >= confidence_min_sims:
-                visits = root.N.astype(np.float32)
-                visit_total = float(visits.sum())
-                if visit_total > 0.0:
-                    visit_confidence = float(visits.max() / visit_total)
-                else:
-                    visit_confidence = 0.0
-
-                if root_confidence is not None:
-                    confidence_index = float(max(visit_confidence, (root_confidence + visit_confidence) / 2.0))
-                else:
-                    confidence_index = visit_confidence
-
-                if confidence_index >= confidence_threshold or visit_confidence >= confidence_threshold:
+            # Confidence stop check: evaluate ONLY the model confidence head output.
+            if confidence_stop_enabled and root_confidence is not None and sim_count >= confidence_min_sims:
+                confidence_index = float(root_confidence)
+                if confidence_index >= confidence_threshold:
                     confidence_stop = True
                     break
 
@@ -730,9 +761,12 @@ class Connect4Agent:
         if visit_total > 0.0:
             visit_confidence = float(visits.max() / visit_total)
         if root_confidence is not None:
-            confidence_index = float(max(visit_confidence, (root_confidence + visit_confidence) / 2.0))
+            confidence_index = float(root_confidence)
         else:
             confidence_index = visit_confidence
+
+        self.tree_root = root
+        self.last_reused_sims = reused_sims
 
         if self.verbose:
             stop_note = (
@@ -745,10 +779,11 @@ class Connect4Agent:
                 if root_confidence is not None
                 else f" | confidence index={confidence_index:.1%}, visits={visit_confidence:.1%}, threshold={confidence_threshold:.1%}"
             )
+            reused_note = f" (reused={reused_sims:,})" if reused_sims > 0 else ""
             print(
                 f"[inference] Move completed in {format_duration(elapsed)} "
                 f"(root={format_duration(root_eval_elapsed)}, search={format_duration(search_elapsed)}) | "
-                f"{sim_count:,} sims ({sps:.0f} sims/s) | "
+                f"{sim_count:,} sims{reused_note} ({sps:.0f} sims/s) | "
                 f"Cache hits: {hits_this_move:,}/{total_evals:,} ({hit_rate:.1f}%) | RAM Cache: {len(self.eval_cache):,} entries"
                 f"{confidence_note}"
                 f"{stop_note}"

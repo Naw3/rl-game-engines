@@ -138,6 +138,10 @@ def write_best_model_selection(
     model2_path = Path(model2).resolve()
     if m1_wins > m2_wins:
         selected = model1_path
+        # Copy winning EMA weights back to base model path so PyTorch resumes from the best model
+        if model2_path.exists():
+            import shutil
+            shutil.copy2(selected, model2_path)
     else:
         # A tie deliberately keeps the current/raw model (model2 in the
         # pipeline), because a tie is not evidence that EMA is better.
@@ -237,7 +241,15 @@ def main():
         help="inference backend for --mcts mode (auto uses config.py infer_backend)",
     )
     parser.add_argument("--selection-file", type=str, default=None, help="write the MCTS winner to this JSON file")
+    parser.add_argument("--seed", type=int, default=42, help="RNG seed for evaluation")
     args = parser.parse_args()
+
+    import random
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
 
     if args.mcts:
         from inference import Connect4Agent
