@@ -127,7 +127,7 @@ struct DeviceJson {
 }
 
 /// Compute the cheap branch of the self-play Playout Cap Randomization.
-/// For the current defaults, 200 full simulations become 32 cheap ones.
+/// For the current defaults, 400 full simulations become 64 cheap ones.
 fn pcr_cheap_budget(full_sims: usize, ratio: f32, min_sims: usize) -> usize {
     let full_sims = full_sims.max(1);
     let ratio = if ratio.is_finite() { ratio.max(0.0) } else { 0.0 };
@@ -141,8 +141,8 @@ mod pcr_tests {
     use super::pcr_cheap_budget;
 
     #[test]
-    fn current_training_budgets_are_200_and_32() {
-        assert_eq!(pcr_cheap_budget(200, 0.1, 32), 32);
+    fn current_training_budgets_are_400_and_64() {
+        assert_eq!(pcr_cheap_budget(400, 0.1, 64), 64);
     }
 
     #[test]

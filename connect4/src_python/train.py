@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import math
 import random
 import re
 import sys
@@ -113,6 +114,10 @@ try:
     _DEFAULT_EPOCHS = CONFIG.train.epochs
     _DEFAULT_BATCH = CONFIG.train.batch_size
     _DEFAULT_LR = CONFIG.train.learning_rate
+    _DEFAULT_LR_MIN = CONFIG.train.learning_rate_min
+    _DEFAULT_LR_WARMUP_EPOCHS = CONFIG.train.lr_warmup_epochs
+    _DEFAULT_LR_SCHEDULE_EPOCHS = CONFIG.train.lr_schedule_epochs
+    _DEFAULT_CONFIDENCE_LOSS_WEIGHT = CONFIG.train.confidence_loss_weight
     _DEFAULT_WD = CONFIG.train.weight_decay
     _DEFAULT_SEED = CONFIG.mcts.seed
     _DEFAULT_NUM_WORKERS = CONFIG.train.num_workers
@@ -140,6 +145,10 @@ except Exception as err:
     _DEFAULT_EPOCHS = 5
     _DEFAULT_BATCH = 256
     _DEFAULT_LR = 1e-3
+    _DEFAULT_LR_MIN = 1e-5
+    _DEFAULT_LR_WARMUP_EPOCHS = 5
+    _DEFAULT_LR_SCHEDULE_EPOCHS = 400
+    _DEFAULT_CONFIDENCE_LOSS_WEIGHT = 0.1
     _DEFAULT_WD = 1e-4
     _DEFAULT_SEED = 42
     _DEFAULT_NUM_WORKERS = 0
@@ -293,8 +302,15 @@ def compute_loss(
     target_policy: torch.Tensor,
     target_value: torch.Tensor,
     target_moves_left: torch.Tensor,
+    predicted_confidence: torch.Tensor | None = None,
+    confidence_loss_weight: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Returns (total_loss, policy_loss, value_loss, moves_left_loss)."""
+    """Returns (total_loss, policy_loss, value_loss, moves_left_loss).
+
+    The confidence target is the concentration of the MCTS visit policy.  It
+    is trained even when confidence-based early stopping is disabled, so the
+    inference log remains useful in fixed-time mode too.
+    """
     # Policy: cross-entropy with soft targets. target_policy is (B, 7),
     # log_p is (B, 7) of log-probabilities. Sum over columns, mean over batch.
     policy_loss = -(target_policy * log_p).sum(dim=1).mean()
@@ -302,7 +318,15 @@ def compute_loss(
     value_loss = F.mse_loss(v, target_value)
     # Moves left: standard MSE, scaled down to prevent dominating the gradients.
     moves_left_loss = F.mse_loss(m, target_moves_left) * 0.02
-    return policy_loss + value_loss + moves_left_loss, policy_loss, value_loss, moves_left_loss
+    confidence_loss = torch.zeros_like(policy_loss)
+    if predicted_confidence is not None and confidence_loss_weight > 0.0:
+        # MCTS policies are normalized distributions, so their maximum visit
+        # probability is a direct, stable concentration/confidence target.
+        confidence_target = target_policy.detach().amax(dim=1).clamp(0.0, 1.0)
+        confidence_loss = F.mse_loss(predicted_confidence, confidence_target)
+        confidence_loss = confidence_loss * confidence_loss_weight
+    total_loss = policy_loss + value_loss + moves_left_loss + confidence_loss
+    return total_loss, policy_loss, value_loss, moves_left_loss
 
 
 
@@ -326,6 +350,186 @@ class _ReplayDataset(torch.utils.data.Dataset):
                 torch.from_numpy(policy),
                 torch.tensor(value, dtype=torch.float32),
                 torch.tensor(moves_left, dtype=torch.float32))
+
+
+def merge_replay_datasets(
+    datasets: list[_ReplayDataset],
+    symmetry: bool,
+) -> _ReplayDataset:
+    """Merge recent self-play generations into one RAM training dataset."""
+    if len(datasets) == 1:
+        return datasets[0]
+
+    import numpy as np
+
+    merged = _ReplayDataset(
+        np.concatenate([dataset._planes for dataset in datasets], axis=0),
+        np.concatenate([dataset._policy for dataset in datasets], axis=0),
+        np.concatenate([dataset._value for dataset in datasets], axis=0),
+        np.concatenate([dataset._moves_left for dataset in datasets], axis=0),
+    )
+    merged.symmetry = symmetry
+    merged.n_games = sum(getattr(dataset, "n_games", 0) for dataset in datasets)
+    return merged
+
+
+def merge_weighted_replay_dataset(
+    current: _ReplayDataset,
+    history: list[_ReplayDataset],
+    symmetry: bool,
+) -> _ReplayDataset:
+    """Keep one epoch-sized dataset with fresh and replay positions mixed.
+
+    The replay window is only a source of samples.  It must not increase the
+    number of optimizer batches for the epoch, otherwise ``replay_keep=10``
+    would silently turn one self-play generation into ten generations worth
+    of training data.  Keep the output exactly as large as the newest
+    generation, with a 50/50 fresh/replay mix once replay is available.
+    """
+    if not history:
+        return current
+
+    import numpy as np
+
+    old_arrays = history[:-1]
+    if not old_arrays:
+        return current
+
+    old_planes = np.concatenate([dataset._planes for dataset in old_arrays], axis=0)
+    old_policy = np.concatenate([dataset._policy for dataset in old_arrays], axis=0)
+    old_value = np.concatenate([dataset._value for dataset in old_arrays], axis=0)
+    old_moves_left = np.concatenate(
+        [dataset._moves_left for dataset in old_arrays], axis=0
+    )
+    target_count = len(current)
+    if target_count == 0:
+        return current
+
+    old_count = len(old_planes)
+    replay_count = target_count // 2
+    fresh_count = target_count - replay_count
+
+    fresh_indices = np.random.choice(
+        target_count, size=fresh_count, replace=False
+    )
+    replay_indices = np.random.choice(
+        old_count, size=replay_count, replace=old_count < replay_count
+    )
+
+    planes = np.concatenate(
+        [current._planes[fresh_indices], old_planes[replay_indices]], axis=0
+    )
+    policy = np.concatenate(
+        [current._policy[fresh_indices], old_policy[replay_indices]], axis=0
+    )
+    value = np.concatenate(
+        [current._value[fresh_indices], old_value[replay_indices]], axis=0
+    )
+    moves_left = np.concatenate(
+        [current._moves_left[fresh_indices], old_moves_left[replay_indices]], axis=0
+    )
+    order = np.random.permutation(target_count)
+    merged = _ReplayDataset(
+        planes[order].copy(),
+        policy[order].copy(),
+        value[order].copy(),
+        moves_left[order].copy(),
+    )
+    merged.symmetry = symmetry
+    # This is still one fresh self-play generation from the pipeline's point
+    # of view; replay positions do not create extra games or extra batches.
+    merged.n_games = getattr(current, "n_games", 0)
+    return merged
+
+
+class WarmupCosineScheduler:
+    """Small serializable warmup + cosine scheduler for online self-play."""
+
+    scheduler_type = "warmup_cosine_v1"
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        total_steps: int,
+        warmup_steps: int,
+        eta_min: float,
+        start_lrs: list[float] | None = None,
+        peak_lrs: list[float] | None = None,
+    ) -> None:
+        self.optimizer = optimizer
+        self.total_steps = max(1, int(total_steps))
+        self.warmup_steps = max(0, min(int(warmup_steps), self.total_steps))
+        self.eta_min = max(0.0, float(eta_min))
+        defaults = [float(group["lr"]) for group in optimizer.param_groups]
+        self.peak_lrs = list(peak_lrs or defaults)
+        self.start_lrs = list(start_lrs or [max(self.eta_min, lr * 0.1) for lr in self.peak_lrs])
+        self.last_epoch = 0
+        self._last_lr = list(self.start_lrs)
+        self._set_lrs(self._last_lr)
+
+    def _set_lrs(self, lrs: list[float]) -> None:
+        for group, lr in zip(self.optimizer.param_groups, lrs):
+            group["lr"] = float(lr)
+        self._last_lr = [float(lr) for lr in lrs]
+
+    def _lrs_at(self, step: int) -> list[float]:
+        if self.warmup_steps > 0 and step <= self.warmup_steps:
+            fraction = step / float(self.warmup_steps)
+            return [
+                start + (peak - start) * fraction
+                for start, peak in zip(self.start_lrs, self.peak_lrs)
+            ]
+
+        cosine_steps = max(1, self.total_steps - self.warmup_steps)
+        progress = min(1.0, max(0.0, (step - self.warmup_steps) / cosine_steps))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return [
+            self.eta_min + (peak - self.eta_min) * cosine
+            for peak in self.peak_lrs
+        ]
+
+    def step(self) -> None:
+        self.last_epoch += 1
+        self._set_lrs(self._lrs_at(self.last_epoch))
+
+    def get_last_lr(self) -> list[float]:
+        return list(self._last_lr)
+
+    def reconfigure_resume(
+        self,
+        start_lrs: list[float],
+        peak_lrs: list[float],
+        total_steps: int,
+        warmup_steps: int,
+    ) -> None:
+        """Continue an old scheduler with a gradual LR recovery, not a reset."""
+        self.total_steps = max(1, int(total_steps))
+        self.warmup_steps = max(1, min(int(warmup_steps), self.total_steps))
+        self.start_lrs = list(start_lrs)
+        self.peak_lrs = list(peak_lrs)
+        self.last_epoch = 0
+        self._set_lrs(self.start_lrs)
+
+    def state_dict(self) -> dict:
+        return {
+            "scheduler_type": self.scheduler_type,
+            "total_steps": self.total_steps,
+            "warmup_steps": self.warmup_steps,
+            "eta_min": self.eta_min,
+            "start_lrs": self.start_lrs,
+            "peak_lrs": self.peak_lrs,
+            "last_epoch": self.last_epoch,
+            "_last_lr": self._last_lr,
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self.total_steps = max(1, int(state_dict["total_steps"]))
+        self.warmup_steps = max(0, min(int(state_dict["warmup_steps"]), self.total_steps))
+        self.eta_min = max(0.0, float(state_dict["eta_min"]))
+        self.start_lrs = [float(lr) for lr in state_dict["start_lrs"]]
+        self.peak_lrs = [float(lr) for lr in state_dict["peak_lrs"]]
+        self.last_epoch = int(state_dict["last_epoch"])
+        self._set_lrs([float(lr) for lr in state_dict["_last_lr"]])
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +610,15 @@ def main() -> None:
     p.add_argument("--compile-mode", type=str, default=_DEFAULT_COMPILE_MODE, choices=["none", "default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
     p.add_argument("--batch", type=int, default=_DEFAULT_BATCH)
     p.add_argument("--lr", type=float, default=_DEFAULT_LR)
+    p.add_argument("--lr-min", type=float, default=_DEFAULT_LR_MIN,
+                   help="minimum learning rate for the cosine schedule")
+    p.add_argument("--lr-warmup-epochs", type=int, default=_DEFAULT_LR_WARMUP_EPOCHS,
+                   help="linear learning-rate warmup duration")
+    p.add_argument("--lr-schedule-epochs", type=int, default=_DEFAULT_LR_SCHEDULE_EPOCHS,
+                   help="total epoch horizon used by the cosine schedule")
+    p.add_argument("--confidence-loss-weight", type=float,
+                   default=_DEFAULT_CONFIDENCE_LOSS_WEIGHT,
+                   help="weight for the MCTS policy-concentration confidence loss")
     p.add_argument("--weight-decay", type=float, default=_DEFAULT_WD)
     p.add_argument(
         "--device",
@@ -429,6 +642,8 @@ def main() -> None:
     p.add_argument("--onnx-every", type=int, default=_DEFAULT_ONNX_EVERY, help="Frequency (in epochs) to export ONNX model (0 = export only at final epoch)")
     p.add_argument("--use-ema", action="store_true", default=_DEFAULT_USE_EMA, help="enable Exponential Moving Average (EMA) of model weights")
     p.add_argument("--ema-decay", type=float, default=_DEFAULT_EMA_DECAY, help="EMA decay rate (default: 0.999)")
+    p.add_argument("--replay-keep", type=int, default=getattr(CONFIG.train, "replay_keep", 10),
+                   help="number of recent streaming self-play generations kept in RAM")
     p.add_argument("--channels-last", action="store_true", default=_DEFAULT_CHANNELS_LAST, help="use channels_last memory format")
     p.add_argument("--fused-adamw", action="store_true", default=_DEFAULT_FUSED_ADAMW, help="use fused AdamW optimizer")
     p.add_argument("--symmetry", action="store_true", default=_DEFAULT_SYMMETRY,
@@ -546,15 +761,47 @@ def main() -> None:
                             pin_memory=(args.device != "cpu"), drop_last=(len(ds) > args.batch))
         return ds, loader
 
+    # In stream mode, retain recent generations in RAM instead of training
+    # once on a generation and immediately discarding it.  This gives the
+    # online learner a small replay window while keeping the zero-disk pipe.
+    stream_replay_buffer: list[_ReplayDataset] = []
+
+    def prepare_stream_dataset(new_ds: _ReplayDataset):
+        stream_replay_buffer.append(new_ds)
+        keep = max(1, int(args.replay_keep))
+        if len(stream_replay_buffer) > keep:
+            del stream_replay_buffer[:-keep]
+        merged_ds = merge_weighted_replay_dataset(
+            stream_replay_buffer[-1],
+            stream_replay_buffer,
+            args.symmetry,
+        )
+        merged_loader = DataLoader(
+            merged_ds,
+            batch_size=args.batch,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=(args.device != "cpu"),
+            drop_last=(len(merged_ds) > args.batch),
+        )
+        return merged_ds, merged_loader
+
     # ---- Dataset Setup (Consume-on-Train Queue / RAM Stream) ----------------
     sp_proc = None
     if args.data == "-" or args.data_dir == "-":
         import subprocess
         onnx_model_path = Path(args.out).with_suffix(".onnx").resolve()
+        selfplay_games = int(getattr(CONFIG.mcts, "games", 256))
+        selfplay_sims = int(getattr(CONFIG.mcts, "sims", 400))
+        selfplay_batch = int(getattr(CONFIG.mcts, "gpu_batch_size", 32))
+        selfplay_device = str(getattr(CONFIG.device, "rust_device", "gpu"))
         cargo_cmd = [
             "cargo", "run", "--release", "--features", "cuda",
             "--manifest-path", "../src_rust/Cargo.toml", "--",
-            "-g", "128", "-s", "200", "-b", "32", "-d", "gpu",
+            "-g", str(selfplay_games),
+            "-s", str(selfplay_sims),
+            "-b", str(selfplay_batch),
+            "-d", selfplay_device,
             "-m", str(onnx_model_path), "-o", "-", "--stream"
         ]
         print("[train] Starting Rust MCTS stream process (ZERO disk I/O, pure RAM IPC)...")
@@ -564,6 +811,8 @@ def main() -> None:
             if sp_proc.poll() is not None:
                 raise RuntimeError(f"Rust MCTS process exited unexpectedly with code {sp_proc.returncode}")
             ds, loader = read_stream_batch(sp_proc.stdout)
+            if ds is not None:
+                ds, loader = prepare_stream_dataset(ds)
             if ds is None:
                 time.sleep(0.1)
     else:
@@ -637,8 +886,18 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=args.fused_adamw
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs * max(1, len(loader))
+    # Replay is sampled into an epoch-sized dataset, so the scheduler must be
+    # based on the actual loader length, not on the size of the RAM window.
+    estimated_steps_per_epoch = max(1, len(loader))
+    schedule_epochs = max(
+        int(args.lr_schedule_epochs),
+        int(start_epoch + args.epochs),
+    )
+    scheduler = WarmupCosineScheduler(
+        optimizer,
+        total_steps=schedule_epochs * estimated_steps_per_epoch,
+        warmup_steps=args.lr_warmup_epochs * estimated_steps_per_epoch,
+        eta_min=args.lr_min,
     )
 
     use_amp = (not args.no_amp) and args.device.startswith("cuda")
@@ -650,8 +909,30 @@ def main() -> None:
     resume_best_loss = float("inf")
     if resume_training_state is not None:
         try:
+            scheduler_state = resume_training_state.get("scheduler_state_dict") or {}
+            is_new_scheduler = scheduler_state.get("scheduler_type") == WarmupCosineScheduler.scheduler_type
+            if is_new_scheduler:
+                scheduler.load_state_dict(scheduler_state)
             optimizer.load_state_dict(resume_training_state["optimizer_state_dict"])
-            scheduler.load_state_dict(resume_training_state["scheduler_state_dict"])
+            if not is_new_scheduler:
+                # Checkpoints created by the old cosine scheduler are still
+                # valid model/Adam checkpoints.  Continue their current LR
+                # through a short ramp instead of resetting to args.lr.
+                current_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+                recovery_peak = [
+                    max(current_lr, min(float(args.lr), float(args.lr) * 0.5))
+                    for current_lr in current_lrs
+                ]
+                scheduler.reconfigure_resume(
+                    current_lrs,
+                    recovery_peak,
+                    total_steps=schedule_epochs * estimated_steps_per_epoch,
+                    warmup_steps=max(1, args.lr_warmup_epochs * estimated_steps_per_epoch),
+                )
+                print(
+                    "[train] Adapted legacy cosine schedule with a gradual LR recovery "
+                    f"({current_lrs[0]:.2e} -> {recovery_peak[0]:.2e})."
+                )
             if ema is not None and resume_training_state.get("ema_shadow") is not None:
                 ema.shadow = {
                     name: value.to(args.device)
@@ -702,7 +983,16 @@ def main() -> None:
                     optimizer.zero_grad(set_to_none=True)
                     with autocast(enabled=use_amp, device_type="cuda" if use_amp else "cpu", dtype=torch.float16 if use_amp else None):
                         w_log_p, w_v, w_m, _w_c = model(wp)
-                        w_loss, _, _, _ = compute_loss(w_log_p, w_v, w_m, wtp, wtv, wtm)
+                        w_loss, _, _, _ = compute_loss(
+                            w_log_p,
+                            w_v,
+                            w_m,
+                            wtp,
+                            wtv,
+                            wtm,
+                            _w_c,
+                            args.confidence_loss_weight,
+                        )
                     scaler.scale(w_loss).backward()
                     # Compile with a real backward pass, but do not consume
                     # optimizer/scheduler steps or alter resumed weights.
@@ -762,6 +1052,8 @@ def main() -> None:
                 if done: break
                 raise RuntimeError(f"Rust MCTS process exited unexpectedly with code {sp_proc.returncode}")
             ds, loader = read_stream_batch(sp_proc.stdout)
+            if ds is not None:
+                ds, loader = prepare_stream_dataset(ds)
             while ds is None:
                 if sp_proc.poll() is not None:
                     if done: break
@@ -769,6 +1061,8 @@ def main() -> None:
                 if done: break
                 time.sleep(0.1)
                 ds, loader = read_stream_batch(sp_proc.stdout)
+                if ds is not None:
+                    ds, loader = prepare_stream_dataset(ds)
             if done: break
         elif args.data_dir and epoch > 0:
             # Poll data_dir until fresh self-play data arrives from Rust generator
@@ -789,7 +1083,7 @@ def main() -> None:
             p_sps = p_ns / max(0.001, p_train_sec)
             p_tother = max(0.0, p_ttot - p_train_sec - p_tdata - p_texport)
             total_time_so_far = time.time() - global_start_t
-            n_g = getattr(ds, "n_games", 128)
+            n_g = getattr(ds, "n_games", 0)
             print(
                 f"[train] {p_estr} done in {format_duration(p_ttot)} "
                 f"(train={format_duration(p_train_sec)} "
@@ -813,7 +1107,9 @@ def main() -> None:
 
         t0 = time.time()
         running = {"total": 0.0, "policy": 0.0, "value": 0.0, "moves_left": 0.0}
+        log_running = {"total": 0.0, "policy": 0.0, "value": 0.0, "moves_left": 0.0}
         n_batches = 0
+        log_batches = 0
         samples_this_epoch = 0
         fwd_sec_epoch = 0.0
         bwd_sec_epoch = 0.0
@@ -842,7 +1138,14 @@ def main() -> None:
             with autocast(enabled=use_amp, device_type="cuda" if use_amp else "cpu", dtype=torch.float16 if use_amp else None):
                 log_p, v, m, _c = model(planes)
                 loss, policy_loss, value_loss, moves_left_loss = compute_loss(
-                    log_p, v, m, target_policy, target_value, target_moves_left
+                    log_p,
+                    v,
+                    m,
+                    target_policy,
+                    target_value,
+                    target_moves_left,
+                    _c,
+                    args.confidence_loss_weight,
                 )
             if args.device == "cuda": torch.cuda.synchronize()
             fwd_sec_epoch += (time.perf_counter() - t_f0)
@@ -870,12 +1173,20 @@ def main() -> None:
             running["policy"] += policy_loss.detach()
             running["value"] += value_loss.detach()
             running["moves_left"] += moves_left_loss.detach()
+            log_running["total"] += loss.detach()
+            log_running["policy"] += policy_loss.detach()
+            log_running["value"] += value_loss.detach()
+            log_running["moves_left"] += moves_left_loss.detach()
             n_batches += 1
+            log_batches += 1
             total_samples += planes.size(0)
             samples_this_epoch += planes.size(0)
 
-            if (batch_idx + 1) % args.log_every == 0:
-                avg = {k: (v.item() if isinstance(v, torch.Tensor) else v) / n_batches for k, v in running.items()}
+            if args.log_every > 0 and (batch_idx + 1) % args.log_every == 0:
+                avg = {
+                    k: (v.item() if isinstance(v, torch.Tensor) else v) / max(1, log_batches)
+                    for k, v in log_running.items()
+                }
                 lr = scheduler.get_last_lr()[0]
                 global_epoch = start_epoch + epoch + 1
                 epoch_str = (
@@ -890,8 +1201,8 @@ def main() -> None:
                     f"value={avg['value']:.4f}  mvl={avg['moves_left']:.4f}  lr={lr:.2e}  "
                     f"({format_duration(time.time() - t0)})"
                 )
-                running = {"total": 0.0, "policy": 0.0, "value": 0.0, "moves_left": 0.0}
-                n_batches = 0
+                log_running = {"total": 0.0, "policy": 0.0, "value": 0.0, "moves_left": 0.0}
+                log_batches = 0
             batch_idx += 1
 
         if batch_idx == 0:
@@ -1000,6 +1311,7 @@ def main() -> None:
         p_sps = p_ns / max(0.001, p_train_sec)
         p_tother = max(0.0, p_ttot - p_train_sec - p_tdata - p_texport)
         total_time_so_far = time.time() - global_start_t
+        n_g = getattr(ds, "n_games", 0)
         print(
             f"[train] {p_estr} done in {format_duration(p_ttot)} "
             f"(train={format_duration(p_train_sec)} "
@@ -1008,7 +1320,7 @@ def main() -> None:
             f"other={format_duration(p_tother)} | tot={format_duration(total_time_so_far)}) "
             f"({p_sps:.0f} samples/s) | loss={p_avg_tot:.4f} "
             f"(policy={p_avg_pol:.4f}, value={p_avg_val:.4f}, mvl={p_avg_mvl:.4f}) lr={p_lr:.2e} | "
-            f"sample val={p_v:+.3f}"
+            f"samples={len(ds):,} | games={n_g:,} | sample val={p_v:+.3f}"
         )
         if p_bl and p_avg_tot < best_loss:
             best_loss = p_avg_tot

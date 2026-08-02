@@ -254,23 +254,54 @@ def main():
         half_games = args.games // 2
         t0 = time.time()
 
+        completed_games = 0
+
+        def render_progress() -> None:
+            elapsed = time.time() - t0
+            total_games = max(1, args.games)
+            progress = completed_games / total_games
+            bar_width = 24
+            filled = int(round(bar_width * progress))
+            bar = "#" * filled + "-" * (bar_width - filled)
+            if completed_games > 0:
+                games_per_second = completed_games / max(0.001, elapsed)
+                eta = (args.games - completed_games) / max(0.001, games_per_second)
+                eta_text = f"{eta:.0f}s"
+            else:
+                eta_text = "--"
+            line = (
+                f"[evaluate] [{bar}] {completed_games}/{args.games} "
+                f"({progress * 100:3.0f}%) | "
+                f"M1={m1_wins} M2={m2_wins} D={draws} | "
+                f"elapsed={elapsed:.0f}s ETA={eta_text}"
+            )
+            # Keep the progress display on one terminal line.
+            sys.stdout.write("\r" + line + " " * 8)
+            sys.stdout.flush()
+
+        def record_result(result: int, m1_starts: bool) -> None:
+            nonlocal completed_games, m1_wins, m2_wins, draws
+            if result == 0:
+                draws += 1
+            elif (result == 1 and m1_starts) or (result == -1 and not m1_starts):
+                m1_wins += 1
+            else:
+                m2_wins += 1
+            completed_games += 1
+            render_progress()
+
+        render_progress()
+
         for _ in range(half_games):
             result = play_game_mcts(agent1, agent2, args.think_time, args.sims)
-            if result == 1:
-                m1_wins += 1
-            elif result == -1:
-                m2_wins += 1
-            else:
-                draws += 1
+            record_result(result, m1_starts=True)
 
         for _ in range(args.games - half_games):
             result = play_game_mcts(agent2, agent1, args.think_time, args.sims)
-            if result == 1:
-                m2_wins += 1
-            elif result == -1:
-                m1_wins += 1
-            else:
-                draws += 1
+            record_result(result, m1_starts=False)
+
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
         elapsed = time.time() - t0
         print(f"[evaluate] MCTS results after {args.games} games ({elapsed:.1f}s):")

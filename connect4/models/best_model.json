@@ -1,11 +1,11 @@
 {
-  "model_pt": "connect4_model_epoch200_ema.pt",
+  "model_pt": "connect4_model_epoch99.pt",
   "model_onnx": null,
-  "selection": "model1",
+  "selection": "model2",
   "selection_method": "mcts_head_to_head",
   "model1": "C:\\Users\\Ewan\\Documents\\dev\\rl-game-engines\\connect4\\models\\connect4_model_ema.pt",
   "model2": "C:\\Users\\Ewan\\Documents\\dev\\rl-game-engines\\connect4\\models\\connect4_model.pt",
-  "model1_wins": 18,
-  "model2_wins": 2,
-  "draws": 0
+  "model1_wins": 4,
+  "model2_wins": 13,
+  "draws": 3
 }

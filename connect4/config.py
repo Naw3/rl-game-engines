@@ -23,13 +23,13 @@ class NetworkConfig:
 @dataclass
 class MCTSConfig:
     """Rust MCTS Self-Play Search Parameters"""
-    games: int = 128
-    sims: int = 200
+    games: int = 256
+    sims: int = 400
     # Playout Cap Randomization (PCR): mix a smaller and a full search
     # budget so the network learns from both cheap and deeply searched moves.
     pcr_full_probability: float = 0.25
     pcr_cheap_ratio: float = 0.1
-    pcr_min_sims: int = 32
+    pcr_min_sims: int = 64
     cpu_batch_size: int = os.cpu_count() or 8
     gpu_batch_size: int = 32
     max_dispatcher_batch: int = 128
@@ -45,18 +45,21 @@ class MCTSConfig:
 @dataclass
 class TrainConfig:
     """PyTorch Training Hyperparameters"""
-    epochs: int = 200
-    batch_size: int = 256
+    epochs: int = 50
+    batch_size: int = 128
     learning_rate: float = 1e-3
+    learning_rate_min: float = 1e-5
+    lr_warmup_epochs: int = 5
+    lr_schedule_epochs: int = 400
     weight_decay: float = 1e-4
     max_grad_norm: float = 5.0
     replay_keep: int = 10
     max_buffer_epochs: int = 0  # 0 = no pre-generation buffer (on-demand per epoch)
     num_workers: int = 0
-    log_every: int = 20
+    log_every: int = 0  # 0 = print only the epoch summary
     onnx_every: int = 1
     use_ema: bool = True
-    ema_decay: float = 0.999
+    ema_decay: float = 0.995
     symmetry: bool = True
     train_precision: str = "fp32"  # "fp32", "fp16", "bf16"
     infer_precision: str = "fp32"  # "fp32", "fp16", "int8"
@@ -136,17 +139,13 @@ class InferConfig:
     infer_backend: str = "auto"  # "pytorch-cuda", "pytorch-cpu", "onnx-cuda", "tensorrt", "auto"
     sims: int = 0                 # 0 = confidence stop + max_think_time fallback
     max_think_time: float = 1.0   # Max search budget in seconds per move
-    batch_size: int = 32          # Fixed GPU leaf evaluation batch size
     c_puct: float = 1.5           # PUCT exploration constant
     temperature: float = 0.0      # Action selection temperature
-    max_think_time: float = 1.0   # Max search budget in seconds per move
     batch_size: int = 32          # Fixed GPU leaf evaluation batch size
-    c_puct: float = 1.5           # PUCT exploration constant
-    temperature: float = 0.0      # Action selection temperature
     device: str = "auto"          # Execution device ("cuda", "cpu", "auto")
     confidence_stop_enabled: bool = False
     confidence_threshold: float = 0.99
-    confidence_min_sims: int = 32
+    confidence_min_sims: int = 0
 
     def __post_init__(self) -> None:
         self.infer_backend = self.infer_backend.strip().lower().replace("_", "-").replace(" ", "-")
@@ -210,6 +209,9 @@ def export_powershell_env() -> str:
         f'$env:EPOCHS = "{CONFIG.train.epochs}"',
         f'$env:TRAIN_BATCH_SIZE = "{CONFIG.train.batch_size}"',
         f'$env:LEARNING_RATE = "{CONFIG.train.learning_rate}"',
+        f'$env:LEARNING_RATE_MIN = "{CONFIG.train.learning_rate_min}"',
+        f'$env:LR_WARMUP_EPOCHS = "{CONFIG.train.lr_warmup_epochs}"',
+        f'$env:LR_SCHEDULE_EPOCHS = "{CONFIG.train.lr_schedule_epochs}"',
         f'$env:WEIGHT_DECAY = "{CONFIG.train.weight_decay}"',
         f'$env:REPLAY_KEEP = "{CONFIG.train.replay_keep}"',
         f'$env:NUM_WORKERS = "{CONFIG.train.num_workers}"',

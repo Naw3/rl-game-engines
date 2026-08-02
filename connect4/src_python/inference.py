@@ -689,7 +689,11 @@ class Connect4Agent:
                         child_node = _MCTSNode(c_own, c_opp, child_policy)
                         parent_node.children[action] = child_node
 
-                        v = child_val
+                        # ``child_val`` is from the perspective of the player
+                        # to move in the child position, i.e. the opponent of
+                        # the parent action.  Flip once before adding it to
+                        # that parent's Q value, then flip at every level.
+                        v = -child_val
                         for path_node, path_a in reversed(path):
                             path_node.N[path_a] += 1
                             path_node.W[path_a] += v

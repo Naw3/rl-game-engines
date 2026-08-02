@@ -449,14 +449,17 @@ impl MCTS {
     }
 
     fn backup(&mut self, path: &[PathEntry], mut value: f32) {
-        for entry in path.iter() {
+        // The network evaluates the leaf from the leaf player's perspective.
+        // Walk from leaf to root and flip before updating each parent edge.
+        // This keeps W(s, a) in the perspective of the player to move at s.
+        for entry in path.iter().rev() {
             if entry.action == usize::MAX {
                 continue;
             }
+            value = -value;
             let node = &mut self.tree[entry.node_idx];
             node.n[entry.action] += 1;
             node.w[entry.action] += value;
-            value = -value;
         }
     }
 
@@ -701,5 +704,21 @@ mod tests {
             "argmax columns differ between batch=1 and batch=16 ({} vs {})",
             argmax_seq, argmax_batch
         );
+    }
+
+    #[test]
+    fn backup_flips_leaf_value_before_updating_parent() {
+        let mut mcts = null_mcts(1, 1);
+        mcts.tree.push(Node::new(0, 0));
+        mcts.tree.push(Node::new(0, 0));
+        let path = [
+            PathEntry { node_idx: 0, action: 0 },
+            PathEntry { node_idx: 1, action: usize::MAX },
+        ];
+
+        mcts.backup(&path, 0.75);
+
+        assert_eq!(mcts.tree[0].n[0], 1);
+        assert!((mcts.tree[0].w[0] + 0.75).abs() < 1e-6);
     }
 }

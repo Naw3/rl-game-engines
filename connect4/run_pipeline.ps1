@@ -63,6 +63,9 @@ $TEMPERATURE      = if ($env:TEMPERATURE)      { [float]$env:TEMPERATURE }    el
 $EPOCHS           = if ($env:EPOCHS)           { [int]$env:EPOCHS }           else { 1000000 }
 $BATCH            = if ($env:TRAIN_BATCH_SIZE) { [int]$env:TRAIN_BATCH_SIZE } else { if ($env:BATCH) { [int]$env:BATCH } else { 256 } }
 $LEARNING_RATE    = if ($env:LEARNING_RATE)    { $env:LEARNING_RATE }         else { "1e-3" }
+$LEARNING_RATE_MIN = if ($env:LEARNING_RATE_MIN) { $env:LEARNING_RATE_MIN }   else { "1e-5" }
+$LR_WARMUP_EPOCHS = if ($env:LR_WARMUP_EPOCHS) { [int]$env:LR_WARMUP_EPOCHS } else { 5 }
+$LR_SCHEDULE_EPOCHS = if ($env:LR_SCHEDULE_EPOCHS) { [int]$env:LR_SCHEDULE_EPOCHS } else { 400 }
 $WEIGHT_DECAY     = if ($env:WEIGHT_DECAY)     { $env:WEIGHT_DECAY }          else { "1e-4" }
 $COMPILE_MODE     = if ($env:COMPILE_MODE)     { $env:COMPILE_MODE }          else { "none" }
 $INFER_PRECISION  = if ($env:INFER_PRECISION)  { $env:INFER_PRECISION }       else { "fp32" }
@@ -123,7 +126,7 @@ if (-not (Test-Path $MODEL_ONNX)) {
         Write-Host "[pipeline] ===== Starting Continuous Training Process ($EPOCHS Epochs) =====" -ForegroundColor Cyan
 
         $t0 = Get-Date
-        $py_args = @("train.py", "--data", "-", "--out", "../$MODEL", "--epochs", $EPOCHS, "--batch", $BATCH, "--lr", $LEARNING_RATE, "--weight-decay", $WEIGHT_DECAY, "--compile-mode", $COMPILE_MODE, "--infer-precision", $INFER_PRECISION, "--onnx-every", $ONNX_EVERY, "--device", $PYTHON_DEVICE)
+        $py_args = @("train.py", "--data", "-", "--out", "../$MODEL", "--epochs", $EPOCHS, "--batch", $BATCH, "--lr", $LEARNING_RATE, "--lr-min", $LEARNING_RATE_MIN, "--lr-warmup-epochs", $LR_WARMUP_EPOCHS, "--lr-schedule-epochs", $LR_SCHEDULE_EPOCHS, "--weight-decay", $WEIGHT_DECAY, "--compile-mode", $COMPILE_MODE, "--infer-precision", $INFER_PRECISION, "--onnx-every", $ONNX_EVERY, "--replay-keep", $REPLAY_KEEP, "--device", $PYTHON_DEVICE)
         if ($SYMMETRY) { $py_args += "--symmetry" }
         if ($CHANNELS_LAST) { $py_args += "--channels-last" }
         if ($FUSED_ADAMW) { $py_args += "--fused-adamw" }
